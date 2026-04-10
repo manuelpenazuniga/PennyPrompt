@@ -1,0 +1,22 @@
+[workspace]
+members = [
+  "crates/penny-types",
+  "crates/penny-config",
+  "crates/penny-store",
+  "crates/penny-cost",
+  "crates/penny-ledger",
+  "crates/penny-budget",
+  "crates/penny-detect",
+  "crates/penny-providers",
+  "crates/penny-proxy",
+  "crates/penny-admin",
+  "crates/penny-cli",
+  "crates/penny-observe",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
