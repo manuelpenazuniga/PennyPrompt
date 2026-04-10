@@ -67,19 +67,16 @@ create_issue() {
   local milestone_title="$2"
   local labels="$3"
   local body="$4"
-  local milestone
 
   if issue_exists "$title"; then
     echo "Skipping existing issue: $title"
     return
   fi
 
-  milestone="$(milestone_number "$milestone_title")"
-
   gh issue create \
     --repo "$repo" \
     --title "$title" \
-    --milestone "$milestone" \
+    --milestone "$milestone_title" \
     --label "$labels" \
     --body "$body" >/dev/null
 
@@ -150,7 +147,7 @@ Acceptance criteria:
 EOF
 )"
 
-create_issue "Implement `penny-types` shared domain model" "M1 Foundation" "phase:m1,area:types" "$(cat <<'EOF'
+create_issue "Implement penny-types shared domain model" "M1 Foundation" "phase:m1,area:types" "$(cat <<'EOF'
 Implement the shared types crate with the request, response, budget, ledger, detect, and event types from the spec.
 
 Deliverables:
@@ -165,7 +162,7 @@ Acceptance criteria:
 EOF
 )"
 
-create_issue "Implement `penny-config` loader, presets, validation, env overrides" "M1 Foundation" "phase:m1,area:config" "$(cat <<'EOF'
+create_issue "Implement penny-config loader, presets, validation, env overrides" "M1 Foundation" "phase:m1,area:config" "$(cat <<'EOF'
 Implement strongly typed config loading from TOML, plus preset and environment variable merging.
 
 Deliverables:
@@ -181,7 +178,7 @@ Acceptance criteria:
 EOF
 )"
 
-create_issue "Implement `penny-store` migrations and repository layer" "M1 Foundation" "phase:m1,area:store" "$(cat <<'EOF'
+create_issue "Implement penny-store migrations and repository layer" "M1 Foundation" "phase:m1,area:store" "$(cat <<'EOF'
 Implement SQLite setup, migrations, and repository traits.
 
 Deliverables:
@@ -196,7 +193,7 @@ Acceptance criteria:
 EOF
 )"
 
-create_issue "Implement `penny-cost` pricing engine and pricebook loader" "M1 Foundation" "phase:m1,area:cost" "$(cat <<'EOF'
+create_issue "Implement penny-cost pricing engine and pricebook loader" "M1 Foundation" "phase:m1,area:cost" "$(cat <<'EOF'
 Implement cost calculation, token estimation, range estimation, and pricing snapshots.
 
 Deliverables:
@@ -237,7 +234,7 @@ Definition of done:
 EOF
 )"
 
-create_issue "Implement `MockProvider` for deterministic integration tests" "M2 Proxy Pass-Through" "phase:m2,area:providers" "$(cat <<'EOF'
+create_issue "Implement MockProvider for deterministic integration tests" "M2 Proxy Pass-Through" "phase:m2,area:providers" "$(cat <<'EOF'
 Implement the test-only provider adapter used for early integration work.
 
 Deliverables:
@@ -320,7 +317,7 @@ Definition of done:
 EOF
 )"
 
-create_issue "Implement `penny-ledger` atomic reservation flow" "M3 Atomic Budgets" "phase:m3,area:ledger,area:store" "$(cat <<'EOF'
+create_issue "Implement penny-ledger atomic reservation flow" "M3 Atomic Budgets" "phase:m3,area:ledger,area:store" "$(cat <<'EOF'
 Implement reserve, reconcile, and release around an append-only cost ledger.
 
 Deliverables:
@@ -335,7 +332,7 @@ Acceptance criteria:
 EOF
 )"
 
-create_issue "Implement `penny-budget` evaluator and observe/guard modes" "M3 Atomic Budgets" "phase:m3,area:budget" "$(cat <<'EOF'
+create_issue "Implement penny-budget evaluator and observe/guard modes" "M3 Atomic Budgets" "phase:m3,area:budget" "$(cat <<'EOF'
 Implement budget selection, window logic, soft warnings, and mode-specific fail behavior.
 
 Deliverables:
@@ -350,7 +347,7 @@ Acceptance criteria:
 EOF
 )"
 
-create_issue "Integrate budget enforcement and structured `402` error bodies" "M3 Atomic Budgets" "phase:m3,area:proxy,area:budget" "$(cat <<'EOF'
+create_issue "Integrate budget enforcement and structured 402 error bodies" "M3 Atomic Budgets" "phase:m3,area:proxy,area:budget" "$(cat <<'EOF'
 Integrate budget evaluation into the proxy request lifecycle and return stable error payloads.
 
 Deliverables:
@@ -379,7 +376,7 @@ Acceptance criteria:
 EOF
 )"
 
-create_issue "Implement `report summary` CLI" "M3 Atomic Budgets" "phase:m3,area:cli" "$(cat <<'EOF'
+create_issue "Implement report summary CLI" "M3 Atomic Budgets" "phase:m3,area:cli" "$(cat <<'EOF'
 Add the first operator-facing cost report.
 
 Deliverables:
@@ -486,7 +483,7 @@ Definition of done:
 EOF
 )"
 
-create_issue "Implement `penny-detect` heuristics and pause lifecycle" "M5 Active Protection" "phase:m5,area:detect" "$(cat <<'EOF'
+create_issue "Implement penny-detect heuristics and pause lifecycle" "M5 Active Protection" "phase:m5,area:detect" "$(cat <<'EOF'
 Implement the in-memory detection engine and session pause support.
 
 Deliverables:
@@ -515,7 +512,7 @@ Acceptance criteria:
 EOF
 )"
 
-create_issue "Implement `estimate` CLI and admin estimate API" "M5 Active Protection" "phase:m5,area:cli,area:admin,area:cost" "$(cat <<'EOF'
+create_issue "Implement estimate CLI and admin estimate API" "M5 Active Protection" "phase:m5,area:cli,area:admin,area:cost" "$(cat <<'EOF'
 Implement route preview and cost range estimation.
 
 Deliverables:
@@ -530,7 +527,7 @@ Acceptance criteria:
 EOF
 )"
 
-create_issue "Implement live `tail` CLI over SSE" "M5 Active Protection" "phase:m5,area:cli,area:admin" "$(cat <<'EOF'
+create_issue "Implement live tail CLI over SSE" "M5 Active Protection" "phase:m5,area:cli,area:admin" "$(cat <<'EOF'
 Build the operator live-view command on top of admin event SSE.
 
 Deliverables:
@@ -545,7 +542,7 @@ Acceptance criteria:
 EOF
 )"
 
-create_issue "Implement `detect status` and `detect resume`" "M5 Active Protection" "phase:m5,area:cli,area:detect" "$(cat <<'EOF'
+create_issue "Implement detect status and detect resume" "M5 Active Protection" "phase:m5,area:cli,area:detect" "$(cat <<'EOF'
 Expose detection state and recovery commands in the CLI.
 
 Deliverables:
