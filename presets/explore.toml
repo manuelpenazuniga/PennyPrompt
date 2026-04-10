@@ -1,0 +1,21 @@
+[server]
+mode = "observe"
+
+[defaults]
+provider = "anthropic"
+model = "claude-haiku-4-5"
+
+[[budgets]]
+scope_type = "global"
+scope_id = "*"
+window_type = "month"
+soft_limit_usd = 10.0
+action_on_hard = "block"
+action_on_soft = "warn"
+
+[detect]
+enabled = true
+burn_rate_alert_usd_per_hour = 5.0
+loop_window_seconds = 120
+loop_threshold_similar_requests = 8
+loop_action = "alert"
