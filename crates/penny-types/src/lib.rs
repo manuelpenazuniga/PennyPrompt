@@ -93,9 +93,17 @@ pub enum WindowType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteDecision {
-    Allow { warnings: Vec<String> },
-    Block { reason: String, detail: BudgetBlockDetail },
-    Failsafe { mode: Mode, reason: String },
+    Allow {
+        warnings: Vec<String>,
+    },
+    Block {
+        reason: String,
+        detail: BudgetBlockDetail,
+    },
+    Failsafe {
+        mode: Mode,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -168,9 +176,18 @@ pub struct RequestDigest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectAlert {
-    ToolLoop { tool_name: String, failure_count: u64 },
-    BurnRate { usd_per_hour: f64, threshold: f64 },
-    ContentLoop { similar_count: u64, window_seconds: u64 },
+    ToolLoop {
+        tool_name: String,
+        failure_count: u64,
+    },
+    BurnRate {
+        usd_per_hour: f64,
+        threshold: f64,
+    },
+    ContentLoop {
+        similar_count: u64,
+        window_seconds: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
