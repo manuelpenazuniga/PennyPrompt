@@ -1,0 +1,31 @@
+provider_id = "openai"
+provider_name = "OpenAI"
+api_format = "openai"
+source = "local"
+
+[[entries]]
+model_id = "gpt-4.1"
+external_name = "gpt-4.1"
+display_name = "GPT-4.1"
+class = "balanced"
+input_per_mtok = 2.0
+output_per_mtok = 8.0
+effective_from = "2026-04-10T00:00:00Z"
+
+[[entries]]
+model_id = "gpt-4.1-mini"
+external_name = "gpt-4.1-mini"
+display_name = "GPT-4.1 Mini"
+class = "fast"
+input_per_mtok = 0.4
+output_per_mtok = 1.6
+effective_from = "2026-04-10T00:00:00Z"
+
+[[entries]]
+model_id = "gpt-4o-mini"
+external_name = "gpt-4o-mini"
+display_name = "GPT-4o Mini"
+class = "fast"
+input_per_mtok = 0.15
+output_per_mtok = 0.6
+effective_from = "2026-04-10T00:00:00Z"
