@@ -23,8 +23,8 @@
   <img src="https://img.shields.io/badge/status-alpha-yellow?style=flat-square" />
 </p>
 
----
-Tired of unpredictable Claude/OpenAI bills? Are you worried about Anthropic's extra usage starting in April 2026? 🦀 PennyPrompt is a deterministic Rust reverse proxy acting as a financial firewall for AI agents. It intercepts OpenAI/Claude-compatible API requests to enforce hard-stop budgets, calculate real-time token costs, and generate forensic usage reports.
+
+
 ---
 
 Your AI agent just burned $47 debugging a typo. You didn't know until Tuesday.
