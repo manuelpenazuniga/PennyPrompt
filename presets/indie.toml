@@ -1,0 +1,31 @@
+[server]
+mode = "guard"
+
+[defaults]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+
+[[budgets]]
+scope_type = "global"
+scope_id = "*"
+window_type = "month"
+hard_limit_usd = 30.0
+soft_limit_usd = 20.0
+action_on_hard = "block"
+action_on_soft = "warn"
+
+[[budgets]]
+scope_type = "global"
+scope_id = "*"
+window_type = "day"
+hard_limit_usd = 10.0
+action_on_hard = "block"
+action_on_soft = "warn"
+
+[detect]
+enabled = true
+burn_rate_alert_usd_per_hour = 10.0
+loop_window_seconds = 120
+loop_threshold_similar_requests = 8
+loop_action = "pause"
+

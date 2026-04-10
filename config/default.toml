@@ -1,0 +1,49 @@
+[server]
+bind = "127.0.0.1:8585"
+admin_socket = "~/.local/share/pennyprompt/admin.sock"
+database_path = "~/.local/share/pennyprompt/penny.db"
+mode = "guard"
+
+[defaults]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+
+[attribution]
+auto_detect_project = true
+session_window_minutes = 30
+
+[providers.anthropic]
+enabled = true
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+api_format = "anthropic"
+
+[providers.openai]
+enabled = true
+base_url = "https://api.openai.com"
+api_key_env = "OPENAI_API_KEY"
+api_format = "openai"
+
+[[budgets]]
+scope_type = "global"
+scope_id = "*"
+window_type = "month"
+hard_limit_usd = 30.0
+soft_limit_usd = 20.0
+action_on_hard = "block"
+action_on_soft = "warn"
+
+[[budgets]]
+scope_type = "global"
+scope_id = "*"
+window_type = "day"
+hard_limit_usd = 10.0
+action_on_hard = "block"
+action_on_soft = "warn"
+
+[detect]
+enabled = true
+burn_rate_alert_usd_per_hour = 10.0
+loop_window_seconds = 120
+loop_threshold_similar_requests = 8
+loop_action = "pause"
