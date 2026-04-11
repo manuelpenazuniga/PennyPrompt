@@ -1,10 +1,14 @@
 //! Proxy plane implementation for PennyPrompt.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use axum::{
     extract::{Json, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -13,16 +17,20 @@ use axum::{
 use chrono::Utc;
 use penny_cost::estimate_tokens;
 use penny_providers::{MockProvider, MockProviderConfig, ProviderAdapter, ProviderError};
-use penny_store::{NewRequest, ProjectRepo, RequestRepo, SqliteStore, UsageRecord};
+use penny_store::{NewRequest, ProjectRepo, RequestRepo, SessionRepo, SqliteStore, UsageRecord};
 use penny_types::{NormalizedRequest, ResponseBody, UsageSource};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::query;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
 pub const DEFAULT_PROXY_BIND: &str = "127.0.0.1:8585";
 const REQUEST_ID_HEADER: &str = "x-penny-request-id";
+const PROJECT_OVERRIDE_HEADER: &str = "x-penny-project";
+const SESSION_OVERRIDE_HEADER: &str = "x-penny-session";
+const CWD_OVERRIDE_HEADER: &str = "x-penny-cwd";
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -39,6 +47,7 @@ pub struct ProxyState {
     models: Vec<String>,
     default_project_id: String,
     default_session_id: String,
+    session_window_minutes: u64,
 }
 
 impl ProxyState {
@@ -49,11 +58,17 @@ impl ProxyState {
             models,
             default_project_id: "default".to_string(),
             default_session_id: "session-auto".to_string(),
+            session_window_minutes: 30,
         }
     }
 
     pub fn with_store(mut self, store: SqliteStore) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    pub fn with_session_window_minutes(mut self, minutes: u64) -> Self {
+        self.session_window_minutes = minutes.max(1);
         self
     }
 
@@ -132,13 +147,26 @@ async fn request_id_middleware(mut req: Request, next: Next) -> Response {
 async fn post_chat_completions(
     State(state): State<Arc<ProxyState>>,
     Extension(ctx): Extension<RequestContext>,
+    headers: HeaderMap,
     Json(payload): Json<ChatCompletionsRequest>,
 ) -> Response {
     if let Err(message) = validate_chat_request(&payload) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_request", message);
     }
 
-    let normalized = normalize_chat_request(&ctx, &state, &payload);
+    let mut normalized = normalize_chat_request(&ctx, &state, &payload);
+    let (project_id, session_id) = match resolve_attribution(&state, &headers).await {
+        Ok(attribution) => attribution,
+        Err(message) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "attribution_failed",
+                message,
+            );
+        }
+    };
+    normalized.project_id = project_id;
+    normalized.session_id = session_id;
 
     let provider_response = match state.provider.send(normalized.clone()).await {
         Ok(response) => response,
@@ -301,6 +329,74 @@ fn estimated_usage_from_request(request: &NormalizedRequest) -> NormalizedUsage 
     }
 }
 
+async fn resolve_attribution(
+    state: &ProxyState,
+    headers: &HeaderMap,
+) -> Result<(String, String), String> {
+    let project_override =
+        header_value(headers, PROJECT_OVERRIDE_HEADER).map(|value| slugify(&value));
+    let session_override = header_value(headers, SESSION_OVERRIDE_HEADER);
+
+    let project_path_seed = if let Some(project) = &project_override {
+        format!("/override/{project}")
+    } else {
+        detect_git_root_from(headers)
+            .map(|root| root.to_string_lossy().to_string())
+            .unwrap_or_else(|| "default".to_string())
+    };
+
+    let fallback_project_id = project_override
+        .clone()
+        .unwrap_or_else(|| project_id_from_seed_path(&project_path_seed));
+    let fallback_session_id = session_override
+        .clone()
+        .unwrap_or_else(|| state.default_session_id.clone());
+
+    let Some(store) = &state.store else {
+        return Ok((fallback_project_id, fallback_session_id));
+    };
+
+    let project_id = ProjectRepo::upsert_by_path(store, &project_path_seed)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let session_id = if let Some(session_id) = session_override {
+        ensure_session_override_exists(store, &session_id, &project_id).await?;
+        session_id
+    } else {
+        match SessionRepo::find_active(store, &project_id, state.session_window_minutes)
+            .await
+            .map_err(|err| err.to_string())?
+        {
+            Some(session_id) => session_id,
+            None => SessionRepo::create(store, &project_id)
+                .await
+                .map_err(|err| err.to_string())?,
+        }
+    };
+
+    Ok((project_id, session_id))
+}
+
+async fn ensure_session_override_exists(
+    store: &SqliteStore,
+    session_id: &str,
+    project_id: &str,
+) -> Result<(), String> {
+    query(
+        r#"
+        INSERT OR IGNORE INTO sessions (id, project_id, source)
+        VALUES (?1, ?2, 'header')
+        "#,
+    )
+    .bind(session_id)
+    .bind(project_id)
+    .execute(store.pool())
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 async fn persist_request_and_usage(
     state: &ProxyState,
     normalized: &NormalizedRequest,
@@ -310,14 +406,10 @@ async fn persist_request_and_usage(
         return Ok(());
     };
 
-    let project_id = ProjectRepo::upsert_by_path(store, &state.default_project_id)
-        .await
-        .map_err(|err| err.to_string())?;
-
     let request = NewRequest {
         id: normalized.id.clone(),
-        session_id: None,
-        project_id,
+        session_id: Some(normalized.session_id.clone()),
+        project_id: normalized.project_id.clone(),
         model_requested: normalized.model_requested.clone(),
         model_used: normalized.model_resolved.clone(),
         provider_id: normalized.provider_id.clone(),
@@ -343,6 +435,74 @@ async fn persist_request_and_usage(
     Ok(())
 }
 
+fn detect_git_root_from(headers: &HeaderMap) -> Option<PathBuf> {
+    let start_path = header_value(headers, CWD_OVERRIDE_HEADER)
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())?;
+    detect_git_root(&start_path)
+}
+
+fn detect_git_root(start: &Path) -> Option<PathBuf> {
+    let mut current = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn project_id_from_seed_path(path: &str) -> String {
+    if path == "default" {
+        return "default".to_string();
+    }
+
+    Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(slugify)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn slugify(input: &str) -> String {
+    let source = input.trim().to_lowercase();
+    let mut output = String::with_capacity(source.len());
+    let mut prev_dash = false;
+    for ch in source.chars() {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            output.push('-');
+            prev_dash = true;
+        }
+    }
+    output = output.trim_matches('-').to_string();
+    if output.is_empty() {
+        "default".to_string()
+    } else {
+        output
+    }
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 fn error_response(status: StatusCode, code: &'static str, message: String) -> Response {
     (
         status,
@@ -361,6 +521,7 @@ mod tests {
         http::Request,
     };
     use sqlx::Row;
+    use tempfile::TempDir;
     use tower::ServiceExt;
 
     fn app() -> Router {
@@ -541,7 +702,7 @@ mod tests {
             .to_string();
 
         let row = sqlx::query(
-            "SELECT id, model_requested, model_used, is_streaming, started_at FROM requests WHERE id = ?1",
+            "SELECT id, model_requested, model_used, is_streaming, started_at, session_id, project_id FROM requests WHERE id = ?1",
         )
         .bind(&request_id)
         .fetch_one(store.pool())
@@ -551,6 +712,8 @@ mod tests {
         assert_eq!(row.get::<String, _>("model_requested"), "claude-sonnet-4-6");
         assert_eq!(row.get::<String, _>("model_used"), "claude-sonnet-4-6");
         assert_eq!(row.get::<i64, _>("is_streaming"), 0);
+        assert!(!row.get::<String, _>("session_id").is_empty());
+        assert!(!row.get::<String, _>("project_id").is_empty());
 
         let started_at = row.get::<String, _>("started_at");
         assert!(
@@ -568,5 +731,138 @@ mod tests {
         assert_eq!(usage.get::<String, _>("request_id"), request_id);
         assert_eq!(usage.get::<i64, _>("input_tokens"), 120);
         assert_eq!(usage.get::<i64, _>("output_tokens"), 48);
+    }
+
+    #[tokio::test]
+    async fn same_project_within_window_reuses_session() {
+        let temp = TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(temp.path().join(".git")).expect("create git marker");
+        let cwd = temp.path().to_string_lossy().to_string();
+
+        let (app, store) = app_with_store().await;
+        let request_one = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(CWD_OVERRIDE_HEADER, cwd.clone())
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"one"}]
+                })
+                .to_string(),
+            ))
+            .expect("request one");
+        let request_two = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(CWD_OVERRIDE_HEADER, cwd)
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"two"}]
+                })
+                .to_string(),
+            ))
+            .expect("request two");
+
+        let response_one = app.clone().oneshot(request_one).await.expect("resp one");
+        let response_two = app.oneshot(request_two).await.expect("resp two");
+        let request_id_one = response_one
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("request id one");
+        let request_id_two = response_two
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("request id two");
+
+        let session_one: String =
+            sqlx::query_scalar("SELECT session_id FROM requests WHERE id = ?1")
+                .bind(request_id_one)
+                .fetch_one(store.pool())
+                .await
+                .expect("session one");
+        let session_two: String =
+            sqlx::query_scalar("SELECT session_id FROM requests WHERE id = ?1")
+                .bind(request_id_two)
+                .fetch_one(store.pool())
+                .await
+                .expect("session two");
+
+        assert_eq!(session_one, session_two);
+    }
+
+    #[tokio::test]
+    async fn missing_git_root_falls_back_to_default_project() {
+        let temp = TempDir::new().expect("temp dir");
+        let cwd = temp.path().to_string_lossy().to_string();
+
+        let (app, store) = app_with_store().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(CWD_OVERRIDE_HEADER, cwd)
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"fallback"}]
+                })
+                .to_string(),
+            ))
+            .expect("request");
+
+        let response = app.oneshot(request).await.expect("response");
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("request id");
+        let project_id: String =
+            sqlx::query_scalar("SELECT project_id FROM requests WHERE id = ?1")
+                .bind(request_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("project id");
+
+        assert_eq!(project_id, "default");
+    }
+
+    #[tokio::test]
+    async fn explicit_project_and_session_headers_override_defaults() {
+        let (app, store) = app_with_store().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(PROJECT_OVERRIDE_HEADER, "Custom Project Name")
+            .header(SESSION_OVERRIDE_HEADER, "session_override_01")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"override"}]
+                })
+                .to_string(),
+            ))
+            .expect("request");
+
+        let response = app.oneshot(request).await.expect("response");
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("request id");
+
+        let row = sqlx::query("SELECT project_id, session_id FROM requests WHERE id = ?1")
+            .bind(request_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("request row");
+        assert_eq!(row.get::<String, _>("project_id"), "custom-project-name");
+        assert_eq!(row.get::<String, _>("session_id"), "session_override_01");
     }
 }
