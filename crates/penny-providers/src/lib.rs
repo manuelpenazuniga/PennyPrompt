@@ -16,6 +16,9 @@ pub trait ProviderAdapter: Send + Sync {
     async fn send(&self, req: NormalizedRequest) -> Result<ProviderResponse, ProviderError>;
     fn provider_id(&self) -> &str;
     fn supports_model(&self, model: &str) -> bool;
+    fn stream_response_lines(&self, _req: &NormalizedRequest) -> Option<Vec<String>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +174,10 @@ impl ProviderAdapter for MockProvider {
 
     fn supports_model(&self, model: &str) -> bool {
         self.config.supported_models.iter().any(|m| m == model)
+    }
+
+    fn stream_response_lines(&self, req: &NormalizedRequest) -> Option<Vec<String>> {
+        Some(self.stream_sse_lines(req))
     }
 }
 
