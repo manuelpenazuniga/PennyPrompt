@@ -4,6 +4,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use axum::{
@@ -48,6 +49,7 @@ pub struct ProxyState {
     default_project_id: String,
     default_session_id: String,
     session_window_minutes: u64,
+    started_at: Instant,
 }
 
 impl ProxyState {
@@ -59,6 +61,7 @@ impl ProxyState {
             default_project_id: "default".to_string(),
             default_session_id: "session-auto".to_string(),
             session_window_minutes: 30,
+            started_at: Instant::now(),
         }
     }
 
@@ -116,6 +119,7 @@ pub fn build_router(state: ProxyState) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(post_chat_completions))
         .route("/v1/models", get(get_models))
+        .route("/internal/health", get(get_internal_health))
         .with_state(Arc::new(state))
         .layer(middleware::from_fn(request_id_middleware))
 }
@@ -240,6 +244,33 @@ async fn get_models(State(state): State<Arc<ProxyState>>) -> Json<Value> {
         "object": "list",
         "data": data
     }))
+}
+
+async fn get_internal_health(State(state): State<Arc<ProxyState>>) -> Response {
+    let (db_status, db_error, status_code) = match &state.store {
+        None => ("disabled", None, StatusCode::OK),
+        Some(store) => match query("SELECT 1").fetch_one(store.pool()).await {
+            Ok(_) => ("up", None, StatusCode::OK),
+            Err(err) => (
+                "down",
+                Some(err.to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        },
+    };
+
+    let uptime_seconds = state.started_at.elapsed().as_secs();
+    let body = json!({
+        "status": if status_code == StatusCode::OK { "ok" } else { "degraded" },
+        "uptime_seconds": uptime_seconds,
+        "db": {
+            "status": db_status,
+            "error": db_error
+        },
+        "providers": [state.provider.provider_id()],
+    });
+
+    (status_code, Json(body)).into_response()
 }
 
 fn validate_chat_request(payload: &ChatCompletionsRequest) -> Result<(), String> {
@@ -617,6 +648,51 @@ mod tests {
             .expect("array data")
             .iter()
             .any(|item| item["id"] == "claude-sonnet-4-6"));
+    }
+
+    #[tokio::test]
+    async fn get_internal_health_returns_status_and_provider_data() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/internal/health")
+            .body(Body::empty())
+            .expect("build request");
+
+        let response = app().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(REQUEST_ID_HEADER).is_some());
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json_body["status"], "ok");
+        assert_eq!(json_body["db"]["status"], "disabled");
+        assert!(json_body["uptime_seconds"].as_u64().is_some());
+        assert!(json_body["providers"]
+            .as_array()
+            .expect("providers array")
+            .iter()
+            .any(|item| item == "mock"));
+    }
+
+    #[tokio::test]
+    async fn get_internal_health_reports_db_up_when_store_is_available() {
+        let (app, _store) = app_with_store().await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/internal/health")
+            .body(Body::empty())
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json_body["db"]["status"], "up");
     }
 
     #[tokio::test]
