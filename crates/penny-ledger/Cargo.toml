@@ -5,4 +5,10 @@ edition = "2021"
 publish = false
 
 [dependencies]
+penny-store = { path = "../penny-store" }
+penny-types = { path = "../penny-types" }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
+thiserror = "1"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

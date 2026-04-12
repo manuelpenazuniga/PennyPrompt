@@ -1095,6 +1095,13 @@ version = "0.1.0"
 [[package]]
 name = "penny-ledger"
 version = "0.1.0"
+dependencies = [
+ "penny-store",
+ "penny-types",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+]
 
 [[package]]
 name = "penny-observe"
