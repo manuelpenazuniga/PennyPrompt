@@ -239,6 +239,25 @@ Do not create these until alpha scope is stable:
 - Plugin system
 - Grafana or Prometheus metrics
 
+## Technical Review Follow-Ups
+
+Review source:
+- Gemini Code Assist comments on merged PRs `#38` through `#51` (review pass on 2026-04-12).
+
+Actioned as dedicated issues:
+- [#45](https://github.com/manuelpenazuniga/PennyPrompt/issues/45) — Harden money representation before M3/M4.
+- [#52](https://github.com/manuelpenazuniga/PennyPrompt/issues/52) — Harden proxy health and error surfaces before M3 integration.
+
+Mapped to existing planned issues (no new issue needed):
+- Streaming memory/latency behavior and reconciliation gaps → [#24](https://github.com/manuelpenazuniga/PennyPrompt/issues/24).
+- Upstream error mapping and incomplete stream handling → [#26](https://github.com/manuelpenazuniga/PennyPrompt/issues/26).
+- Budget-enforcement error contracts and structured 402 responses → [#18](https://github.com/manuelpenazuniga/PennyPrompt/issues/18).
+
+Technical annotations to revisit (future hardening, currently no dedicated issue):
+- `penny-store`: revisit pool sizing/query patterns and slug collision risk once M3 load/concurrency tests exist.
+- `penny-config`: improve cross-platform path handling (`HOME`/tilde resolution) before alpha packaging.
+- `penny-cost`: revisit historical pricing query ergonomics and non-blocking import path as performance tuning.
+
 ## Automation
 
 Use [scripts/create_github_backlog.sh](/Volumes/MacMiniExt/dev/OpenSource%20Projects/PennyPrompt/PennyPrompt/scripts/create_github_backlog.sh) to create the milestones, labels, and alpha issues once `gh` is authenticated.
