@@ -88,7 +88,7 @@ impl BudgetEvaluator {
                 remaining_by_budget,
             } => {
                 let warnings = match self
-                    .compute_soft_limit_warnings(&budgets, &remaining_by_budget, request)
+                    .compute_soft_limit_warnings(&budgets, &remaining_by_budget)
                     .await
                 {
                     Ok(warnings) => warnings,
@@ -146,20 +146,41 @@ impl BudgetEvaluator {
                     limit_usd: limit,
                     resets_at: window_reset_at(&budget.window_type),
                 };
-                self.record_event(
-                    request,
-                    EventType::BudgetBlock,
-                    Severity::Warn,
-                    json!({
-                        "mode": self.mode_tag(),
-                        "result": "block",
-                        "reason": reason,
-                        "detail": detail
-                    }),
-                )
-                .await;
-
-                RouteDecision::Block { reason, detail }
+                match self.mode {
+                    Mode::Guard => {
+                        self.record_event(
+                            request,
+                            EventType::BudgetBlock,
+                            Severity::Warn,
+                            json!({
+                                "mode": self.mode_tag(),
+                                "result": "block",
+                                "reason": reason,
+                                "detail": detail
+                            }),
+                        )
+                        .await;
+                        RouteDecision::Block { reason, detail }
+                    }
+                    Mode::Observe => {
+                        let warning = format!("observe mode budget violation: {reason}");
+                        self.record_event(
+                            request,
+                            EventType::BudgetWarn,
+                            Severity::Warn,
+                            json!({
+                                "mode": self.mode_tag(),
+                                "result": "allow_budget_violation",
+                                "reason": reason,
+                                "detail": detail
+                            }),
+                        )
+                        .await;
+                        RouteDecision::Allow {
+                            warnings: vec![warning],
+                        }
+                    }
+                }
             }
         }
     }
@@ -210,7 +231,6 @@ impl BudgetEvaluator {
         &self,
         budgets: &[Budget],
         remaining_by_budget: &[penny_types::BudgetRemaining],
-        request: &NormalizedRequest,
     ) -> Result<Vec<String>, String> {
         let mut remaining_map = HashMap::with_capacity(remaining_by_budget.len());
         for item in remaining_by_budget {
@@ -246,20 +266,6 @@ impl BudgetEvaluator {
                     soft_limit
                 ));
             }
-        }
-
-        if !warnings.is_empty() {
-            self.record_event(
-                request,
-                EventType::BudgetWarn,
-                Severity::Warn,
-                json!({
-                    "mode": self.mode_tag(),
-                    "result": "soft_limit_reached",
-                    "warnings": warnings
-                }),
-            )
-            .await;
         }
 
         Ok(warnings)
@@ -477,6 +483,11 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == EventType::BudgetWarn));
+        let warn_count = events
+            .iter()
+            .filter(|event| event.event_type == EventType::BudgetWarn)
+            .count();
+        assert_eq!(warn_count, 1);
     }
 
     #[tokio::test]
@@ -555,6 +566,34 @@ mod tests {
         .await
         .expect("load failsafe events");
         assert!(types.iter().any(|ty| ty == "mode_failsafe"));
+    }
+
+    #[tokio::test]
+    async fn observe_mode_does_not_block_on_budget_denial() {
+        let store = setup_store().await;
+        seed_budget(&store, WindowType::Day, Some(1.0), None).await;
+
+        let evaluator = BudgetEvaluator::new(store.clone(), Mode::Observe);
+        let decision = evaluator
+            .evaluate(&request("req_observe_violation"), 2.0)
+            .await;
+
+        match decision {
+            RouteDecision::Allow { warnings } => {
+                assert_eq!(warnings.len(), 1);
+                assert!(warnings[0].contains("observe mode budget violation"));
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+
+        let event_types: Vec<String> = query_scalar(
+            "SELECT event_type FROM events WHERE request_id = 'req_observe_violation' ORDER BY id",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("load observe violation events");
+        assert!(event_types.iter().any(|ty| ty == "budget_warn"));
+        assert!(!event_types.iter().any(|ty| ty == "budget_block"));
     }
 
     #[tokio::test]
