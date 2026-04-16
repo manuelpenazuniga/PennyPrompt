@@ -35,6 +35,27 @@ impl CostLedger {
         budgets: &[Budget],
         estimated_cost: f64,
     ) -> Result<Reservation, LedgerError> {
+        self.reserve_internal(request_id, budgets, estimated_cost, true)
+            .await
+    }
+
+    pub async fn reserve_allow_over_limit(
+        &self,
+        request_id: &str,
+        budgets: &[Budget],
+        estimated_cost: f64,
+    ) -> Result<Reservation, LedgerError> {
+        self.reserve_internal(request_id, budgets, estimated_cost, false)
+            .await
+    }
+
+    async fn reserve_internal(
+        &self,
+        request_id: &str,
+        budgets: &[Budget],
+        estimated_cost: f64,
+        enforce_hard_limits: bool,
+    ) -> Result<Reservation, LedgerError> {
         if request_id.trim().is_empty() {
             return Err(LedgerError::InvalidRequest("request_id must not be empty"));
         }
@@ -60,18 +81,20 @@ impl CostLedger {
         for budget in budgets {
             let current_total = latest_running_total(&mut conn, budget.id).await?;
             let new_total = current_total + estimated_cost;
-            if let Some(limit) = budget.hard_limit_usd {
-                if new_total > limit {
-                    rollback_quietly(&mut conn).await;
-                    return Ok(Reservation::Denied {
-                        budget: budget.clone(),
-                        accumulated: new_total,
-                        limit,
-                        reason: format!(
-                            "budget id {} exceeded hard limit: {:.6} > {:.6}",
-                            budget.id, new_total, limit
-                        ),
-                    });
+            if enforce_hard_limits {
+                if let Some(limit) = budget.hard_limit_usd {
+                    if new_total > limit {
+                        rollback_quietly(&mut conn).await;
+                        return Ok(Reservation::Denied {
+                            budget: budget.clone(),
+                            accumulated: new_total,
+                            limit,
+                            reason: format!(
+                                "budget id {} exceeded hard limit: {:.6} > {:.6}",
+                                budget.id, new_total, limit
+                            ),
+                        });
+                    }
                 }
             }
 
@@ -353,6 +376,47 @@ mod tests {
                 .await
                 .expect("count denied rows");
         assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn reserve_allow_over_limit_persists_entries_in_observe_style_flow() {
+        let store = setup_store().await;
+        let budget = insert_budget(&store, Some(1.0)).await;
+        let ledger = CostLedger::new(store.clone());
+
+        let reservation = ledger
+            .reserve_allow_over_limit("req_observe", std::slice::from_ref(&budget), 2.0)
+            .await
+            .expect("reserve allow over limit should succeed");
+
+        match reservation {
+            Reservation::Granted {
+                entries,
+                remaining_by_budget,
+            } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(remaining_by_budget.len(), 1);
+                assert!(remaining_by_budget[0].remaining_usd < 0.0);
+            }
+            Reservation::Denied { .. } => panic!("reservation should not deny in allow-over-limit"),
+        }
+
+        let row = query(
+            r#"
+            SELECT amount_usd, running_total
+            FROM cost_ledger
+            WHERE request_id = 'req_observe' AND entry_type = 'reserve'
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load observe reserve row");
+
+        let amount: f64 = row.get("amount_usd");
+        let running_total: f64 = row.get("running_total");
+        assert!((amount - 2.0).abs() < 1e-9);
+        assert!((running_total - 2.0).abs() < 1e-9);
     }
 
     #[tokio::test]
