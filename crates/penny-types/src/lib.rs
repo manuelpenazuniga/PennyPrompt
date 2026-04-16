@@ -1,13 +1,205 @@
 //! Shared domain types for PennyPrompt.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use std::{fmt, str::FromStr};
 use thiserror::Error;
 
 pub type RequestId = String;
 pub type SessionId = String;
 pub type ProjectId = String;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Money(i64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum MoneyError {
+    #[error("money value must be finite")]
+    NonFinite,
+    #[error("money value is out of range")]
+    OutOfRange,
+    #[error("money decimal string is invalid")]
+    InvalidFormat,
+}
+
+impl Money {
+    pub const SCALE: i64 = 1_000_000;
+    pub const ZERO: Self = Self(0);
+
+    pub fn from_micros(micros: i64) -> Self {
+        Self(micros)
+    }
+
+    pub fn micros(self) -> i64 {
+        self.0
+    }
+
+    pub fn is_negative(self) -> bool {
+        self.0 < 0
+    }
+
+    pub fn checked_add(self, rhs: Self) -> Option<Self> {
+        self.0.checked_add(rhs.0).map(Self)
+    }
+
+    pub fn checked_sub(self, rhs: Self) -> Option<Self> {
+        self.0.checked_sub(rhs.0).map(Self)
+    }
+
+    pub fn from_usd(value: f64) -> Result<Self, MoneyError> {
+        if !value.is_finite() {
+            return Err(MoneyError::NonFinite);
+        }
+        let scaled = (value * Self::SCALE as f64).round();
+        if scaled < i64::MIN as f64 || scaled > i64::MAX as f64 {
+            return Err(MoneyError::OutOfRange);
+        }
+        Ok(Self(scaled as i64))
+    }
+
+    pub fn to_usd(self) -> f64 {
+        self.0 as f64 / Self::SCALE as f64
+    }
+}
+
+impl fmt::Display for Money {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let negative = self.0 < 0;
+        let abs = self.0.unsigned_abs();
+        let whole = abs / Money::SCALE as u64;
+        let frac = abs % Money::SCALE as u64;
+        if negative {
+            write!(f, "-{whole}.{frac:06}")
+        } else {
+            write!(f, "{whole}.{frac:06}")
+        }
+    }
+}
+
+impl Serialize for Money {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(self.to_usd())
+    }
+}
+
+impl<'de> Deserialize<'de> for Money {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct MoneyVisitor;
+
+        impl<'de> de::Visitor<'de> for MoneyVisitor {
+            type Value = Money;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a decimal USD value as number or string")
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(Money::from_micros(
+                    value
+                        .checked_mul(Money::SCALE)
+                        .ok_or_else(|| E::custom(MoneyError::OutOfRange.to_string()))?,
+                ))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let signed = i64::try_from(value)
+                    .map_err(|_| E::custom(MoneyError::OutOfRange.to_string()))?;
+                self.visit_i64(signed)
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Money::from_usd(value).map_err(|err| E::custom(err.to_string()))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                parse_money_str(value).map_err(|err| E::custom(err.to_string()))
+            }
+        }
+
+        deserializer.deserialize_any(MoneyVisitor)
+    }
+}
+
+impl FromStr for Money {
+    type Err = MoneyError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_money_str(s)
+    }
+}
+
+fn parse_money_str(value: &str) -> Result<Money, MoneyError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(MoneyError::InvalidFormat);
+    }
+
+    let (negative, digits) = match trimmed.as_bytes()[0] {
+        b'-' => (true, &trimmed[1..]),
+        b'+' => (false, &trimmed[1..]),
+        _ => (false, trimmed),
+    };
+
+    if digits.is_empty() {
+        return Err(MoneyError::InvalidFormat);
+    }
+
+    let mut parts = digits.split('.');
+    let whole_part = parts.next().ok_or(MoneyError::InvalidFormat)?;
+    let frac_part = parts.next();
+    if parts.next().is_some() {
+        return Err(MoneyError::InvalidFormat);
+    }
+
+    let whole: i64 = whole_part.parse().map_err(|_| MoneyError::InvalidFormat)?;
+    let frac = match frac_part {
+        None => 0_i64,
+        Some(raw) => {
+            if raw.is_empty() || raw.len() > 6 || !raw.chars().all(|ch| ch.is_ascii_digit()) {
+                return Err(MoneyError::InvalidFormat);
+            }
+            let mut padded = raw.to_string();
+            while padded.len() < 6 {
+                padded.push('0');
+            }
+            padded
+                .parse::<i64>()
+                .map_err(|_| MoneyError::InvalidFormat)?
+        }
+    };
+
+    let whole_scaled = whole
+        .checked_mul(Money::SCALE)
+        .ok_or(MoneyError::OutOfRange)?;
+    let mut micros = whole_scaled
+        .checked_add(frac)
+        .ok_or(MoneyError::OutOfRange)?;
+
+    if negative {
+        micros = micros.checked_neg().ok_or(MoneyError::OutOfRange)?;
+    }
+
+    Ok(Money::from_micros(micros))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NormalizedRequest {
@@ -48,7 +240,7 @@ pub struct StreamDescriptor {
 pub struct AccountedUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cost_usd: f64,
+    pub cost_usd: Money,
     pub source: UsageSource,
     pub pricing_snapshot: Value,
 }
@@ -67,8 +259,8 @@ pub struct Budget {
     pub scope_type: ScopeType,
     pub scope_id: String,
     pub window_type: WindowType,
-    pub hard_limit_usd: Option<f64>,
-    pub soft_limit_usd: Option<f64>,
+    pub hard_limit_usd: Option<Money>,
+    pub soft_limit_usd: Option<Money>,
     pub action_on_hard: String,
     pub action_on_soft: String,
     pub preset_source: Option<String>,
@@ -111,8 +303,8 @@ pub enum RouteDecision {
 pub struct BudgetBlockDetail {
     pub scope: String,
     pub window: WindowType,
-    pub accumulated_usd: f64,
-    pub limit_usd: f64,
+    pub accumulated_usd: Money,
+    pub limit_usd: Money,
     pub resets_at: Option<DateTime<Utc>>,
 }
 
@@ -129,8 +321,8 @@ pub struct LedgerEntry {
     pub request_id: RequestId,
     pub entry_type: LedgerEntryType,
     pub budget_id: i64,
-    pub amount_usd: f64,
-    pub running_total: f64,
+    pub amount_usd: Money,
+    pub running_total: Money,
     pub created_at: DateTime<Utc>,
 }
 
@@ -151,8 +343,8 @@ pub enum Reservation {
     },
     Denied {
         budget: Budget,
-        accumulated: f64,
-        limit: f64,
+        accumulated: Money,
+        limit: Money,
         reason: String,
     },
 }
@@ -160,14 +352,14 @@ pub enum Reservation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BudgetRemaining {
     pub budget_id: i64,
-    pub remaining_usd: f64,
+    pub remaining_usd: Option<Money>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RequestDigest {
     pub model: String,
     pub input_tokens: u64,
-    pub cost_usd: f64,
+    pub cost_usd: Money,
     pub tool_name: Option<String>,
     pub tool_succeeded: bool,
     pub content_hash: u64,
@@ -349,8 +541,8 @@ mod tests {
             scope_type: ScopeType::Global,
             scope_id: "*".into(),
             window_type: WindowType::Day,
-            hard_limit_usd: Some(10.0),
-            soft_limit_usd: Some(8.0),
+            hard_limit_usd: Some(Money::from_usd(10.0).expect("money")),
+            soft_limit_usd: Some(Money::from_usd(8.0).expect("money")),
             action_on_hard: "block".into(),
             action_on_soft: "warn".into(),
             preset_source: Some("preset:indie".into()),
@@ -362,8 +554,8 @@ mod tests {
             detail: BudgetBlockDetail {
                 scope: "global:*".into(),
                 window: WindowType::Day,
-                accumulated_usd: 10.12,
-                limit_usd: 10.0,
+                accumulated_usd: Money::from_usd(10.12).expect("money"),
+                limit_usd: Money::from_usd(10.0).expect("money"),
                 resets_at: Some(ts()),
             },
         };
@@ -377,8 +569,8 @@ mod tests {
             request_id: "req_01".into(),
             entry_type: LedgerEntryType::Reserve,
             budget_id: 10,
-            amount_usd: 0.25,
-            running_total: 1.75,
+            amount_usd: Money::from_usd(0.25).expect("money"),
+            running_total: Money::from_usd(1.75).expect("money"),
             created_at: ts(),
         };
         assert_round_trip(&entry);
@@ -387,7 +579,7 @@ mod tests {
             entries: vec![1, 2],
             remaining_by_budget: vec![BudgetRemaining {
                 budget_id: 10,
-                remaining_usd: 8.25,
+                remaining_usd: Some(Money::from_usd(8.25).expect("money")),
             }],
         };
         assert_round_trip(&reservation);
@@ -398,7 +590,7 @@ mod tests {
         let digest = RequestDigest {
             model: "claude-sonnet-4-6".into(),
             input_tokens: 2000,
-            cost_usd: 0.43,
+            cost_usd: Money::from_usd(0.43).expect("money"),
             tool_name: Some("shell".into()),
             tool_succeeded: false,
             content_hash: 998877,
@@ -435,5 +627,15 @@ mod tests {
 
         let error = PennyError::Budget("hard limit exceeded".into());
         assert_round_trip(&error);
+    }
+
+    #[test]
+    fn money_round_trip_and_parse() {
+        let value = Money::from_usd(12.345678).expect("money");
+        assert_eq!(value.to_string(), "12.345678");
+        assert_round_trip(&value);
+
+        let parsed = "0.42".parse::<Money>().expect("parse money");
+        assert_eq!(parsed, Money::from_usd(0.42).expect("money"));
     }
 }

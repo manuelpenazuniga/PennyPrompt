@@ -28,8 +28,8 @@ use penny_store::{
     BudgetRepo, NewRequest, ProjectRepo, RequestRepo, SessionRepo, SqliteStore, UsageRecord,
 };
 use penny_types::{
-    Budget, BudgetBlockDetail, Mode, NormalizedRequest, ResponseBody, RouteDecision, ScopeType,
-    UsageSource, WindowType,
+    Budget, BudgetBlockDetail, Mode, Money, NormalizedRequest, ResponseBody, RouteDecision,
+    ScopeType, UsageSource, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -173,7 +173,7 @@ struct NormalizedUsage {
 
 #[derive(Debug, Clone, Copy)]
 struct BudgetEnforcementContext {
-    estimated_cost_usd: f64,
+    estimated_cost_usd: Money,
     reserve_persisted: bool,
 }
 
@@ -270,7 +270,7 @@ async fn post_chat_completions(
                     enforcement
                         .as_ref()
                         .map(|ctx| ctx.estimated_cost_usd)
-                        .unwrap_or(0.0)
+                        .unwrap_or(Money::ZERO)
                 });
             if let Some(context) = enforcement {
                 if let Err(message) = reconcile_after_dispatch(
@@ -312,7 +312,7 @@ async fn post_chat_completions(
                         enforcement
                             .as_ref()
                             .map(|ctx| ctx.estimated_cost_usd)
-                            .unwrap_or(0.0)
+                            .unwrap_or(Money::ZERO)
                     });
                 if let Some(context) = enforcement {
                     if let Err(message) = reconcile_after_dispatch(
@@ -614,8 +614,12 @@ fn map_config_budget(budget: &RuntimeBudgetConfig) -> Budget {
         scope_type: scope_type_from_config(&budget.scope_type),
         scope_id: budget.scope_id.clone(),
         window_type: window_type_from_config(&budget.window_type),
-        hard_limit_usd: budget.hard_limit_usd,
-        soft_limit_usd: budget.soft_limit_usd,
+        hard_limit_usd: budget
+            .hard_limit_usd
+            .and_then(|value| Money::from_usd(value).ok()),
+        soft_limit_usd: budget
+            .soft_limit_usd
+            .and_then(|value| Money::from_usd(value).ok()),
         action_on_hard: budget.action_on_hard.clone(),
         action_on_soft: budget.action_on_soft.clone(),
         preset_source: budget.preset_source.clone(),
@@ -671,7 +675,7 @@ async fn evaluate_budget_before_dispatch(
 
     if !has_budgets {
         return Ok(Some(BudgetEnforcementContext {
-            estimated_cost_usd: 0.0,
+            estimated_cost_usd: Money::ZERO,
             reserve_persisted: false,
         }));
     }
@@ -687,7 +691,7 @@ async fn evaluate_budget_before_dispatch(
                     None,
                 ));
             }
-            0.0
+            Money::ZERO
         }
     };
 
@@ -702,7 +706,7 @@ async fn evaluate_budget_before_dispatch(
         }
         RouteDecision::Block { reason, detail } => {
             let message = format!(
-                "{} ({:?}) exceeded: {:.6} / {:.6} - {reason}",
+                "{} ({:?}) exceeded: {} / {} - {reason}",
                 detail.scope, detail.window, detail.accumulated_usd, detail.limit_usd
             );
             Err(budget_error_response(
@@ -732,9 +736,9 @@ async fn evaluate_budget_before_dispatch(
 async fn estimated_request_cost_usd(
     state: &ProxyState,
     request: &NormalizedRequest,
-) -> Result<f64, String> {
+) -> Result<Money, String> {
     let Some(store) = &state.store else {
-        return Ok(0.0);
+        return Ok(Money::ZERO);
     };
     PricingEngine::new(store)
         .calculate(
@@ -750,9 +754,9 @@ async fn actual_usage_cost_usd(
     state: &ProxyState,
     request: &NormalizedRequest,
     usage: &NormalizedUsage,
-) -> Result<f64, String> {
+) -> Result<Money, String> {
     let Some(store) = &state.store else {
-        return Ok(0.0);
+        return Ok(Money::ZERO);
     };
     PricingEngine::new(store)
         .calculate(
@@ -786,7 +790,7 @@ async fn has_any_budget(store: &SqliteStore) -> Result<bool, String> {
 async fn reconcile_after_dispatch(
     state: &ProxyState,
     request_id: &str,
-    usage_cost_usd: f64,
+    usage_cost_usd: Money,
     reserve_persisted: bool,
 ) -> Result<(), String> {
     if !reserve_persisted {
@@ -820,7 +824,7 @@ async fn persist_request_and_usage(
     state: &ProxyState,
     normalized: &NormalizedRequest,
     usage: &NormalizedUsage,
-    cost_usd: f64,
+    cost_usd: Money,
 ) -> Result<(), String> {
     let Some(store) = &state.store else {
         return Ok(());
@@ -977,7 +981,7 @@ mod tests {
     use penny_config::{load_config, LoadOptions};
     use penny_cost::import_pricebook_files;
     use penny_store::BudgetRepo;
-    use penny_types::{Budget, RouteDecision, ScopeType, WindowType};
+    use penny_types::{Budget, Money, RouteDecision, ScopeType, WindowType};
     use sqlx::Row;
     use std::fs;
     use std::path::PathBuf;
@@ -1012,7 +1016,7 @@ mod tests {
         .expect("import pricebooks");
     }
 
-    async fn seed_global_day_budget(store: &SqliteStore, hard_limit_usd: f64) {
+    async fn seed_global_day_budget(store: &SqliteStore, hard_limit_usd: Money) {
         BudgetRepo::upsert(
             store,
             &Budget {
@@ -1121,7 +1125,10 @@ action_on_soft = "warn"
             .expect("list all budgets");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].window_type, WindowType::Day);
-        assert_eq!(all[0].hard_limit_usd, Some(7.0));
+        assert_eq!(
+            all[0].hard_limit_usd,
+            Some(Money::from_usd(7.0).expect("money"))
+        );
         assert_eq!(all[0].preset_source, None);
     }
 
@@ -1143,7 +1150,10 @@ action_on_soft = "warn"
 
         let evaluator = BudgetEvaluator::new(store, Mode::Guard);
         let decision = evaluator
-            .evaluate(&budget_request("req_seeded_eval"), 11.0)
+            .evaluate(
+                &budget_request("req_seeded_eval"),
+                Money::from_usd(11.0).expect("money"),
+            )
             .await;
         assert!(matches!(decision, RouteDecision::Block { .. }));
     }
@@ -1515,7 +1525,7 @@ action_on_soft = "warn"
     async fn over_budget_request_returns_structured_402_and_never_429() {
         let (app, store) = app_with_store().await;
         seed_pricebooks(&store).await;
-        seed_global_day_budget(&store, 0.0).await;
+        seed_global_day_budget(&store, Money::from_usd(0.0).expect("money")).await;
 
         let request = Request::builder()
             .method("POST")
@@ -1557,7 +1567,7 @@ action_on_soft = "warn"
     async fn successful_dispatch_persists_reserve_then_reconcile() {
         let (app, store) = app_with_store().await;
         seed_pricebooks(&store).await;
-        seed_global_day_budget(&store, 10.0).await;
+        seed_global_day_budget(&store, Money::from_usd(10.0).expect("money")).await;
 
         let request = Request::builder()
             .method("POST")
@@ -1596,7 +1606,7 @@ action_on_soft = "warn"
             .await
             .expect("create in-memory store");
         seed_pricebooks(&store).await;
-        seed_global_day_budget(&store, 10.0).await;
+        seed_global_day_budget(&store, Money::from_usd(10.0).expect("money")).await;
 
         let failing_provider = MockProvider::new(MockProviderConfig {
             supported_models: Vec::new(),
