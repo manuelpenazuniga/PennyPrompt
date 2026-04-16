@@ -8,6 +8,8 @@ publish = false
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 penny-cost = { path = "../penny-cost" }
+penny-budget = { path = "../penny-budget" }
+penny-ledger = { path = "../penny-ledger" }
 penny-providers = { path = "../penny-providers" }
 penny-store = { path = "../penny-store" }
 penny-types = { path = "../penny-types" }
