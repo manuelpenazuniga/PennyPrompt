@@ -492,6 +492,7 @@ mod tests {
                 soft_limit_usd: soft_limit,
                 action_on_hard: "block".to_string(),
                 action_on_soft: "warn".to_string(),
+                preset_source: None,
             },
         )
         .await

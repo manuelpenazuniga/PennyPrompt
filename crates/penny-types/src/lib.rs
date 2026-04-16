@@ -71,6 +71,7 @@ pub struct Budget {
     pub soft_limit_usd: Option<f64>,
     pub action_on_hard: String,
     pub action_on_soft: String,
+    pub preset_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -352,6 +353,7 @@ mod tests {
             soft_limit_usd: Some(8.0),
             action_on_hard: "block".into(),
             action_on_soft: "warn".into(),
+            preset_source: Some("preset:indie".into()),
         };
         assert_round_trip(&budget);
 
