@@ -16,13 +16,17 @@ use axum::{
     Extension, Router,
 };
 use chrono::Utc;
-use penny_cost::estimate_tokens;
+use penny_budget::BudgetEvaluator;
+use penny_cost::{estimate_tokens, PricingEngine};
+use penny_ledger::CostLedger;
 use penny_providers::{MockProvider, MockProviderConfig, ProviderAdapter, ProviderError};
 use penny_store::{NewRequest, ProjectRepo, RequestRepo, SessionRepo, SqliteStore, UsageRecord};
-use penny_types::{NormalizedRequest, ResponseBody, UsageSource};
+use penny_types::{
+    BudgetBlockDetail, Mode, NormalizedRequest, ResponseBody, RouteDecision, UsageSource,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::query;
+use sqlx::{query, query_scalar};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -46,6 +50,7 @@ pub struct ProxyState {
     provider: Arc<dyn ProviderAdapter>,
     store: Option<SqliteStore>,
     models: Vec<String>,
+    mode: Mode,
     default_project_id: String,
     default_session_id: String,
     session_window_minutes: u64,
@@ -58,6 +63,7 @@ impl ProxyState {
             provider,
             store: None,
             models,
+            mode: Mode::Guard,
             default_project_id: "default".to_string(),
             default_session_id: "session-auto".to_string(),
             session_window_minutes: 30,
@@ -72,6 +78,11 @@ impl ProxyState {
 
     pub fn with_session_window_minutes(mut self, minutes: u64) -> Self {
         self.session_window_minutes = minutes.max(1);
+        self
+    }
+
+    pub fn with_mode(mut self, mode: Mode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -107,12 +118,33 @@ struct ApiErrorDetail {
     message: String,
 }
 
+#[derive(Debug, Serialize)]
+struct BudgetApiError {
+    error: BudgetApiErrorDetail,
+}
+
+#[derive(Debug, Serialize)]
+struct BudgetApiErrorDetail {
+    #[serde(rename = "type")]
+    error_type: &'static str,
+    retryable: bool,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget: Option<BudgetBlockDetail>,
+}
+
 #[derive(Debug, Clone)]
 struct NormalizedUsage {
     input_tokens: u64,
     output_tokens: u64,
     source: UsageSource,
     pricing_snapshot: Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BudgetEnforcementContext {
+    estimated_cost_usd: f64,
+    reserve_persisted: bool,
 }
 
 pub fn build_router(state: ProxyState) -> Router {
@@ -172,9 +204,22 @@ async fn post_chat_completions(
     normalized.project_id = project_id;
     normalized.session_id = session_id;
 
+    let enforcement = match evaluate_budget_before_dispatch(&state, &normalized).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+
     let provider_response = match state.provider.send(normalized.clone()).await {
         Ok(response) => response,
         Err(ProviderError::UnsupportedModel(model)) => {
+            if let Some(context) = enforcement {
+                maybe_release_on_dispatch_failure(
+                    &state,
+                    &normalized.id,
+                    context.reserve_persisted,
+                )
+                .await;
+            }
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "unsupported_model",
@@ -188,7 +233,33 @@ async fn post_chat_completions(
         ResponseBody::Complete(value) => {
             let usage = provider_usage_from_completion(&value)
                 .unwrap_or_else(|| estimated_usage_from_request(&normalized));
-            if let Err(message) = persist_request_and_usage(&state, &normalized, &usage).await {
+            let usage_cost_usd = actual_usage_cost_usd(&state, &normalized, &usage)
+                .await
+                .unwrap_or_else(|_| {
+                    enforcement
+                        .as_ref()
+                        .map(|ctx| ctx.estimated_cost_usd)
+                        .unwrap_or(0.0)
+                });
+            if let Some(context) = enforcement {
+                if let Err(message) = reconcile_after_dispatch(
+                    &state,
+                    &normalized.id,
+                    usage_cost_usd,
+                    context.reserve_persisted,
+                )
+                .await
+                {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "ledger_reconcile_failed",
+                        message,
+                    );
+                }
+            }
+            if let Err(message) =
+                persist_request_and_usage(&state, &normalized, &usage, usage_cost_usd).await
+            {
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "persistence_failed",
@@ -202,7 +273,33 @@ async fn post_chat_completions(
             if let Some(lines) = state.provider.stream_response_lines(&normalized) {
                 let usage = provider_usage_from_sse_lines(&lines)
                     .unwrap_or_else(|| estimated_usage_from_request(&normalized));
-                if let Err(message) = persist_request_and_usage(&state, &normalized, &usage).await {
+                let usage_cost_usd = actual_usage_cost_usd(&state, &normalized, &usage)
+                    .await
+                    .unwrap_or_else(|_| {
+                        enforcement
+                            .as_ref()
+                            .map(|ctx| ctx.estimated_cost_usd)
+                            .unwrap_or(0.0)
+                    });
+                if let Some(context) = enforcement {
+                    if let Err(message) = reconcile_after_dispatch(
+                        &state,
+                        &normalized.id,
+                        usage_cost_usd,
+                        context.reserve_persisted,
+                    )
+                    .await
+                    {
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "ledger_reconcile_failed",
+                            message,
+                        );
+                    }
+                }
+                if let Err(message) =
+                    persist_request_and_usage(&state, &normalized, &usage, usage_cost_usd).await
+                {
                     return error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "persistence_failed",
@@ -217,6 +314,14 @@ async fn post_chat_completions(
                 );
                 response
             } else {
+                if let Some(context) = enforcement {
+                    maybe_release_on_dispatch_failure(
+                        &state,
+                        &normalized.id,
+                        context.reserve_persisted,
+                    )
+                    .await;
+                }
                 error_response(
                     StatusCode::NOT_IMPLEMENTED,
                     "streaming_not_supported",
@@ -428,10 +533,174 @@ async fn ensure_session_override_exists(
     Ok(())
 }
 
+async fn evaluate_budget_before_dispatch(
+    state: &ProxyState,
+    request: &NormalizedRequest,
+) -> Result<Option<BudgetEnforcementContext>, Response> {
+    let Some(store) = &state.store else {
+        return Ok(None);
+    };
+
+    let has_budgets = match has_any_budget(store).await {
+        Ok(value) => value,
+        Err(message) => {
+            if matches!(state.mode, Mode::Guard) {
+                return Err(budget_error_response(
+                    "budget_engine_failure",
+                    format!("budget engine failed before dispatch: {message}"),
+                    None,
+                ));
+            }
+            false
+        }
+    };
+
+    if !has_budgets {
+        return Ok(Some(BudgetEnforcementContext {
+            estimated_cost_usd: 0.0,
+            reserve_persisted: false,
+        }));
+    }
+
+    let estimated_cost_usd = match estimated_request_cost_usd(state, request).await {
+        Ok(cost) => cost,
+        Err(message) => {
+            if matches!(state.mode, Mode::Guard) {
+                return Err(budget_error_response(
+                    "budget_engine_failure",
+                    format!("budget engine failed before dispatch: {message}"),
+                    None,
+                ));
+            }
+            0.0
+        }
+    };
+
+    let evaluator = BudgetEvaluator::new(store.clone(), state.mode.clone());
+    match evaluator.evaluate(request, estimated_cost_usd).await {
+        RouteDecision::Allow { .. } => {
+            let reserve_persisted = has_reserve_entry(store, &request.id).await.unwrap_or(false);
+            Ok(Some(BudgetEnforcementContext {
+                estimated_cost_usd,
+                reserve_persisted,
+            }))
+        }
+        RouteDecision::Block { reason, detail } => {
+            let message = format!(
+                "{} ({:?}) exceeded: {:.6} / {:.6} - {reason}",
+                detail.scope, detail.window, detail.accumulated_usd, detail.limit_usd
+            );
+            Err(budget_error_response(
+                "budget_exceeded",
+                message,
+                Some(detail),
+            ))
+        }
+        RouteDecision::Failsafe { mode, reason } => {
+            if matches!(mode, Mode::Guard) {
+                Err(budget_error_response("budget_engine_failure", reason, None))
+            } else {
+                Ok(Some(BudgetEnforcementContext {
+                    estimated_cost_usd,
+                    reserve_persisted: false,
+                }))
+            }
+        }
+    }
+}
+
+async fn estimated_request_cost_usd(
+    state: &ProxyState,
+    request: &NormalizedRequest,
+) -> Result<f64, String> {
+    let Some(store) = &state.store else {
+        return Ok(0.0);
+    };
+    PricingEngine::new(store)
+        .calculate(
+            &request.model_resolved,
+            request.estimated_input_tokens,
+            request.estimated_output_tokens,
+        )
+        .await
+        .map_err(|err| err.to_string())
+}
+
+async fn actual_usage_cost_usd(
+    state: &ProxyState,
+    request: &NormalizedRequest,
+    usage: &NormalizedUsage,
+) -> Result<f64, String> {
+    let Some(store) = &state.store else {
+        return Ok(0.0);
+    };
+    PricingEngine::new(store)
+        .calculate(
+            &request.model_resolved,
+            usage.input_tokens,
+            usage.output_tokens,
+        )
+        .await
+        .map_err(|err| err.to_string())
+}
+
+async fn has_reserve_entry(store: &SqliteStore, request_id: &str) -> Result<bool, String> {
+    let reserve_count: i64 = query_scalar(
+        "SELECT COUNT(*) FROM cost_ledger WHERE request_id = ?1 AND entry_type = 'reserve'",
+    )
+    .bind(request_id)
+    .fetch_one(store.pool())
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(reserve_count > 0)
+}
+
+async fn has_any_budget(store: &SqliteStore) -> Result<bool, String> {
+    let budget_count: i64 = query_scalar("SELECT COUNT(*) FROM budgets")
+        .fetch_one(store.pool())
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(budget_count > 0)
+}
+
+async fn reconcile_after_dispatch(
+    state: &ProxyState,
+    request_id: &str,
+    usage_cost_usd: f64,
+    reserve_persisted: bool,
+) -> Result<(), String> {
+    if !reserve_persisted {
+        return Ok(());
+    }
+    let Some(store) = &state.store else {
+        return Ok(());
+    };
+    CostLedger::new(store.clone())
+        .reconcile(request_id, usage_cost_usd)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+async fn maybe_release_on_dispatch_failure(
+    state: &ProxyState,
+    request_id: &str,
+    reserve_persisted: bool,
+) {
+    if !reserve_persisted {
+        return;
+    }
+    let Some(store) = &state.store else {
+        return;
+    };
+    let _ = CostLedger::new(store.clone()).release(request_id).await;
+}
+
 async fn persist_request_and_usage(
     state: &ProxyState,
     normalized: &NormalizedRequest,
     usage: &NormalizedUsage,
+    cost_usd: f64,
 ) -> Result<(), String> {
     let Some(store) = &state.store else {
         return Ok(());
@@ -455,7 +724,7 @@ async fn persist_request_and_usage(
         request_id: normalized.id.clone(),
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
-        cost_usd: 0.0,
+        cost_usd,
         source: usage.source.clone(),
         pricing_snapshot: usage.pricing_snapshot.clone(),
     };
@@ -544,6 +813,25 @@ fn error_response(status: StatusCode, code: &'static str, message: String) -> Re
         .into_response()
 }
 
+fn budget_error_response(
+    error_type: &'static str,
+    message: String,
+    budget: Option<BudgetBlockDetail>,
+) -> Response {
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        Json(json!(BudgetApiError {
+            error: BudgetApiErrorDetail {
+                error_type,
+                retryable: false,
+                message,
+                budget,
+            }
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,7 +839,11 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
     };
+    use penny_cost::import_pricebook_files;
+    use penny_store::BudgetRepo;
+    use penny_types::{Budget, ScopeType, WindowType};
     use sqlx::Row;
+    use std::path::PathBuf;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -565,6 +857,40 @@ mod tests {
             .expect("create in-memory store");
         let state = ProxyState::mock_default().with_store(store.clone());
         (build_router(state), store)
+    }
+
+    async fn seed_pricebooks(store: &SqliteStore) {
+        let prices_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../prices")
+            .canonicalize()
+            .expect("resolve prices dir");
+        import_pricebook_files(
+            store,
+            &[
+                prices_dir.join("anthropic.toml"),
+                prices_dir.join("openai.toml"),
+            ],
+        )
+        .await
+        .expect("import pricebooks");
+    }
+
+    async fn seed_global_day_budget(store: &SqliteStore, hard_limit_usd: f64) {
+        BudgetRepo::upsert(
+            store,
+            &Budget {
+                id: 0,
+                scope_type: ScopeType::Global,
+                scope_id: "*".to_string(),
+                window_type: WindowType::Day,
+                hard_limit_usd: Some(hard_limit_usd),
+                soft_limit_usd: None,
+                action_on_hard: "block".to_string(),
+                action_on_soft: "warn".to_string(),
+            },
+        )
+        .await
+        .expect("seed budget");
     }
 
     #[tokio::test]
@@ -807,6 +1133,133 @@ mod tests {
         assert_eq!(usage.get::<String, _>("request_id"), request_id);
         assert_eq!(usage.get::<i64, _>("input_tokens"), 120);
         assert_eq!(usage.get::<i64, _>("output_tokens"), 48);
+    }
+
+    #[tokio::test]
+    async fn over_budget_request_returns_structured_402_and_never_429() {
+        let (app, store) = app_with_store().await;
+        seed_pricebooks(&store).await;
+        seed_global_day_budget(&store, 0.0).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"should block"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(json_body["error"]["type"], "budget_exceeded");
+        assert_eq!(json_body["error"]["retryable"], false);
+        assert_eq!(json_body["error"]["budget"]["scope"], "global:*");
+        assert_eq!(json_body["error"]["budget"]["window"], "day");
+        assert!(
+            json_body["error"]["budget"]["accumulated_usd"]
+                .as_f64()
+                .expect("accumulated as f64")
+                > 0.0
+        );
+        assert_eq!(json_body["error"]["budget"]["limit_usd"], 0.0);
+        assert!(json_body["error"]["budget"]["resets_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn successful_dispatch_persists_reserve_then_reconcile() {
+        let (app, store) = app_with_store().await;
+        seed_pricebooks(&store).await;
+        seed_global_day_budget(&store, 10.0).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"reserve and reconcile"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("request id header");
+
+        let entry_types: Vec<String> = sqlx::query_scalar(
+            "SELECT entry_type FROM cost_ledger WHERE request_id = ?1 ORDER BY id",
+        )
+        .bind(request_id)
+        .fetch_all(store.pool())
+        .await
+        .expect("ledger entries");
+        assert_eq!(entry_types, vec!["reserve", "reconcile"]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_failure_releases_reserved_amount() {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        seed_pricebooks(&store).await;
+        seed_global_day_budget(&store, 10.0).await;
+
+        let failing_provider = MockProvider::new(MockProviderConfig {
+            supported_models: Vec::new(),
+            ..MockProviderConfig::default()
+        });
+        let state = ProxyState::with_provider(Arc::new(failing_provider), Vec::new())
+            .with_store(store.clone())
+            .with_mode(Mode::Guard);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"force dispatch failure"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("request id header");
+        let entry_types: Vec<String> = sqlx::query_scalar(
+            "SELECT entry_type FROM cost_ledger WHERE request_id = ?1 ORDER BY id",
+        )
+        .bind(request_id)
+        .fetch_all(store.pool())
+        .await
+        .expect("ledger entries");
+        assert_eq!(entry_types, vec!["reserve", "release"]);
     }
 
     #[tokio::test]
