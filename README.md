@@ -389,6 +389,7 @@ cargo run -- serve --mock
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the crate dependency map.
+For the day-to-day issue workflow used in this repo, see [docs/DEVELOPMENT_WORKFLOW.md](docs/DEVELOPMENT_WORKFLOW.md).
 
 ## License
 
