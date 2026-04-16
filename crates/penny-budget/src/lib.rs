@@ -10,7 +10,7 @@ use penny_types::{
     ScopeType, Severity, WindowType,
 };
 use serde_json::json;
-use sqlx::query_scalar;
+use sqlx::{QueryBuilder, Row, Sqlite};
 
 #[derive(Clone)]
 pub struct BudgetEvaluator {
@@ -204,40 +204,13 @@ impl BudgetEvaluator {
         &self,
         request: &NormalizedRequest,
     ) -> Result<Vec<Budget>, String> {
-        let scopes = [
-            (ScopeType::Global, "*".to_string()),
-            (ScopeType::Project, request.project_id.clone()),
-            (ScopeType::Session, request.session_id.clone()),
-        ];
-        let windows = [
-            WindowType::Day,
-            WindowType::Week,
-            WindowType::Month,
-            WindowType::Total,
-        ];
-
-        let mut dedupe = HashSet::new();
-        let mut budgets = Vec::new();
-
-        for window in &windows {
-            for (scope_type, scope_id) in &scopes {
-                let found = BudgetRepo::list_applicable(
-                    &self.store,
-                    scope_type.clone(),
-                    scope_id,
-                    window.clone(),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-
-                for budget in found {
-                    if dedupe.insert(budget.id) {
-                        budgets.push(budget);
-                    }
-                }
-            }
-        }
-
+        let mut budgets = BudgetRepo::list_applicable_for_request(
+            &self.store,
+            &request.project_id,
+            &request.session_id,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         budgets.sort_by_key(|budget| budget.id);
         Ok(budgets)
     }
@@ -287,6 +260,26 @@ impl BudgetEvaluator {
             remaining_map.insert(item.budget_id, item.remaining_usd);
         }
 
+        let mut lookup_budget_ids = HashSet::new();
+        for budget in budgets {
+            if budget.hard_limit_usd.is_none() {
+                lookup_budget_ids.insert(budget.id);
+                continue;
+            }
+
+            if !matches!(
+                remaining_map.get(&budget.id),
+                Some(remaining) if remaining.is_finite()
+            ) {
+                lookup_budget_ids.insert(budget.id);
+            }
+        }
+
+        let running_totals = self
+            .latest_running_totals(&lookup_budget_ids.into_iter().collect::<Vec<_>>())
+            .await
+            .map_err(|error| error.to_string())?;
+
         let mut warnings = Vec::new();
         for budget in budgets {
             let Some(soft_limit) = budget.soft_limit_usd else {
@@ -296,15 +289,10 @@ impl BudgetEvaluator {
             let accumulated = if let Some(limit) = budget.hard_limit_usd {
                 match remaining_map.get(&budget.id) {
                     Some(remaining) if remaining.is_finite() => limit - *remaining,
-                    _ => self
-                        .latest_running_total(budget.id)
-                        .await
-                        .map_err(|error| error.to_string())?,
+                    _ => *running_totals.get(&budget.id).unwrap_or(&0.0),
                 }
             } else {
-                self.latest_running_total(budget.id)
-                    .await
-                    .map_err(|error| error.to_string())?
+                *running_totals.get(&budget.id).unwrap_or(&0.0)
             };
 
             if accumulated >= soft_limit {
@@ -321,20 +309,41 @@ impl BudgetEvaluator {
         Ok(warnings)
     }
 
-    async fn latest_running_total(&self, budget_id: i64) -> Result<f64, sqlx::Error> {
-        query_scalar(
+    async fn latest_running_totals(
+        &self,
+        budget_ids: &[i64],
+    ) -> Result<HashMap<i64, f64>, sqlx::Error> {
+        if budget_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut qb = QueryBuilder::<Sqlite>::new(
             r#"
-            SELECT running_total
+            SELECT budget_id, running_total
             FROM cost_ledger
-            WHERE budget_id = ?1
-            ORDER BY id DESC
-            LIMIT 1
+            WHERE budget_id IN (
             "#,
-        )
-        .bind(budget_id)
-        .fetch_optional(self.store.pool())
-        .await
-        .map(|value: Option<f64>| value.unwrap_or(0.0))
+        );
+        {
+            let mut separated = qb.separated(", ");
+            for budget_id in budget_ids {
+                separated.push_bind(*budget_id);
+            }
+        }
+        qb.push(
+            r#")
+            ORDER BY budget_id ASC, id DESC
+            "#,
+        );
+
+        let rows = qb.build().fetch_all(self.store.pool()).await?;
+        let mut totals = HashMap::with_capacity(budget_ids.len());
+        for row in rows {
+            let budget_id: i64 = row.get("budget_id");
+            let running_total: f64 = row.get("running_total");
+            totals.entry(budget_id).or_insert(running_total);
+        }
+        Ok(totals)
     }
 
     async fn failsafe_decision(

@@ -220,6 +220,11 @@ pub trait BudgetRepo {
         scope_id: &str,
         window_type: WindowType,
     ) -> Result<Vec<Budget>, StoreError>;
+    async fn list_applicable_for_request(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<Budget>, StoreError>;
     async fn upsert(&self, budget: &Budget) -> Result<Budget, StoreError>;
     async fn list_all(&self) -> Result<Vec<Budget>, StoreError>;
 }
@@ -457,6 +462,32 @@ impl BudgetRepo for SqliteStore {
         .bind(window_type_db)
         .bind(scope_type_db)
         .bind(scope_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(budget_from_row).collect()
+    }
+
+    async fn list_applicable_for_request(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<Budget>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft
+            FROM budgets
+            WHERE window_type IN ('day', 'week', 'month', 'total')
+              AND (
+                (scope_type = 'global' AND scope_id = '*')
+                OR (scope_type = 'project' AND scope_id = ?1)
+                OR (scope_type = 'session' AND scope_id = ?2)
+              )
+            ORDER BY id
+            "#,
+        )
+        .bind(project_id)
+        .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -1044,6 +1075,66 @@ mod tests {
 
         let all = store.list_all().await.expect("list all");
         assert_eq!(all.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn budget_repo_list_applicable_for_request_returns_all_scope_matches() {
+        let store = setup_store().await;
+
+        let budgets = vec![
+            Budget {
+                id: 0,
+                scope_type: ScopeType::Global,
+                scope_id: "*".into(),
+                window_type: WindowType::Day,
+                hard_limit_usd: Some(100.0),
+                soft_limit_usd: None,
+                action_on_hard: "block".into(),
+                action_on_soft: "warn".into(),
+            },
+            Budget {
+                id: 0,
+                scope_type: ScopeType::Project,
+                scope_id: "project-alpha".into(),
+                window_type: WindowType::Week,
+                hard_limit_usd: Some(200.0),
+                soft_limit_usd: None,
+                action_on_hard: "block".into(),
+                action_on_soft: "warn".into(),
+            },
+            Budget {
+                id: 0,
+                scope_type: ScopeType::Session,
+                scope_id: "session-123".into(),
+                window_type: WindowType::Month,
+                hard_limit_usd: Some(300.0),
+                soft_limit_usd: None,
+                action_on_hard: "block".into(),
+                action_on_soft: "warn".into(),
+            },
+            Budget {
+                id: 0,
+                scope_type: ScopeType::Project,
+                scope_id: "other-project".into(),
+                window_type: WindowType::Total,
+                hard_limit_usd: Some(400.0),
+                soft_limit_usd: None,
+                action_on_hard: "block".into(),
+                action_on_soft: "warn".into(),
+            },
+        ];
+
+        for budget in &budgets {
+            store.upsert(budget).await.expect("upsert budget");
+        }
+
+        let found = store
+            .list_applicable_for_request("project-alpha", "session-123")
+            .await
+            .expect("list applicable for request");
+
+        let found_ids: Vec<i64> = found.into_iter().map(|budget| budget.id).collect();
+        assert_eq!(found_ids.len(), 3);
     }
 
     #[tokio::test]
