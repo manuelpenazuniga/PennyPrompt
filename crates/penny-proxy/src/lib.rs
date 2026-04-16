@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 use sqlx::{query, query_scalar};
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 pub const DEFAULT_PROXY_BIND: &str = "127.0.0.1:8585";
@@ -43,6 +44,8 @@ const REQUEST_ID_HEADER: &str = "x-penny-request-id";
 const PROJECT_OVERRIDE_HEADER: &str = "x-penny-project";
 const SESSION_OVERRIDE_HEADER: &str = "x-penny-session";
 const CWD_OVERRIDE_HEADER: &str = "x-penny-cwd";
+const INTERNAL_HEALTH_HEADER: &str = "x-penny-internal-health";
+const INTERNAL_HEALTH_HEADER_VALUE: &str = "1";
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -61,6 +64,7 @@ pub struct ProxyState {
     default_project_id: String,
     default_session_id: String,
     session_window_minutes: u64,
+    health_db_probe_timeout: Duration,
     started_at: Instant,
 }
 
@@ -74,6 +78,7 @@ impl ProxyState {
             default_project_id: "default".to_string(),
             default_session_id: "session-auto".to_string(),
             session_window_minutes: 30,
+            health_db_probe_timeout: Duration::from_millis(200),
             started_at: Instant::now(),
         }
     }
@@ -90,6 +95,11 @@ impl ProxyState {
 
     pub fn with_mode(mut self, mode: Mode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn with_health_db_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.health_db_probe_timeout = timeout;
         self
     }
 
@@ -214,9 +224,10 @@ async fn post_chat_completions(
     let (project_id, session_id) = match resolve_attribution(&state, &headers).await {
         Ok(attribution) => attribution,
         Err(message) => {
-            return error_response(
+            return internal_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "attribution_failed",
+                "failed to resolve request attribution".to_string(),
                 message,
             );
         }
@@ -270,9 +281,10 @@ async fn post_chat_completions(
                 )
                 .await
                 {
-                    return error_response(
+                    return internal_error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "ledger_reconcile_failed",
+                        "failed to reconcile request accounting".to_string(),
                         message,
                     );
                 }
@@ -280,9 +292,10 @@ async fn post_chat_completions(
             if let Err(message) =
                 persist_request_and_usage(&state, &normalized, &usage, usage_cost_usd).await
             {
-                return error_response(
+                return internal_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "persistence_failed",
+                    "failed to persist request metadata".to_string(),
                     message,
                 );
             }
@@ -310,9 +323,10 @@ async fn post_chat_completions(
                     )
                     .await
                     {
-                        return error_response(
+                        return internal_error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "ledger_reconcile_failed",
+                            "failed to reconcile request accounting".to_string(),
                             message,
                         );
                     }
@@ -320,9 +334,10 @@ async fn post_chat_completions(
                 if let Err(message) =
                     persist_request_and_usage(&state, &normalized, &usage, usage_cost_usd).await
                 {
-                    return error_response(
+                    return internal_error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "persistence_failed",
+                        "failed to persist request metadata".to_string(),
                         message,
                     );
                 }
@@ -371,16 +386,41 @@ async fn get_models(State(state): State<Arc<ProxyState>>) -> Json<Value> {
     }))
 }
 
-async fn get_internal_health(State(state): State<Arc<ProxyState>>) -> Response {
+async fn get_internal_health(State(state): State<Arc<ProxyState>>, headers: HeaderMap) -> Response {
+    if header_value(&headers, INTERNAL_HEALTH_HEADER).as_deref()
+        != Some(INTERNAL_HEALTH_HEADER_VALUE)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     let (db_status, db_error, status_code) = match &state.store {
         None => ("disabled", None, StatusCode::OK),
-        Some(store) => match query("SELECT 1").fetch_one(store.pool()).await {
-            Ok(_) => ("up", None, StatusCode::OK),
-            Err(err) => (
-                "down",
-                Some(err.to_string()),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
+        Some(store) => match timeout(
+            state.health_db_probe_timeout,
+            query("SELECT 1").fetch_one(store.pool()),
+        )
+        .await
+        {
+            Ok(Ok(_)) => ("up", None, StatusCode::OK),
+            Ok(Err(err)) => {
+                log_internal_error("internal_health_db_probe_failed", err.to_string());
+                (
+                    "down",
+                    Some("unavailable".to_string()),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                )
+            }
+            Err(_) => {
+                log_internal_error(
+                    "internal_health_db_probe_timeout",
+                    format!("probe exceeded {:?}", state.health_db_probe_timeout),
+                );
+                (
+                    "down",
+                    Some("probe_timeout".to_string()),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                )
+            }
         },
     };
 
@@ -618,9 +658,10 @@ async fn evaluate_budget_before_dispatch(
         Ok(value) => value,
         Err(message) => {
             if matches!(state.mode, Mode::Guard) {
+                log_internal_error("budget_engine_has_any_budget_failed", message);
                 return Err(budget_error_response(
                     "budget_engine_failure",
-                    format!("budget engine failed before dispatch: {message}"),
+                    "budget engine temporarily unavailable".to_string(),
                     None,
                 ));
             }
@@ -639,9 +680,10 @@ async fn evaluate_budget_before_dispatch(
         Ok(cost) => cost,
         Err(message) => {
             if matches!(state.mode, Mode::Guard) {
+                log_internal_error("budget_engine_estimated_cost_failed", message);
                 return Err(budget_error_response(
                     "budget_engine_failure",
-                    format!("budget engine failed before dispatch: {message}"),
+                    "budget engine temporarily unavailable".to_string(),
                     None,
                 ));
             }
@@ -671,7 +713,12 @@ async fn evaluate_budget_before_dispatch(
         }
         RouteDecision::Failsafe { mode, reason } => {
             if matches!(mode, Mode::Guard) {
-                Err(budget_error_response("budget_engine_failure", reason, None))
+                log_internal_error("budget_engine_guard_failsafe", reason);
+                Err(budget_error_response(
+                    "budget_engine_failure",
+                    "budget engine fail-closed in guard mode".to_string(),
+                    None,
+                ))
             } else {
                 Ok(Some(BudgetEnforcementContext {
                     estimated_cost_usd,
@@ -886,6 +933,16 @@ fn error_response(status: StatusCode, code: &'static str, message: String) -> Re
         .into_response()
 }
 
+fn internal_error_response(
+    status: StatusCode,
+    code: &'static str,
+    public_message: String,
+    internal_detail: String,
+) -> Response {
+    log_internal_error(code, internal_detail);
+    error_response(status, code, public_message)
+}
+
 fn budget_error_response(
     error_type: &'static str,
     message: String,
@@ -903,6 +960,10 @@ fn budget_error_response(
         })),
     )
         .into_response()
+}
+
+fn log_internal_error(tag: &str, detail: String) {
+    eprintln!("[{tag}] {detail}");
 }
 
 #[cfg(test)]
@@ -1175,6 +1236,7 @@ action_on_soft = "warn"
         let request = Request::builder()
             .method("GET")
             .uri("/internal/health")
+            .header(INTERNAL_HEALTH_HEADER, INTERNAL_HEALTH_HEADER_VALUE)
             .body(Body::empty())
             .expect("build request");
 
@@ -1202,6 +1264,7 @@ action_on_soft = "warn"
         let request = Request::builder()
             .method("GET")
             .uri("/internal/health")
+            .header(INTERNAL_HEALTH_HEADER, INTERNAL_HEALTH_HEADER_VALUE)
             .body(Body::empty())
             .expect("build request");
 
@@ -1213,6 +1276,125 @@ action_on_soft = "warn"
             .expect("read body");
         let json_body: Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(json_body["db"]["status"], "up");
+    }
+
+    #[tokio::test]
+    async fn internal_health_requires_internal_header() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/internal/health")
+            .body(Body::empty())
+            .expect("build request");
+
+        let response = app().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn internal_health_db_probe_timeout_returns_degraded_fast() {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        let state = ProxyState::mock_default()
+            .with_store(store.clone())
+            .with_health_db_probe_timeout(Duration::from_millis(5));
+        let app = build_router(state);
+
+        let _held_conn = store.pool().acquire().await.expect("hold connection");
+        let request = Request::builder()
+            .method("GET")
+            .uri("/internal/health")
+            .header(INTERNAL_HEALTH_HEADER, INTERNAL_HEALTH_HEADER_VALUE)
+            .body(Body::empty())
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json_body["status"], "degraded");
+        assert_eq!(json_body["db"]["status"], "down");
+        assert_eq!(json_body["db"]["error"], "probe_timeout");
+    }
+
+    #[tokio::test]
+    async fn attribution_error_response_is_sanitized() {
+        let (app, store) = app_with_store().await;
+        sqlx::query("DROP TABLE projects")
+            .execute(store.pool())
+            .await
+            .expect("drop projects table");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"trigger attribution failure"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json_body["error"]["code"], "attribution_failed");
+        assert_eq!(
+            json_body["error"]["message"],
+            "failed to resolve request attribution"
+        );
+        let msg = json_body["error"]["message"]
+            .as_str()
+            .expect("error message as str");
+        assert!(!msg.contains("sqlx"));
+        assert!(!msg.contains("no such table"));
+    }
+
+    #[tokio::test]
+    async fn persistence_error_response_is_sanitized() {
+        let (app, store) = app_with_store().await;
+        sqlx::query("DROP TABLE request_usage")
+            .execute(store.pool())
+            .await
+            .expect("drop request_usage table");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"trigger persistence failure"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json_body["error"]["code"], "persistence_failed");
+        assert_eq!(
+            json_body["error"]["message"],
+            "failed to persist request metadata"
+        );
+        let msg = json_body["error"]["message"]
+            .as_str()
+            .expect("error message as str");
+        assert!(!msg.contains("sqlx"));
+        assert!(!msg.contains("no such table"));
     }
 
     #[tokio::test]
