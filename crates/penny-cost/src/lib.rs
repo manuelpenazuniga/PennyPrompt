@@ -4,7 +4,7 @@ use std::{fs, path::Path};
 
 use chrono::{DateTime, Utc};
 use penny_store::{NewPricebookEntry, PricebookRepo, SqliteStore, StoreError};
-use penny_types::{Confidence, CostRange, TaskType, UsageSource};
+use penny_types::{Confidence, CostRange, Money, MoneyError, TaskType, UsageSource};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -24,6 +24,10 @@ pub enum CostError {
     InvalidDatetime { field: &'static str, value: String },
     #[error("no active pricebook entry found for model `{0}`")]
     PriceNotFound(String),
+    #[error("money conversion error: {0}")]
+    Money(#[from] MoneyError),
+    #[error("money arithmetic overflow")]
+    MoneyOverflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,9 +52,9 @@ impl<'a, R: PricebookRepo> PricingEngine<'a, R> {
         model_id: &str,
         input_tokens: u64,
         output_tokens: u64,
-    ) -> Result<f64, CostError> {
+    ) -> Result<Money, CostError> {
         if input_tokens == 0 && output_tokens == 0 {
-            return Ok(0.0);
+            return Ok(Money::ZERO);
         }
 
         let price = self
@@ -59,9 +63,14 @@ impl<'a, R: PricebookRepo> PricingEngine<'a, R> {
             .await?
             .ok_or_else(|| CostError::PriceNotFound(model_id.to_string()))?;
 
-        let input_cost = (input_tokens as f64 * price.input_per_mtok) / 1_000_000.0;
-        let output_cost = (output_tokens as f64 * price.output_per_mtok) / 1_000_000.0;
-        Ok(input_cost + output_cost)
+        let input_rate = Money::from_usd(price.input_per_mtok)?;
+        let output_rate = Money::from_usd(price.output_per_mtok)?;
+
+        let input_cost = prorate_mtok(input_tokens, input_rate)?;
+        let output_cost = prorate_mtok(output_tokens, output_rate)?;
+        input_cost
+            .checked_add(output_cost)
+            .ok_or(CostError::MoneyOverflow)
     }
 
     /// Estimate input/output tokens from OpenAI-compatible `messages`.
@@ -104,6 +113,7 @@ impl<'a, R: PricebookRepo> PricingEngine<'a, R> {
         let one_round = self
             .calculate(model_id, context_tokens, output_tokens)
             .await?;
+        let one_round_usd = one_round.to_usd();
 
         let (rounds, margin, confidence) = match task_type {
             TaskType::SinglePass => (1.0, 0.30, Confidence::High),
@@ -111,7 +121,7 @@ impl<'a, R: PricebookRepo> PricingEngine<'a, R> {
             TaskType::AgentTask => (5.0, 1.00, Confidence::Low),
         };
 
-        let center = one_round * rounds;
+        let center = one_round_usd * rounds;
         let min = (center * (1.0 - margin)).max(0.0);
         let max = center * (1.0 + margin);
 
@@ -160,6 +170,13 @@ pub fn estimate_tokens(messages: &Value) -> TokenEstimate {
 
 fn estimate_output_tokens(input_tokens: u64) -> u64 {
     ((input_tokens as f64 * 0.3).min(4096.0)).round() as u64
+}
+
+fn prorate_mtok(tokens: u64, usd_per_mtok: Money) -> Result<Money, CostError> {
+    let numerator = i128::from(tokens) * i128::from(usd_per_mtok.micros());
+    let micros = (numerator + 500_000) / 1_000_000;
+    let micros_i64 = i64::try_from(micros).map_err(|_| CostError::MoneyOverflow)?;
+    Ok(Money::from_micros(micros_i64))
 }
 
 fn heuristic_chars_to_tokens(chars: usize) -> u64 {
@@ -352,7 +369,7 @@ mod tests {
             .await
             .expect("calculate");
 
-        approx_eq(cost, 18.0, 1e-9);
+        assert_eq!(cost, Money::from_usd(18.0).expect("money"));
     }
 
     #[tokio::test]

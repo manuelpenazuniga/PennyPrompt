@@ -6,8 +6,8 @@ use chrono::{Datelike, Days, Duration, TimeZone, Utc, Weekday};
 use penny_ledger::CostLedger;
 use penny_store::{BudgetRepo, EventRepo, NewEvent, SqliteStore};
 use penny_types::{
-    Budget, BudgetBlockDetail, EventType, Mode, NormalizedRequest, Reservation, RouteDecision,
-    ScopeType, Severity, WindowType,
+    Budget, BudgetBlockDetail, EventType, Mode, Money, NormalizedRequest, Reservation,
+    RouteDecision, ScopeType, Severity, WindowType,
 };
 use serde_json::json;
 use sqlx::{QueryBuilder, Row, Sqlite};
@@ -32,7 +32,7 @@ impl BudgetEvaluator {
     pub async fn evaluate(
         &self,
         request: &NormalizedRequest,
-        estimated_cost: f64,
+        estimated_cost: Money,
     ) -> RouteDecision {
         let budgets = match self.lookup_applicable_budgets(request).await {
             Ok(budgets) => budgets,
@@ -56,7 +56,7 @@ impl BudgetEvaluator {
                     "mode": self.mode_tag(),
                     "result": "allow",
                     "reason": "no_applicable_budgets",
-                    "estimated_cost_usd": estimated_cost
+                    "estimated_cost_usd": estimated_cost.to_usd()
                 }),
             )
             .await;
@@ -123,7 +123,7 @@ impl BudgetEvaluator {
                             "mode": self.mode_tag(),
                             "result": "allow",
                             "entries": entries,
-                            "estimated_cost_usd": estimated_cost
+                            "estimated_cost_usd": estimated_cost.to_usd()
                         }),
                     )
                     .await;
@@ -140,7 +140,7 @@ impl BudgetEvaluator {
                                 "allow_with_warnings"
                             },
                             "warnings": warnings,
-                            "estimated_cost_usd": estimated_cost
+                            "estimated_cost_usd": estimated_cost.to_usd()
                         }),
                     )
                     .await;
@@ -231,14 +231,16 @@ impl BudgetEvaluator {
                 continue;
             };
 
-            let Some(remaining) = remaining_map.get(&budget.id) else {
+            let Some(Some(remaining)) = remaining_map.get(&budget.id).copied() else {
                 continue;
             };
 
-            if remaining.is_finite() && *remaining < 0.0 {
-                let accumulated = limit - *remaining;
+            if remaining.is_negative() {
+                let Some(accumulated) = limit.checked_sub(remaining) else {
+                    continue;
+                };
                 warnings.push(format!(
-                    "hard limit exceeded for {} ({:?}): {:.6} / {:.6}",
+                    "hard limit exceeded for {} ({:?}): {} / {}",
                     scope_string(budget),
                     budget.window_type,
                     accumulated,
@@ -267,10 +269,7 @@ impl BudgetEvaluator {
                 continue;
             }
 
-            if !matches!(
-                remaining_map.get(&budget.id),
-                Some(remaining) if remaining.is_finite()
-            ) {
+            if !matches!(remaining_map.get(&budget.id), Some(Some(_))) {
                 lookup_budget_ids.insert(budget.id);
             }
         }
@@ -288,16 +287,16 @@ impl BudgetEvaluator {
 
             let accumulated = if let Some(limit) = budget.hard_limit_usd {
                 match remaining_map.get(&budget.id) {
-                    Some(remaining) if remaining.is_finite() => limit - *remaining,
-                    _ => *running_totals.get(&budget.id).unwrap_or(&0.0),
+                    Some(Some(remaining)) => limit.checked_sub(*remaining).unwrap_or(Money::ZERO),
+                    _ => *running_totals.get(&budget.id).unwrap_or(&Money::ZERO),
                 }
             } else {
-                *running_totals.get(&budget.id).unwrap_or(&0.0)
+                *running_totals.get(&budget.id).unwrap_or(&Money::ZERO)
             };
 
             if accumulated >= soft_limit {
                 warnings.push(format!(
-                    "soft limit reached for {} ({:?}): {:.6} / {:.6}",
+                    "soft limit reached for {} ({:?}): {} / {}",
                     scope_string(budget),
                     budget.window_type,
                     accumulated,
@@ -312,14 +311,14 @@ impl BudgetEvaluator {
     async fn latest_running_totals(
         &self,
         budget_ids: &[i64],
-    ) -> Result<HashMap<i64, f64>, sqlx::Error> {
+    ) -> Result<HashMap<i64, Money>, sqlx::Error> {
         if budget_ids.is_empty() {
             return Ok(HashMap::new());
         }
 
         let mut qb = QueryBuilder::<Sqlite>::new(
             r#"
-            SELECT budget_id, running_total
+            SELECT budget_id, running_total_micros
             FROM cost_ledger
             WHERE budget_id IN (
             "#,
@@ -340,10 +339,13 @@ impl BudgetEvaluator {
         let mut totals = HashMap::with_capacity(budget_ids.len());
         for row in rows {
             let budget_id: i64 = row.get("budget_id");
-            let running_total: f64 = row.get("running_total");
+            let running_total: i64 = row.get("running_total_micros");
             totals.entry(budget_id).or_insert(running_total);
         }
-        Ok(totals)
+        Ok(totals
+            .into_iter()
+            .map(|(budget_id, micros)| (budget_id, Money::from_micros(micros)))
+            .collect())
     }
 
     async fn failsafe_decision(
@@ -478,8 +480,8 @@ mod tests {
     async fn seed_budget(
         store: &SqliteStore,
         window_type: WindowType,
-        hard_limit: Option<f64>,
-        soft_limit: Option<f64>,
+        hard_limit: Option<Money>,
+        soft_limit: Option<Money>,
     ) -> Budget {
         BudgetRepo::upsert(
             store,
@@ -518,10 +520,18 @@ mod tests {
     #[tokio::test]
     async fn soft_limit_reached_returns_allow_with_warnings() {
         let store = setup_store().await;
-        seed_budget(&store, WindowType::Day, Some(10.0), Some(5.0)).await;
+        seed_budget(
+            &store,
+            WindowType::Day,
+            Some(Money::from_usd(10.0).expect("money")),
+            Some(Money::from_usd(5.0).expect("money")),
+        )
+        .await;
 
         let evaluator = BudgetEvaluator::new(store.clone(), Mode::Guard);
-        let decision = evaluator.evaluate(&request("req_warn"), 6.0).await;
+        let decision = evaluator
+            .evaluate(&request("req_warn"), Money::from_usd(6.0).expect("money"))
+            .await;
 
         match decision {
             RouteDecision::Allow { warnings } => {
@@ -553,15 +563,23 @@ mod tests {
     #[tokio::test]
     async fn hard_limit_exceeded_blocks_with_window_metadata() {
         let store = setup_store().await;
-        seed_budget(&store, WindowType::Day, Some(1.0), None).await;
+        seed_budget(
+            &store,
+            WindowType::Day,
+            Some(Money::from_usd(1.0).expect("money")),
+            None,
+        )
+        .await;
 
         let evaluator = BudgetEvaluator::new(store.clone(), Mode::Guard);
-        let decision = evaluator.evaluate(&request("req_block"), 2.0).await;
+        let decision = evaluator
+            .evaluate(&request("req_block"), Money::from_usd(2.0).expect("money"))
+            .await;
 
         match decision {
             RouteDecision::Block { detail, .. } => {
                 assert_eq!(detail.window, WindowType::Day);
-                assert_eq!(detail.limit_usd, 1.0);
+                assert_eq!(detail.limit_usd, Money::from_usd(1.0).expect("money"));
                 assert!(detail.resets_at.is_some());
             }
             other => panic!("unexpected decision: {other:?}"),
@@ -586,7 +604,10 @@ mod tests {
 
         let evaluator = BudgetEvaluator::new(store, Mode::Guard);
         let decision = evaluator
-            .evaluate(&request("req_guard_failsafe"), 1.0)
+            .evaluate(
+                &request("req_guard_failsafe"),
+                Money::from_usd(1.0).expect("money"),
+            )
             .await;
 
         match decision {
@@ -608,7 +629,10 @@ mod tests {
 
         let evaluator = BudgetEvaluator::new(store.clone(), Mode::Observe);
         let decision = evaluator
-            .evaluate(&request("req_observe_failsafe"), 1.0)
+            .evaluate(
+                &request("req_observe_failsafe"),
+                Money::from_usd(1.0).expect("money"),
+            )
             .await;
 
         match decision {
@@ -631,11 +655,20 @@ mod tests {
     #[tokio::test]
     async fn observe_mode_does_not_block_on_budget_denial() {
         let store = setup_store().await;
-        seed_budget(&store, WindowType::Day, Some(1.0), None).await;
+        seed_budget(
+            &store,
+            WindowType::Day,
+            Some(Money::from_usd(1.0).expect("money")),
+            None,
+        )
+        .await;
 
         let evaluator = BudgetEvaluator::new(store.clone(), Mode::Observe);
         let decision = evaluator
-            .evaluate(&request("req_observe_violation"), 2.0)
+            .evaluate(
+                &request("req_observe_violation"),
+                Money::from_usd(2.0).expect("money"),
+            )
             .await;
 
         match decision {
@@ -663,25 +696,54 @@ mod tests {
         .expect("count observe reserve rows");
         assert_eq!(reserve_count, 1);
 
-        let running_total: f64 = query_scalar(
-            "SELECT running_total FROM cost_ledger WHERE request_id = 'req_observe_violation' AND entry_type = 'reserve' LIMIT 1",
+        let running_total: i64 = query_scalar(
+            "SELECT running_total_micros FROM cost_ledger WHERE request_id = 'req_observe_violation' AND entry_type = 'reserve' LIMIT 1",
         )
         .fetch_one(store.pool())
         .await
         .expect("load observe running total");
-        assert!((running_total - 2.0).abs() < 1e-9);
+        assert_eq!(running_total, Money::from_usd(2.0).expect("money").micros());
     }
 
     #[tokio::test]
     async fn evaluator_applies_all_budget_windows_without_duplicates() {
         let store = setup_store().await;
-        seed_budget(&store, WindowType::Day, Some(100.0), None).await;
-        seed_budget(&store, WindowType::Week, Some(100.0), None).await;
-        seed_budget(&store, WindowType::Month, Some(100.0), None).await;
-        seed_budget(&store, WindowType::Total, Some(100.0), None).await;
+        seed_budget(
+            &store,
+            WindowType::Day,
+            Some(Money::from_usd(100.0).expect("money")),
+            None,
+        )
+        .await;
+        seed_budget(
+            &store,
+            WindowType::Week,
+            Some(Money::from_usd(100.0).expect("money")),
+            None,
+        )
+        .await;
+        seed_budget(
+            &store,
+            WindowType::Month,
+            Some(Money::from_usd(100.0).expect("money")),
+            None,
+        )
+        .await;
+        seed_budget(
+            &store,
+            WindowType::Total,
+            Some(Money::from_usd(100.0).expect("money")),
+            None,
+        )
+        .await;
 
         let evaluator = BudgetEvaluator::new(store.clone(), Mode::Guard);
-        let decision = evaluator.evaluate(&request("req_windows"), 1.0).await;
+        let decision = evaluator
+            .evaluate(
+                &request("req_windows"),
+                Money::from_usd(1.0).expect("money"),
+            )
+            .await;
         assert!(matches!(decision, RouteDecision::Allow { .. }));
 
         let reserve_count: i64 = query_scalar(

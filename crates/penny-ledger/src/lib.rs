@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use penny_store::{SqliteStore, StoreError};
-use penny_types::{Budget, BudgetRemaining, Reservation};
+use penny_types::{Budget, BudgetRemaining, Money, Reservation};
 use sqlx::{query, query_scalar, Row};
 use thiserror::Error;
 
@@ -26,8 +26,8 @@ pub struct CostLedger {
 struct LedgerRow {
     id: i64,
     budget_id: i64,
-    amount_usd: f64,
-    running_total: f64,
+    amount_usd: Money,
+    running_total: Money,
 }
 
 impl CostLedger {
@@ -43,7 +43,7 @@ impl CostLedger {
         &self,
         request_id: &str,
         budgets: &[Budget],
-        estimated_cost: f64,
+        estimated_cost: Money,
     ) -> Result<Reservation, LedgerError> {
         self.reserve_internal(request_id, budgets, estimated_cost, true)
             .await
@@ -53,7 +53,7 @@ impl CostLedger {
         &self,
         request_id: &str,
         budgets: &[Budget],
-        estimated_cost: f64,
+        estimated_cost: Money,
     ) -> Result<Reservation, LedgerError> {
         self.reserve_internal(request_id, budgets, estimated_cost, false)
             .await
@@ -63,15 +63,15 @@ impl CostLedger {
         &self,
         request_id: &str,
         budgets: &[Budget],
-        estimated_cost: f64,
+        estimated_cost: Money,
         enforce_hard_limits: bool,
     ) -> Result<Reservation, LedgerError> {
         if request_id.trim().is_empty() {
             return Err(LedgerError::InvalidRequest("request_id must not be empty"));
         }
-        if !estimated_cost.is_finite() || estimated_cost < 0.0 {
+        if estimated_cost.is_negative() {
             return Err(LedgerError::InvalidRequest(
-                "estimated_cost must be a finite non-negative number",
+                "estimated_cost must be non-negative",
             ));
         }
 
@@ -97,7 +97,12 @@ impl CostLedger {
 
         for budget in budgets {
             let current_total = latest_running_total(&mut tx, budget.id).await?;
-            let new_total = current_total + estimated_cost;
+            let Some(new_total) = current_total.checked_add(estimated_cost) else {
+                tx.rollback().await?;
+                return Err(LedgerError::InvalidRequest(
+                    "running_total overflow while reserving budget",
+                ));
+            };
             if enforce_hard_limits {
                 if let Some(limit) = budget.hard_limit_usd {
                     if new_total > limit {
@@ -107,7 +112,7 @@ impl CostLedger {
                             accumulated: new_total,
                             limit,
                             reason: format!(
-                                "budget id {} exceeded hard limit: {:.6} > {:.6}",
+                                "budget id {} exceeded hard limit: {} > {}",
                                 budget.id, new_total, limit
                             ),
                         });
@@ -129,8 +134,7 @@ impl CostLedger {
                 budget_id: budget.id,
                 remaining_usd: budget
                     .hard_limit_usd
-                    .map(|limit| limit - new_total)
-                    .unwrap_or(f64::INFINITY),
+                    .and_then(|limit| limit.checked_sub(new_total)),
             });
         }
 
@@ -144,14 +148,14 @@ impl CostLedger {
     pub async fn reconcile(
         &self,
         request_id: &str,
-        actual_cost: f64,
+        actual_cost: Money,
     ) -> Result<Vec<i64>, LedgerError> {
         if request_id.trim().is_empty() {
             return Err(LedgerError::InvalidRequest("request_id must not be empty"));
         }
-        if !actual_cost.is_finite() || actual_cost < 0.0 {
+        if actual_cost.is_negative() {
             return Err(LedgerError::InvalidRequest(
-                "actual_cost must be a finite non-negative number",
+                "actual_cost must be non-negative",
             ));
         }
 
@@ -183,9 +187,19 @@ impl CostLedger {
         for row in reserve_rows {
             let budget_id = row.budget_id;
             let reserved_amount = row.amount_usd;
-            let diff = actual_cost - reserved_amount;
+            let Some(diff) = actual_cost.checked_sub(reserved_amount) else {
+                tx.rollback().await?;
+                return Err(LedgerError::InvalidRequest(
+                    "reconcile diff overflow for request",
+                ));
+            };
             let current_total = latest_running_total(&mut tx, budget_id).await?;
-            let new_total = current_total + diff;
+            let Some(new_total) = current_total.checked_add(diff) else {
+                tx.rollback().await?;
+                return Err(LedgerError::InvalidRequest(
+                    "running_total overflow while reconciling",
+                ));
+            };
             let entry_id =
                 insert_ledger_entry(&mut tx, request_id, "reconcile", budget_id, diff, new_total)
                     .await?;
@@ -229,9 +243,19 @@ impl CostLedger {
         for row in reserve_rows {
             let budget_id = row.budget_id;
             let reserved_amount = row.amount_usd;
-            let release_amount = -reserved_amount;
+            let Some(release_amount) = Money::ZERO.checked_sub(reserved_amount) else {
+                tx.rollback().await?;
+                return Err(LedgerError::InvalidRequest(
+                    "release amount overflow for request",
+                ));
+            };
             let current_total = latest_running_total(&mut tx, budget_id).await?;
-            let new_total = current_total + release_amount;
+            let Some(new_total) = current_total.checked_add(release_amount) else {
+                tx.rollback().await?;
+                return Err(LedgerError::InvalidRequest(
+                    "running_total overflow while releasing",
+                ));
+            };
             let entry_id = insert_ledger_entry(
                 &mut tx,
                 request_id,
@@ -251,7 +275,7 @@ impl CostLedger {
 
 fn reservation_from_existing(
     budgets: &[Budget],
-    estimated_cost: f64,
+    estimated_cost: Money,
     rows: &[LedgerRow],
 ) -> Result<Reservation, LedgerError> {
     if rows.len() != budgets.len() {
@@ -277,7 +301,7 @@ fn reservation_from_existing(
             ));
         };
 
-        if (row.amount_usd - estimated_cost).abs() > 1e-9 {
+        if row.amount_usd != estimated_cost {
             return Err(LedgerError::InvalidRequest(
                 "estimated_cost does not match existing reservation",
             ));
@@ -287,8 +311,7 @@ fn reservation_from_existing(
             budget_id: budget.id,
             remaining_usd: budget
                 .hard_limit_usd
-                .map(|limit| limit - row.running_total)
-                .unwrap_or(f64::INFINITY),
+                .and_then(|limit| limit.checked_sub(row.running_total)),
         });
     }
 
@@ -301,10 +324,10 @@ fn reservation_from_existing(
 async fn latest_running_total(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     budget_id: i64,
-) -> Result<f64, sqlx::Error> {
+) -> Result<Money, sqlx::Error> {
     query_scalar(
         r#"
-        SELECT running_total
+        SELECT running_total_micros
         FROM cost_ledger
         WHERE budget_id = ?1
         ORDER BY id DESC
@@ -314,7 +337,7 @@ async fn latest_running_total(
     .bind(budget_id)
     .fetch_optional(&mut **tx)
     .await
-    .map(|value: Option<f64>| value.unwrap_or(0.0))
+    .map(|value: Option<i64>| Money::from_micros(value.unwrap_or(0)))
 }
 
 async fn insert_ledger_entry(
@@ -322,22 +345,24 @@ async fn insert_ledger_entry(
     request_id: &str,
     entry_type: &'static str,
     budget_id: i64,
-    amount_usd: f64,
-    running_total: f64,
+    amount_usd: Money,
+    running_total: Money,
 ) -> Result<i64, sqlx::Error> {
     let result = query(
         r#"
         INSERT INTO cost_ledger (
-            request_id, entry_type, budget_id, amount_usd, running_total
+            request_id, entry_type, budget_id, amount_usd, amount_micros, running_total, running_total_micros
         )
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         "#,
     )
     .bind(request_id)
     .bind(entry_type)
     .bind(budget_id)
-    .bind(amount_usd)
-    .bind(running_total)
+    .bind(amount_usd.to_usd())
+    .bind(amount_usd.micros())
+    .bind(running_total.to_usd())
+    .bind(running_total.micros())
     .execute(&mut **tx)
     .await?;
 
@@ -357,7 +382,7 @@ async fn request_entries_by_type(
 ) -> Result<Vec<LedgerRow>, sqlx::Error> {
     let rows = query(
         r#"
-        SELECT id, budget_id, amount_usd, running_total
+        SELECT id, budget_id, amount_micros, running_total_micros
         FROM cost_ledger
         WHERE request_id = ?1 AND entry_type = ?2
         ORDER BY id
@@ -373,8 +398,8 @@ async fn request_entries_by_type(
         entries.push(LedgerRow {
             id: row.get("id"),
             budget_id: row.get("budget_id"),
-            amount_usd: row.get("amount_usd"),
-            running_total: row.get("running_total"),
+            amount_usd: Money::from_micros(row.get("amount_micros")),
+            running_total: Money::from_micros(row.get("running_total_micros")),
         });
     }
     Ok(entries)
@@ -415,7 +440,7 @@ mod tests {
             .expect("create in-memory store")
     }
 
-    async fn insert_budget(store: &SqliteStore, hard_limit: Option<f64>) -> Budget {
+    async fn insert_budget(store: &SqliteStore, hard_limit: Option<Money>) -> Budget {
         BudgetRepo::upsert(
             store,
             &Budget {
@@ -437,11 +462,15 @@ mod tests {
     #[tokio::test]
     async fn reserve_grants_and_persists_running_total() {
         let store = setup_store().await;
-        let budget = insert_budget(&store, Some(10.0)).await;
+        let budget = insert_budget(&store, Some(Money::from_usd(10.0).expect("money"))).await;
         let ledger = CostLedger::new(store.clone());
 
         let reservation = ledger
-            .reserve("req_01", std::slice::from_ref(&budget), 2.5)
+            .reserve(
+                "req_01",
+                std::slice::from_ref(&budget),
+                Money::from_usd(2.5).expect("money"),
+            )
             .await
             .expect("reserve should succeed");
 
@@ -453,14 +482,17 @@ mod tests {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(remaining_by_budget.len(), 1);
                 assert_eq!(remaining_by_budget[0].budget_id, budget.id);
-                assert!((remaining_by_budget[0].remaining_usd - 7.5).abs() < 1e-9);
+                assert_eq!(
+                    remaining_by_budget[0].remaining_usd,
+                    Some(Money::from_usd(7.5).expect("money"))
+                );
             }
             Reservation::Denied { .. } => panic!("reservation unexpectedly denied"),
         }
 
-        let running_total: f64 = query_scalar(
+        let running_total: i64 = query_scalar(
             r#"
-            SELECT running_total
+            SELECT running_total_micros
             FROM cost_ledger
             WHERE request_id = 'req_01' AND entry_type = 'reserve'
             LIMIT 1
@@ -469,23 +501,29 @@ mod tests {
         .fetch_one(store.pool())
         .await
         .expect("load running_total");
-        assert!((running_total - 2.5).abs() < 1e-9);
+        assert_eq!(running_total, Money::from_usd(2.5).expect("money").micros());
     }
 
     #[tokio::test]
     async fn reserve_denied_rolls_back_all_budget_rows() {
         let store = setup_store().await;
-        let budget_a = insert_budget(&store, Some(10.0)).await;
-        let budget_b = insert_budget(&store, Some(1.0)).await;
+        let budget_a = insert_budget(&store, Some(Money::from_usd(10.0).expect("money"))).await;
+        let budget_b = insert_budget(&store, Some(Money::from_usd(1.0).expect("money"))).await;
         let ledger = CostLedger::new(store.clone());
 
         let reservation = ledger
-            .reserve("req_denied", &[budget_a, budget_b], 2.0)
+            .reserve(
+                "req_denied",
+                &[budget_a, budget_b],
+                Money::from_usd(2.0).expect("money"),
+            )
             .await
             .expect("reserve should return denied, not error");
 
         match reservation {
-            Reservation::Denied { limit, .. } => assert_eq!(limit, 1.0),
+            Reservation::Denied { limit, .. } => {
+                assert_eq!(limit, Money::from_usd(1.0).expect("money"))
+            }
             Reservation::Granted { .. } => panic!("reservation unexpectedly granted"),
         }
 
@@ -500,11 +538,15 @@ mod tests {
     #[tokio::test]
     async fn reserve_allow_over_limit_persists_entries_in_observe_style_flow() {
         let store = setup_store().await;
-        let budget = insert_budget(&store, Some(1.0)).await;
+        let budget = insert_budget(&store, Some(Money::from_usd(1.0).expect("money"))).await;
         let ledger = CostLedger::new(store.clone());
 
         let reservation = ledger
-            .reserve_allow_over_limit("req_observe", std::slice::from_ref(&budget), 2.0)
+            .reserve_allow_over_limit(
+                "req_observe",
+                std::slice::from_ref(&budget),
+                Money::from_usd(2.0).expect("money"),
+            )
             .await
             .expect("reserve allow over limit should succeed");
 
@@ -515,14 +557,17 @@ mod tests {
             } => {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(remaining_by_budget.len(), 1);
-                assert!(remaining_by_budget[0].remaining_usd < 0.0);
+                assert_eq!(
+                    remaining_by_budget[0].remaining_usd,
+                    Some(Money::from_usd(-1.0).expect("money"))
+                );
             }
             Reservation::Denied { .. } => panic!("reservation should not deny in allow-over-limit"),
         }
 
         let row = query(
             r#"
-            SELECT amount_usd, running_total
+            SELECT amount_micros, running_total_micros
             FROM cost_ledger
             WHERE request_id = 'req_observe' AND entry_type = 'reserve'
             LIMIT 1
@@ -532,33 +577,37 @@ mod tests {
         .await
         .expect("load observe reserve row");
 
-        let amount: f64 = row.get("amount_usd");
-        let running_total: f64 = row.get("running_total");
-        assert!((amount - 2.0).abs() < 1e-9);
-        assert!((running_total - 2.0).abs() < 1e-9);
+        let amount: i64 = row.get("amount_micros");
+        let running_total: i64 = row.get("running_total_micros");
+        assert_eq!(amount, Money::from_usd(2.0).expect("money").micros());
+        assert_eq!(running_total, Money::from_usd(2.0).expect("money").micros());
     }
 
     #[tokio::test]
     async fn reconcile_adds_diff_entries_against_reserves() {
         let store = setup_store().await;
-        let budget = insert_budget(&store, Some(20.0)).await;
+        let budget = insert_budget(&store, Some(Money::from_usd(20.0).expect("money"))).await;
         let ledger = CostLedger::new(store.clone());
 
         let reserve_result = ledger
-            .reserve("req_reconcile", std::slice::from_ref(&budget), 2.0)
+            .reserve(
+                "req_reconcile",
+                std::slice::from_ref(&budget),
+                Money::from_usd(2.0).expect("money"),
+            )
             .await
             .expect("reserve");
         assert!(matches!(reserve_result, Reservation::Granted { .. }));
 
         let ids = ledger
-            .reconcile("req_reconcile", 3.5)
+            .reconcile("req_reconcile", Money::from_usd(3.5).expect("money"))
             .await
             .expect("reconcile");
         assert_eq!(ids.len(), 1);
 
         let row = query(
             r#"
-            SELECT amount_usd, running_total
+            SELECT amount_micros, running_total_micros
             FROM cost_ledger
             WHERE request_id = 'req_reconcile' AND entry_type = 'reconcile'
             LIMIT 1
@@ -568,20 +617,24 @@ mod tests {
         .await
         .expect("load reconcile row");
 
-        let amount: f64 = row.get("amount_usd");
-        let running_total: f64 = row.get("running_total");
-        assert!((amount - 1.5).abs() < 1e-9);
-        assert!((running_total - 3.5).abs() < 1e-9);
+        let amount: i64 = row.get("amount_micros");
+        let running_total: i64 = row.get("running_total_micros");
+        assert_eq!(amount, Money::from_usd(1.5).expect("money").micros());
+        assert_eq!(running_total, Money::from_usd(3.5).expect("money").micros());
     }
 
     #[tokio::test]
     async fn release_reverts_reserved_amount() {
         let store = setup_store().await;
-        let budget = insert_budget(&store, Some(20.0)).await;
+        let budget = insert_budget(&store, Some(Money::from_usd(20.0).expect("money"))).await;
         let ledger = CostLedger::new(store.clone());
 
         let reserve_result = ledger
-            .reserve("req_release", std::slice::from_ref(&budget), 2.0)
+            .reserve(
+                "req_release",
+                std::slice::from_ref(&budget),
+                Money::from_usd(2.0).expect("money"),
+            )
             .await
             .expect("reserve");
         assert!(matches!(reserve_result, Reservation::Granted { .. }));
@@ -591,7 +644,7 @@ mod tests {
 
         let row = query(
             r#"
-            SELECT amount_usd, running_total
+            SELECT amount_micros, running_total_micros
             FROM cost_ledger
             WHERE request_id = 'req_release' AND entry_type = 'release'
             LIMIT 1
@@ -601,24 +654,32 @@ mod tests {
         .await
         .expect("load release row");
 
-        let amount: f64 = row.get("amount_usd");
-        let running_total: f64 = row.get("running_total");
-        assert!((amount + 2.0).abs() < 1e-9);
-        assert!(running_total.abs() < 1e-9);
+        let amount: i64 = row.get("amount_micros");
+        let running_total: i64 = row.get("running_total_micros");
+        assert_eq!(amount, Money::from_usd(-2.0).expect("money").micros());
+        assert_eq!(running_total, Money::ZERO.micros());
     }
 
     #[tokio::test]
     async fn reserve_is_idempotent_for_same_request_id() {
         let store = setup_store().await;
-        let budget = insert_budget(&store, Some(10.0)).await;
+        let budget = insert_budget(&store, Some(Money::from_usd(10.0).expect("money"))).await;
         let ledger = CostLedger::new(store.clone());
 
         let first = ledger
-            .reserve("req_idempotent_reserve", std::slice::from_ref(&budget), 2.0)
+            .reserve(
+                "req_idempotent_reserve",
+                std::slice::from_ref(&budget),
+                Money::from_usd(2.0).expect("money"),
+            )
             .await
             .expect("first reserve");
         let second = ledger
-            .reserve("req_idempotent_reserve", std::slice::from_ref(&budget), 2.0)
+            .reserve(
+                "req_idempotent_reserve",
+                std::slice::from_ref(&budget),
+                Money::from_usd(2.0).expect("money"),
+            )
             .await
             .expect("second reserve should be idempotent");
 
@@ -651,24 +712,30 @@ mod tests {
     #[tokio::test]
     async fn reconcile_is_idempotent_for_same_request_id() {
         let store = setup_store().await;
-        let budget = insert_budget(&store, Some(20.0)).await;
+        let budget = insert_budget(&store, Some(Money::from_usd(20.0).expect("money"))).await;
         let ledger = CostLedger::new(store.clone());
 
         ledger
             .reserve(
                 "req_idempotent_reconcile",
                 std::slice::from_ref(&budget),
-                2.0,
+                Money::from_usd(2.0).expect("money"),
             )
             .await
             .expect("reserve");
 
         let first = ledger
-            .reconcile("req_idempotent_reconcile", 3.0)
+            .reconcile(
+                "req_idempotent_reconcile",
+                Money::from_usd(3.0).expect("money"),
+            )
             .await
             .expect("first reconcile");
         let second = ledger
-            .reconcile("req_idempotent_reconcile", 3.0)
+            .reconcile(
+                "req_idempotent_reconcile",
+                Money::from_usd(3.0).expect("money"),
+            )
             .await
             .expect("second reconcile should be idempotent");
 
@@ -687,11 +754,15 @@ mod tests {
     #[tokio::test]
     async fn release_is_idempotent_for_same_request_id() {
         let store = setup_store().await;
-        let budget = insert_budget(&store, Some(20.0)).await;
+        let budget = insert_budget(&store, Some(Money::from_usd(20.0).expect("money"))).await;
         let ledger = CostLedger::new(store.clone());
 
         ledger
-            .reserve("req_idempotent_release", std::slice::from_ref(&budget), 2.0)
+            .reserve(
+                "req_idempotent_release",
+                std::slice::from_ref(&budget),
+                Money::from_usd(2.0).expect("money"),
+            )
             .await
             .expect("reserve");
 
@@ -719,14 +790,14 @@ mod tests {
     #[tokio::test]
     async fn reconcile_after_release_is_rejected() {
         let store = setup_store().await;
-        let budget = insert_budget(&store, Some(20.0)).await;
+        let budget = insert_budget(&store, Some(Money::from_usd(20.0).expect("money"))).await;
         let ledger = CostLedger::new(store);
 
         ledger
             .reserve(
                 "req_conflict_reconcile_after_release",
                 std::slice::from_ref(&budget),
-                2.0,
+                Money::from_usd(2.0).expect("money"),
             )
             .await
             .expect("reserve");
@@ -736,7 +807,10 @@ mod tests {
             .expect("release");
 
         let err = ledger
-            .reconcile("req_conflict_reconcile_after_release", 3.0)
+            .reconcile(
+                "req_conflict_reconcile_after_release",
+                Money::from_usd(3.0).expect("money"),
+            )
             .await
             .expect_err("reconcile after release should fail");
 
@@ -749,19 +823,22 @@ mod tests {
     #[tokio::test]
     async fn release_after_reconcile_is_rejected() {
         let store = setup_store().await;
-        let budget = insert_budget(&store, Some(20.0)).await;
+        let budget = insert_budget(&store, Some(Money::from_usd(20.0).expect("money"))).await;
         let ledger = CostLedger::new(store);
 
         ledger
             .reserve(
                 "req_conflict_release_after_reconcile",
                 std::slice::from_ref(&budget),
-                2.0,
+                Money::from_usd(2.0).expect("money"),
             )
             .await
             .expect("reserve");
         ledger
-            .reconcile("req_conflict_release_after_reconcile", 3.0)
+            .reconcile(
+                "req_conflict_release_after_reconcile",
+                Money::from_usd(3.0).expect("money"),
+            )
             .await
             .expect("reconcile");
 

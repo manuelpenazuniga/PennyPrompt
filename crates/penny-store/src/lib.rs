@@ -4,8 +4,8 @@ use std::{path::Path, str::FromStr};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use penny_types::{
-    AccountedUsage, Budget, Event, EventType, ProjectId, RequestId, ScopeType, SessionId, Severity,
-    UsageSource, WindowType,
+    AccountedUsage, Budget, Event, EventType, Money, ProjectId, RequestId, ScopeType, SessionId,
+    Severity, UsageSource, WindowType,
 };
 use serde_json::Value;
 use sqlx::{
@@ -115,7 +115,7 @@ pub struct UsageRecord {
     pub request_id: RequestId,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cost_usd: f64,
+    pub cost_usd: Money,
     pub source: UsageSource,
     pub pricing_snapshot: Value,
 }
@@ -421,15 +421,16 @@ impl RequestRepo for SqliteStore {
         sqlx::query(
             r#"
             INSERT INTO request_usage (
-                request_id, input_tokens, output_tokens, cost_usd, pricing_snapshot, source
+                request_id, input_tokens, output_tokens, cost_usd, cost_micros, pricing_snapshot, source
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
         )
         .bind(&usage.request_id)
         .bind(i64_from_u64(usage.input_tokens))
         .bind(i64_from_u64(usage.output_tokens))
-        .bind(usage.cost_usd)
+        .bind(usage.cost_usd.to_usd())
+        .bind(usage.cost_usd.micros())
         .bind(usage.pricing_snapshot.to_string())
         .bind(usage_source_to_db(&usage.source))
         .execute(&self.pool)
@@ -449,7 +450,7 @@ impl BudgetRepo for SqliteStore {
         let window_type_db = window_type_to_db(&window_type);
         let rows = sqlx::query(
             r#"
-            SELECT id, scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft, preset_source
+            SELECT id, scope_type, scope_id, window_type, hard_limit_micros, soft_limit_micros, action_on_hard, action_on_soft, preset_source
             FROM budgets
             WHERE window_type = ?1
               AND (
@@ -475,7 +476,7 @@ impl BudgetRepo for SqliteStore {
     ) -> Result<Vec<Budget>, StoreError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft, preset_source
+            SELECT id, scope_type, scope_id, window_type, hard_limit_micros, soft_limit_micros, action_on_hard, action_on_soft, preset_source
             FROM budgets
             WHERE window_type IN ('day', 'week', 'month', 'total')
               AND (
@@ -507,17 +508,21 @@ impl BudgetRepo for SqliteStore {
                     window_type = ?3,
                     hard_limit_usd = ?4,
                     soft_limit_usd = ?5,
-                    action_on_hard = ?6,
-                    action_on_soft = ?7,
-                    preset_source = ?8
-                WHERE id = ?9
+                    hard_limit_micros = ?6,
+                    soft_limit_micros = ?7,
+                    action_on_hard = ?8,
+                    action_on_soft = ?9,
+                    preset_source = ?10
+                WHERE id = ?11
                 "#,
             )
             .bind(scope_type_db)
             .bind(&budget.scope_id)
             .bind(window_type_db)
-            .bind(budget.hard_limit_usd)
-            .bind(budget.soft_limit_usd)
+            .bind(budget.hard_limit_usd.map(Money::to_usd))
+            .bind(budget.soft_limit_usd.map(Money::to_usd))
+            .bind(budget.hard_limit_usd.map(Money::micros))
+            .bind(budget.soft_limit_usd.map(Money::micros))
             .bind(&budget.action_on_hard)
             .bind(&budget.action_on_soft)
             .bind(&budget.preset_source)
@@ -550,14 +555,18 @@ impl BudgetRepo for SqliteStore {
                 UPDATE budgets
                 SET hard_limit_usd = ?1,
                     soft_limit_usd = ?2,
-                    action_on_hard = ?3,
-                    action_on_soft = ?4,
-                    preset_source = ?5
-                WHERE id = ?6
+                    hard_limit_micros = ?3,
+                    soft_limit_micros = ?4,
+                    action_on_hard = ?5,
+                    action_on_soft = ?6,
+                    preset_source = ?7
+                WHERE id = ?8
                 "#,
             )
-            .bind(budget.hard_limit_usd)
-            .bind(budget.soft_limit_usd)
+            .bind(budget.hard_limit_usd.map(Money::to_usd))
+            .bind(budget.soft_limit_usd.map(Money::to_usd))
+            .bind(budget.hard_limit_usd.map(Money::micros))
+            .bind(budget.soft_limit_usd.map(Money::micros))
             .bind(&budget.action_on_hard)
             .bind(&budget.action_on_soft)
             .bind(&budget.preset_source)
@@ -569,16 +578,18 @@ impl BudgetRepo for SqliteStore {
             sqlx::query(
                 r#"
                 INSERT INTO budgets (
-                    scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft, preset_source
+                    scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, hard_limit_micros, soft_limit_micros, action_on_hard, action_on_soft, preset_source
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 "#,
             )
             .bind(scope_type_db)
             .bind(&budget.scope_id)
             .bind(window_type_db)
-            .bind(budget.hard_limit_usd)
-            .bind(budget.soft_limit_usd)
+            .bind(budget.hard_limit_usd.map(Money::to_usd))
+            .bind(budget.soft_limit_usd.map(Money::to_usd))
+            .bind(budget.hard_limit_usd.map(Money::micros))
+            .bind(budget.soft_limit_usd.map(Money::micros))
             .bind(&budget.action_on_hard)
             .bind(&budget.action_on_soft)
             .bind(&budget.preset_source)
@@ -597,7 +608,7 @@ impl BudgetRepo for SqliteStore {
     async fn list_all(&self) -> Result<Vec<Budget>, StoreError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft, preset_source
+            SELECT id, scope_type, scope_id, window_type, hard_limit_micros, soft_limit_micros, action_on_hard, action_on_soft, preset_source
             FROM budgets
             ORDER BY id
             "#,
@@ -884,8 +895,12 @@ fn budget_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Budget, StoreError> {
         scope_type: scope_type_from_db(&scope_value)?,
         scope_id: row.get("scope_id"),
         window_type: window_type_from_db(&window_value)?,
-        hard_limit_usd: row.get("hard_limit_usd"),
-        soft_limit_usd: row.get("soft_limit_usd"),
+        hard_limit_usd: row
+            .get::<Option<i64>, _>("hard_limit_micros")
+            .map(Money::from_micros),
+        soft_limit_usd: row
+            .get::<Option<i64>, _>("soft_limit_micros")
+            .map(Money::from_micros),
         action_on_hard: row.get("action_on_hard"),
         action_on_soft: row.get("action_on_soft"),
         preset_source: row.get("preset_source"),
@@ -1032,7 +1047,7 @@ mod tests {
                 request_id,
                 input_tokens: 1234,
                 output_tokens: 321,
-                cost_usd: 0.42,
+                cost_usd: Money::from_usd(0.42).expect("money"),
                 source: UsageSource::Provider,
                 pricing_snapshot: json!({ "model": "claude-sonnet-4-6" }),
             })
@@ -1059,8 +1074,8 @@ mod tests {
             scope_type: ScopeType::Global,
             scope_id: "*".into(),
             window_type: WindowType::Day,
-            hard_limit_usd: Some(10.0),
-            soft_limit_usd: Some(8.0),
+            hard_limit_usd: Some(Money::from_usd(10.0).expect("money")),
+            soft_limit_usd: Some(Money::from_usd(8.0).expect("money")),
             action_on_hard: "block".into(),
             action_on_soft: "warn".into(),
             preset_source: None,
@@ -1070,7 +1085,7 @@ mod tests {
         assert!(stored.id > 0);
 
         let mut changed = stored.clone();
-        changed.hard_limit_usd = Some(12.5);
+        changed.hard_limit_usd = Some(Money::from_usd(12.5).expect("money"));
         store.upsert(&changed).await.expect("update budget");
 
         let applicable = store
@@ -1078,7 +1093,10 @@ mod tests {
             .await
             .expect("list applicable");
         assert_eq!(applicable.len(), 1);
-        assert_eq!(applicable[0].hard_limit_usd, Some(12.5));
+        assert_eq!(
+            applicable[0].hard_limit_usd,
+            Some(Money::from_usd(12.5).expect("money"))
+        );
 
         let all = store.list_all().await.expect("list all");
         assert_eq!(all.len(), 1);
@@ -1094,7 +1112,7 @@ mod tests {
                 scope_type: ScopeType::Global,
                 scope_id: "*".into(),
                 window_type: WindowType::Day,
-                hard_limit_usd: Some(100.0),
+                hard_limit_usd: Some(Money::from_usd(100.0).expect("money")),
                 soft_limit_usd: None,
                 action_on_hard: "block".into(),
                 action_on_soft: "warn".into(),
@@ -1105,7 +1123,7 @@ mod tests {
                 scope_type: ScopeType::Project,
                 scope_id: "project-alpha".into(),
                 window_type: WindowType::Week,
-                hard_limit_usd: Some(200.0),
+                hard_limit_usd: Some(Money::from_usd(200.0).expect("money")),
                 soft_limit_usd: None,
                 action_on_hard: "block".into(),
                 action_on_soft: "warn".into(),
@@ -1116,7 +1134,7 @@ mod tests {
                 scope_type: ScopeType::Session,
                 scope_id: "session-123".into(),
                 window_type: WindowType::Month,
-                hard_limit_usd: Some(300.0),
+                hard_limit_usd: Some(Money::from_usd(300.0).expect("money")),
                 soft_limit_usd: None,
                 action_on_hard: "block".into(),
                 action_on_soft: "warn".into(),
@@ -1127,7 +1145,7 @@ mod tests {
                 scope_type: ScopeType::Project,
                 scope_id: "other-project".into(),
                 window_type: WindowType::Total,
-                hard_limit_usd: Some(400.0),
+                hard_limit_usd: Some(Money::from_usd(400.0).expect("money")),
                 soft_limit_usd: None,
                 action_on_hard: "block".into(),
                 action_on_soft: "warn".into(),
