@@ -1135,6 +1135,7 @@ dependencies = [
  "axum",
  "chrono",
  "penny-budget",
+ "penny-config",
  "penny-cost",
  "penny-ledger",
  "penny-providers",

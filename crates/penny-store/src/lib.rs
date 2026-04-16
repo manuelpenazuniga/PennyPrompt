@@ -449,7 +449,7 @@ impl BudgetRepo for SqliteStore {
         let window_type_db = window_type_to_db(&window_type);
         let rows = sqlx::query(
             r#"
-            SELECT id, scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft
+            SELECT id, scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft, preset_source
             FROM budgets
             WHERE window_type = ?1
               AND (
@@ -475,7 +475,7 @@ impl BudgetRepo for SqliteStore {
     ) -> Result<Vec<Budget>, StoreError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft
+            SELECT id, scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft, preset_source
             FROM budgets
             WHERE window_type IN ('day', 'week', 'month', 'total')
               AND (
@@ -508,8 +508,9 @@ impl BudgetRepo for SqliteStore {
                     hard_limit_usd = ?4,
                     soft_limit_usd = ?5,
                     action_on_hard = ?6,
-                    action_on_soft = ?7
-                WHERE id = ?8
+                    action_on_soft = ?7,
+                    preset_source = ?8
+                WHERE id = ?9
                 "#,
             )
             .bind(scope_type_db)
@@ -519,6 +520,7 @@ impl BudgetRepo for SqliteStore {
             .bind(budget.soft_limit_usd)
             .bind(&budget.action_on_hard)
             .bind(&budget.action_on_soft)
+            .bind(&budget.preset_source)
             .bind(budget.id)
             .execute(&self.pool)
             .await?;
@@ -549,14 +551,16 @@ impl BudgetRepo for SqliteStore {
                 SET hard_limit_usd = ?1,
                     soft_limit_usd = ?2,
                     action_on_hard = ?3,
-                    action_on_soft = ?4
-                WHERE id = ?5
+                    action_on_soft = ?4,
+                    preset_source = ?5
+                WHERE id = ?6
                 "#,
             )
             .bind(budget.hard_limit_usd)
             .bind(budget.soft_limit_usd)
             .bind(&budget.action_on_hard)
             .bind(&budget.action_on_soft)
+            .bind(&budget.preset_source)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -565,9 +569,9 @@ impl BudgetRepo for SqliteStore {
             sqlx::query(
                 r#"
                 INSERT INTO budgets (
-                    scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft
+                    scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft, preset_source
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 "#,
             )
             .bind(scope_type_db)
@@ -577,6 +581,7 @@ impl BudgetRepo for SqliteStore {
             .bind(budget.soft_limit_usd)
             .bind(&budget.action_on_hard)
             .bind(&budget.action_on_soft)
+            .bind(&budget.preset_source)
             .execute(&self.pool)
             .await?;
             sqlx::query_scalar("SELECT last_insert_rowid()")
@@ -592,7 +597,7 @@ impl BudgetRepo for SqliteStore {
     async fn list_all(&self) -> Result<Vec<Budget>, StoreError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft
+            SELECT id, scope_type, scope_id, window_type, hard_limit_usd, soft_limit_usd, action_on_hard, action_on_soft, preset_source
             FROM budgets
             ORDER BY id
             "#,
@@ -883,6 +888,7 @@ fn budget_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Budget, StoreError> {
         soft_limit_usd: row.get("soft_limit_usd"),
         action_on_hard: row.get("action_on_hard"),
         action_on_soft: row.get("action_on_soft"),
+        preset_source: row.get("preset_source"),
     })
 }
 
@@ -1057,6 +1063,7 @@ mod tests {
             soft_limit_usd: Some(8.0),
             action_on_hard: "block".into(),
             action_on_soft: "warn".into(),
+            preset_source: None,
         };
 
         let stored = store.upsert(&budget).await.expect("insert budget");
@@ -1091,6 +1098,7 @@ mod tests {
                 soft_limit_usd: None,
                 action_on_hard: "block".into(),
                 action_on_soft: "warn".into(),
+                preset_source: Some("preset:indie".into()),
             },
             Budget {
                 id: 0,
@@ -1101,6 +1109,7 @@ mod tests {
                 soft_limit_usd: None,
                 action_on_hard: "block".into(),
                 action_on_soft: "warn".into(),
+                preset_source: Some("preset:indie".into()),
             },
             Budget {
                 id: 0,
@@ -1111,6 +1120,7 @@ mod tests {
                 soft_limit_usd: None,
                 action_on_hard: "block".into(),
                 action_on_soft: "warn".into(),
+                preset_source: Some("preset:indie".into()),
             },
             Budget {
                 id: 0,
@@ -1121,6 +1131,7 @@ mod tests {
                 soft_limit_usd: None,
                 action_on_hard: "block".into(),
                 action_on_soft: "warn".into(),
+                preset_source: Some("preset:team".into()),
             },
         ];
 

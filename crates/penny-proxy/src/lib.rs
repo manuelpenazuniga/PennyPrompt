@@ -17,12 +17,19 @@ use axum::{
 };
 use chrono::Utc;
 use penny_budget::BudgetEvaluator;
+use penny_config::{
+    AppConfig as RuntimeConfig, BudgetConfig as RuntimeBudgetConfig, ScopeType as ConfigScopeType,
+    WindowType as ConfigWindowType,
+};
 use penny_cost::{estimate_tokens, PricingEngine};
 use penny_ledger::CostLedger;
 use penny_providers::{MockProvider, MockProviderConfig, ProviderAdapter, ProviderError};
-use penny_store::{NewRequest, ProjectRepo, RequestRepo, SessionRepo, SqliteStore, UsageRecord};
+use penny_store::{
+    BudgetRepo, NewRequest, ProjectRepo, RequestRepo, SessionRepo, SqliteStore, UsageRecord,
+};
 use penny_types::{
-    BudgetBlockDetail, Mode, NormalizedRequest, ResponseBody, RouteDecision, UsageSource,
+    Budget, BudgetBlockDetail, Mode, NormalizedRequest, ResponseBody, RouteDecision, ScopeType,
+    UsageSource, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -91,6 +98,19 @@ impl ProxyState {
         let models = mock.config().supported_models.clone();
         Self::with_provider(Arc::new(mock), models)
     }
+}
+
+pub async fn build_state_from_config(
+    provider: Arc<dyn ProviderAdapter>,
+    models: Vec<String>,
+    store: SqliteStore,
+    config: &RuntimeConfig,
+) -> Result<ProxyState, String> {
+    seed_budgets_from_runtime_config(&store, config).await?;
+    Ok(ProxyState::with_provider(provider, models)
+        .with_store(store)
+        .with_mode(mode_from_config(&config.server.mode))
+        .with_session_window_minutes(config.attribution.session_window_minutes as u64))
 }
 
 #[derive(Debug, Clone)]
@@ -533,6 +553,59 @@ async fn ensure_session_override_exists(
     Ok(())
 }
 
+pub async fn seed_budgets_from_runtime_config(
+    store: &SqliteStore,
+    config: &RuntimeConfig,
+) -> Result<Vec<Budget>, String> {
+    let mut seeded = Vec::with_capacity(config.budgets.len());
+    for budget in &config.budgets {
+        let mapped = map_config_budget(budget);
+        let stored = BudgetRepo::upsert(store, &mapped)
+            .await
+            .map_err(|err| err.to_string())?;
+        seeded.push(stored);
+    }
+    Ok(seeded)
+}
+
+fn map_config_budget(budget: &RuntimeBudgetConfig) -> Budget {
+    Budget {
+        id: 0,
+        scope_type: scope_type_from_config(&budget.scope_type),
+        scope_id: budget.scope_id.clone(),
+        window_type: window_type_from_config(&budget.window_type),
+        hard_limit_usd: budget.hard_limit_usd,
+        soft_limit_usd: budget.soft_limit_usd,
+        action_on_hard: budget.action_on_hard.clone(),
+        action_on_soft: budget.action_on_soft.clone(),
+        preset_source: budget.preset_source.clone(),
+    }
+}
+
+fn scope_type_from_config(scope: &ConfigScopeType) -> ScopeType {
+    match scope {
+        ConfigScopeType::Global => ScopeType::Global,
+        ConfigScopeType::Project => ScopeType::Project,
+        ConfigScopeType::Session => ScopeType::Session,
+    }
+}
+
+fn window_type_from_config(window: &ConfigWindowType) -> WindowType {
+    match window {
+        ConfigWindowType::Day => WindowType::Day,
+        ConfigWindowType::Week => WindowType::Week,
+        ConfigWindowType::Month => WindowType::Month,
+        ConfigWindowType::Total => WindowType::Total,
+    }
+}
+
+fn mode_from_config(mode: &penny_config::Mode) -> Mode {
+    match mode {
+        penny_config::Mode::Observe => Mode::Observe,
+        penny_config::Mode::Guard => Mode::Guard,
+    }
+}
+
 async fn evaluate_budget_before_dispatch(
     state: &ProxyState,
     request: &NormalizedRequest,
@@ -839,10 +912,13 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
     };
+    use penny_budget::BudgetEvaluator;
+    use penny_config::{load_config, LoadOptions};
     use penny_cost::import_pricebook_files;
     use penny_store::BudgetRepo;
-    use penny_types::{Budget, ScopeType, WindowType};
+    use penny_types::{Budget, RouteDecision, ScopeType, WindowType};
     use sqlx::Row;
+    use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
     use tower::ServiceExt;
@@ -887,10 +963,128 @@ mod tests {
                 soft_limit_usd: None,
                 action_on_hard: "block".to_string(),
                 action_on_soft: "warn".to_string(),
+                preset_source: None,
             },
         )
         .await
         .expect("seed budget");
+    }
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("resolve repo root")
+    }
+
+    fn budget_request(id: &str) -> NormalizedRequest {
+        NormalizedRequest {
+            id: id.to_string(),
+            project_id: "project-alpha".to_string(),
+            session_id: "session-1".to_string(),
+            model_requested: "claude-sonnet-4-6".to_string(),
+            model_resolved: "claude-sonnet-4-6".to_string(),
+            provider_id: "mock".to_string(),
+            messages: json!([{ "role": "user", "content": "hello" }]),
+            stream: false,
+            estimated_input_tokens: 100,
+            estimated_output_tokens: 50,
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_seeding_from_preset_is_idempotent_and_tagged() {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        let config = load_config(LoadOptions {
+            repository_root: Some(repo_root()),
+            preset: Some("team".to_string()),
+            ..LoadOptions::default()
+        })
+        .expect("load config with team preset");
+
+        let first = seed_budgets_from_runtime_config(&store, &config)
+            .await
+            .expect("first seed");
+        let second = seed_budgets_from_runtime_config(&store, &config)
+            .await
+            .expect("second seed");
+        assert_eq!(first.len(), config.budgets.len());
+        assert_eq!(second.len(), config.budgets.len());
+
+        let all = BudgetRepo::list_all(&store)
+            .await
+            .expect("list all budgets");
+        assert_eq!(all.len(), config.budgets.len());
+        assert!(all
+            .iter()
+            .all(|budget| budget.preset_source.as_deref() == Some("preset:team")));
+    }
+
+    #[tokio::test]
+    async fn user_budget_override_replaces_preset_values_safely() {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        let temp = TempDir::new().expect("temp dir");
+        let user_config_path = temp.path().join("config.toml");
+        fs::write(
+            &user_config_path,
+            r#"
+[[budgets]]
+scope_type = "global"
+scope_id = "*"
+window_type = "day"
+hard_limit_usd = 7.0
+action_on_hard = "block"
+action_on_soft = "warn"
+"#,
+        )
+        .expect("write user config");
+
+        let config = load_config(LoadOptions {
+            repository_root: Some(repo_root()),
+            config_path: Some(user_config_path),
+            preset: Some("team".to_string()),
+        })
+        .expect("load config with user override");
+
+        seed_budgets_from_runtime_config(&store, &config)
+            .await
+            .expect("seed budgets");
+
+        let all = BudgetRepo::list_all(&store)
+            .await
+            .expect("list all budgets");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].window_type, WindowType::Day);
+        assert_eq!(all[0].hard_limit_usd, Some(7.0));
+        assert_eq!(all[0].preset_source, None);
+    }
+
+    #[tokio::test]
+    async fn seeded_budgets_are_immediately_visible_to_evaluator() {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        let config = load_config(LoadOptions {
+            repository_root: Some(repo_root()),
+            preset: Some("indie".to_string()),
+            ..LoadOptions::default()
+        })
+        .expect("load config with indie preset");
+
+        seed_budgets_from_runtime_config(&store, &config)
+            .await
+            .expect("seed budgets");
+
+        let evaluator = BudgetEvaluator::new(store, Mode::Guard);
+        let decision = evaluator
+            .evaluate(&budget_request("req_seeded_eval"), 11.0)
+            .await;
+        assert!(matches!(decision, RouteDecision::Block { .. }));
     }
 
     #[tokio::test]

@@ -87,6 +87,8 @@ pub struct BudgetConfig {
     pub action_on_hard: String,
     #[serde(default = "default_action_on_soft")]
     pub action_on_soft: String,
+    #[serde(default)]
+    pub preset_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -161,7 +163,8 @@ pub fn load_config(opts: LoadOptions) -> Result<AppConfig, ConfigError> {
                 path: preset_path.display().to_string(),
             });
         }
-        let preset_partial = read_partial(&preset_path)?;
+        let mut preset_partial = read_partial(&preset_path)?;
+        tag_preset_budget_source(&mut preset_partial, preset);
         merged.merge_from(preset_partial);
     }
 
@@ -184,6 +187,18 @@ fn default_action_on_hard() -> String {
 
 fn default_action_on_soft() -> String {
     "warn".to_string()
+}
+
+fn tag_preset_budget_source(cfg: &mut PartialAppConfig, preset: &str) {
+    let Some(budgets) = cfg.budgets.as_mut() else {
+        return;
+    };
+    let source = format!("preset:{preset}");
+    for budget in budgets {
+        if budget.preset_source.is_none() {
+            budget.preset_source = Some(source.clone());
+        }
+    }
 }
 
 fn resolve_repo_root(repository_root: Option<PathBuf>) -> Result<PathBuf, ConfigError> {
