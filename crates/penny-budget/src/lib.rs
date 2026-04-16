@@ -65,11 +65,20 @@ impl BudgetEvaluator {
             };
         }
 
-        let reservation = match self
-            .ledger
-            .reserve(&request.id, &budgets, estimated_cost)
-            .await
-        {
+        let reserve_result = match self.mode {
+            Mode::Guard => {
+                self.ledger
+                    .reserve(&request.id, &budgets, estimated_cost)
+                    .await
+            }
+            Mode::Observe => {
+                self.ledger
+                    .reserve_allow_over_limit(&request.id, &budgets, estimated_cost)
+                    .await
+            }
+        };
+
+        let reservation = match reserve_result {
             Ok(reservation) => reservation,
             Err(error) => {
                 return self
@@ -87,7 +96,8 @@ impl BudgetEvaluator {
                 entries,
                 remaining_by_budget,
             } => {
-                let warnings = match self
+                let mut warnings = self.compute_over_limit_warnings(&budgets, &remaining_by_budget);
+                let soft_warnings = match self
                     .compute_soft_limit_warnings(&budgets, &remaining_by_budget)
                     .await
                 {
@@ -102,6 +112,7 @@ impl BudgetEvaluator {
                             .await;
                     }
                 };
+                warnings.extend(soft_warnings);
 
                 if warnings.is_empty() {
                     self.record_event(
@@ -123,7 +134,11 @@ impl BudgetEvaluator {
                         Severity::Warn,
                         json!({
                             "mode": self.mode_tag(),
-                            "result": "allow_with_warnings",
+                            "result": if warnings.iter().any(|warning| warning.contains("hard limit exceeded")) {
+                                "allow_budget_violation"
+                            } else {
+                                "allow_with_warnings"
+                            },
                             "warnings": warnings,
                             "estimated_cost_usd": estimated_cost
                         }),
@@ -225,6 +240,41 @@ impl BudgetEvaluator {
 
         budgets.sort_by_key(|budget| budget.id);
         Ok(budgets)
+    }
+
+    fn compute_over_limit_warnings(
+        &self,
+        budgets: &[Budget],
+        remaining_by_budget: &[penny_types::BudgetRemaining],
+    ) -> Vec<String> {
+        let mut remaining_map = HashMap::with_capacity(remaining_by_budget.len());
+        for item in remaining_by_budget {
+            remaining_map.insert(item.budget_id, item.remaining_usd);
+        }
+
+        let mut warnings = Vec::new();
+        for budget in budgets {
+            let Some(limit) = budget.hard_limit_usd else {
+                continue;
+            };
+
+            let Some(remaining) = remaining_map.get(&budget.id) else {
+                continue;
+            };
+
+            if remaining.is_finite() && *remaining < 0.0 {
+                let accumulated = limit - *remaining;
+                warnings.push(format!(
+                    "hard limit exceeded for {} ({:?}): {:.6} / {:.6}",
+                    scope_string(budget),
+                    budget.window_type,
+                    accumulated,
+                    limit
+                ));
+            }
+        }
+
+        warnings
     }
 
     async fn compute_soft_limit_warnings(
@@ -581,7 +631,7 @@ mod tests {
         match decision {
             RouteDecision::Allow { warnings } => {
                 assert_eq!(warnings.len(), 1);
-                assert!(warnings[0].contains("observe mode budget violation"));
+                assert!(warnings[0].contains("hard limit exceeded"));
             }
             other => panic!("unexpected decision: {other:?}"),
         }
@@ -594,6 +644,22 @@ mod tests {
         .expect("load observe violation events");
         assert!(event_types.iter().any(|ty| ty == "budget_warn"));
         assert!(!event_types.iter().any(|ty| ty == "budget_block"));
+
+        let reserve_count: i64 = query_scalar(
+            "SELECT COUNT(*) FROM cost_ledger WHERE request_id = 'req_observe_violation' AND entry_type = 'reserve'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count observe reserve rows");
+        assert_eq!(reserve_count, 1);
+
+        let running_total: f64 = query_scalar(
+            "SELECT running_total FROM cost_ledger WHERE request_id = 'req_observe_violation' AND entry_type = 'reserve' LIMIT 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load observe running total");
+        assert!((running_total - 2.0).abs() < 1e-9);
     }
 
     #[tokio::test]
