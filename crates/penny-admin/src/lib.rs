@@ -631,6 +631,7 @@ fn event_type_from_db(value: &str) -> Result<EventType, StoreError> {
         "loop_detected" => Ok(EventType::LoopDetected),
         "burn_rate_alert" => Ok(EventType::BurnRateAlert),
         "session_paused" => Ok(EventType::SessionPaused),
+        "provider_failure" => Ok(EventType::ProviderFailure),
         "mode_failsafe" => Ok(EventType::ModeFailsafe),
         _ => Err(StoreError::InvalidEnum {
             field: "events.event_type",

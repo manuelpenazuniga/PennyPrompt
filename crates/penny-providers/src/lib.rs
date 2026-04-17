@@ -33,6 +33,39 @@ pub trait ProviderAdapter: Send + Sync {
     }
 }
 
+fn transport_error_response(error: reqwest::Error) -> ProviderResponse {
+    let (status, error_type) = if error.is_timeout() {
+        (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout")
+    } else {
+        (StatusCode::BAD_GATEWAY, "upstream_unavailable")
+    };
+    ProviderResponse {
+        status: status.as_u16(),
+        body: ResponseBody::Complete(json!({
+            "error": {
+                "message": error.to_string(),
+                "type": error_type,
+                "code": status.as_u16(),
+            }
+        })),
+        upstream_ms: 0,
+    }
+}
+
+fn parse_failure_response(error: serde_json::Error) -> ProviderResponse {
+    ProviderResponse {
+        status: StatusCode::BAD_GATEWAY.as_u16(),
+        body: ResponseBody::Complete(json!({
+            "error": {
+                "message": format!("failed to parse upstream JSON response: {error}"),
+                "type": "provider_parse_error",
+                "code": StatusCode::BAD_GATEWAY.as_u16(),
+            }
+        })),
+        upstream_ms: 0,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiProviderConfig {
     pub provider_id: String,
@@ -609,17 +642,7 @@ impl ProviderAdapter for AnthropicProvider {
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                return Ok(ProviderResponse {
-                    status: StatusCode::BAD_GATEWAY.as_u16(),
-                    body: ResponseBody::Complete(json!({
-                        "error": {
-                            "message": error.to_string(),
-                            "type": "upstream_unavailable",
-                            "code": StatusCode::BAD_GATEWAY.as_u16(),
-                        }
-                    })),
-                    upstream_ms: 0,
-                });
+                return Ok(transport_error_response(error));
             }
         };
         let status = response.status();
@@ -673,7 +696,10 @@ impl ProviderAdapter for AnthropicProvider {
         }
 
         let body_text = response.text().await.unwrap_or_default();
-        let parsed: Value = serde_json::from_str(&body_text).unwrap_or_else(|_| json!({}));
+        let parsed = match serde_json::from_str::<Value>(&body_text) {
+            Ok(parsed) => parsed,
+            Err(error) => return Ok(parse_failure_response(error)),
+        };
         Ok(ProviderResponse {
             status: status.as_u16(),
             body: ResponseBody::Complete(self.map_non_stream_response(&req, &parsed)),
@@ -720,17 +746,7 @@ impl ProviderAdapter for OpenAiProvider {
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                return Ok(ProviderResponse {
-                    status: StatusCode::BAD_GATEWAY.as_u16(),
-                    body: ResponseBody::Complete(json!({
-                        "error": {
-                            "message": error.to_string(),
-                            "type": "upstream_unavailable",
-                            "code": StatusCode::BAD_GATEWAY.as_u16(),
-                        }
-                    })),
-                    upstream_ms: 0,
-                });
+                return Ok(transport_error_response(error));
             }
         };
         let status = response.status();
@@ -782,7 +798,10 @@ impl ProviderAdapter for OpenAiProvider {
         }
 
         let body_text = response.text().await.unwrap_or_default();
-        let parsed = serde_json::from_str::<Value>(&body_text).unwrap_or_else(|_| json!({}));
+        let parsed = match serde_json::from_str::<Value>(&body_text) {
+            Ok(parsed) => parsed,
+            Err(error) => return Ok(parse_failure_response(error)),
+        };
         Ok(ProviderResponse {
             status: status.as_u16(),
             body: ResponseBody::Complete(parsed),
@@ -965,6 +984,7 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
         sync::oneshot,
+        time::{sleep, Duration},
     };
 
     fn request(stream: bool) -> NormalizedRequest {
@@ -1091,8 +1111,11 @@ mod tests {
 
             let reason = match status {
                 200 => "OK",
+                429 => "Too Many Requests",
                 401 => "Unauthorized",
                 502 => "Bad Gateway",
+                503 => "Service Unavailable",
+                504 => "Gateway Timeout",
                 _ => "OK",
             };
             let response = format!(
@@ -1105,6 +1128,18 @@ mod tests {
                 .expect("write response");
         });
         (format!("http://{addr}"), rx)
+    }
+
+    async fn spawn_slow_server(delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow server");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept request");
+            sleep(delay).await;
+        });
+        format!("http://{addr}")
     }
 
     async fn collect_stream_lines(mut receiver: mpsc::Receiver<String>) -> Vec<String> {
@@ -1403,6 +1438,85 @@ mod tests {
             }
             other => panic!("expected mapped error payload, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn openai_timeout_is_mapped_to_504() {
+        let base_url = spawn_slow_server(Duration::from_millis(250)).await;
+        let provider = OpenAiProvider::new(OpenAiProviderConfig {
+            base_url,
+            api_key: "test-openai-key".to_string(),
+            timeout_ms: 25,
+            supported_models: vec!["gpt-4.1".to_string()],
+            ..OpenAiProviderConfig::default()
+        })
+        .expect("provider should build");
+        let mut req = request(false);
+        req.provider_id = "openai".to_string();
+        req.model_requested = "gpt-4.1".to_string();
+        req.model_resolved = "gpt-4.1".to_string();
+
+        let response = provider.send(req).await.expect("response");
+        assert_eq!(response.status, 504);
+        match response.body {
+            ResponseBody::Complete(payload) => {
+                assert_eq!(payload["error"]["type"], "upstream_timeout");
+                assert_eq!(payload["error"]["code"], 504);
+            }
+            other => panic!("expected mapped timeout error payload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_parse_failure_is_mapped_to_502() {
+        let (base_url, _) =
+            spawn_single_response_server(200, "application/json", "{not-json".into()).await;
+        let provider = openai_provider(base_url);
+        let mut req = request(false);
+        req.provider_id = "openai".to_string();
+        req.model_requested = "gpt-4.1".to_string();
+        req.model_resolved = "gpt-4.1".to_string();
+
+        let response = provider.send(req).await.expect("response");
+        assert_eq!(response.status, 502);
+        match response.body {
+            ResponseBody::Complete(payload) => {
+                assert_eq!(payload["error"]["type"], "provider_parse_error");
+                assert_eq!(payload["error"]["code"], 502);
+            }
+            other => panic!("expected mapped parse error payload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_http_429_and_503_are_passthrough() {
+        let (base_429, _) = spawn_single_response_server(
+            429,
+            "application/json",
+            json!({"error":{"message":"rate limited","type":"rate_limit_error"}}).to_string(),
+        )
+        .await;
+        let provider_429 = openai_provider(base_429);
+        let mut req_429 = request(false);
+        req_429.provider_id = "openai".to_string();
+        req_429.model_requested = "gpt-4.1".to_string();
+        req_429.model_resolved = "gpt-4.1".to_string();
+        let response_429 = provider_429.send(req_429).await.expect("response 429");
+        assert_eq!(response_429.status, 429);
+
+        let (base_503, _) = spawn_single_response_server(
+            503,
+            "application/json",
+            json!({"error":{"message":"upstream overloaded","type":"server_error"}}).to_string(),
+        )
+        .await;
+        let provider_503 = openai_provider(base_503);
+        let mut req_503 = request(false);
+        req_503.provider_id = "openai".to_string();
+        req_503.model_requested = "gpt-4.1".to_string();
+        req_503.model_resolved = "gpt-4.1".to_string();
+        let response_503 = provider_503.send(req_503).await.expect("response 503");
+        assert_eq!(response_503.status, 503);
     }
 
     #[tokio::test]

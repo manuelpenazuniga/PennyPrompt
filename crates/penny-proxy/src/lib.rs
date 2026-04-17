@@ -27,11 +27,12 @@ use penny_cost::{estimate_tokens, PricingEngine};
 use penny_ledger::CostLedger;
 use penny_providers::{MockProvider, MockProviderConfig, ProviderAdapter, ProviderError};
 use penny_store::{
-    BudgetRepo, NewRequest, ProjectRepo, RequestRepo, SessionRepo, SqliteStore, UsageRecord,
+    BudgetRepo, EventRepo, NewEvent, NewRequest, ProjectRepo, RequestRepo, SessionRepo,
+    SqliteStore, UsageRecord,
 };
 use penny_types::{
-    Budget, BudgetBlockDetail, Mode, Money, NormalizedRequest, ResponseBody, RouteDecision,
-    ScopeType, UsageSource, WindowType,
+    Budget, BudgetBlockDetail, EventType, Mode, Money, NormalizedRequest, ResponseBody,
+    RouteDecision, ScopeType, Severity, UsageSource, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -282,6 +283,28 @@ async fn post_chat_completions(
     let status = StatusCode::from_u16(provider_response.status).unwrap_or(StatusCode::BAD_GATEWAY);
     match provider_response.body {
         ResponseBody::Complete(value) => {
+            if !status.is_success() {
+                if let Some(context) = enforcement.as_ref() {
+                    maybe_release_on_dispatch_failure(
+                        &state,
+                        &normalized.id,
+                        context.reserve_persisted,
+                    )
+                    .await;
+                }
+                if status.is_server_error() {
+                    log_provider_failure_event(
+                        &state,
+                        &normalized,
+                        status,
+                        "upstream_http",
+                        &value,
+                    )
+                    .await;
+                }
+                return (status, Json(value)).into_response();
+            }
+
             let usage = provider_usage_from_completion(&value)
                 .unwrap_or_else(|| estimated_usage_from_request(&normalized));
             let usage_cost_usd =
@@ -905,6 +928,14 @@ async fn stream_passthrough_response(
             .unwrap_or_else(|| estimated_usage_from_request(&normalized));
         if !saw_done {
             mark_stream_incomplete(&mut usage);
+            log_provider_failure_event(
+                &state,
+                &normalized,
+                status,
+                "incomplete_stream",
+                &json!({"message":"upstream stream ended before [DONE]"}),
+            )
+            .await;
         }
 
         let usage_cost_usd =
@@ -950,6 +981,35 @@ fn mark_stream_incomplete(usage: &mut NormalizedUsage) {
     snapshot.insert("stream_incomplete".to_string(), Value::Bool(true));
     snapshot.insert("stream_completed".to_string(), Value::Bool(false));
     usage.pricing_snapshot = Value::Object(snapshot);
+}
+
+async fn log_provider_failure_event(
+    state: &ProxyState,
+    normalized: &NormalizedRequest,
+    status: StatusCode,
+    failure_kind: &'static str,
+    payload: &Value,
+) {
+    let Some(store) = &state.store else {
+        return;
+    };
+    let event = NewEvent {
+        request_id: Some(normalized.id.clone()),
+        session_id: Some(normalized.session_id.clone()),
+        event_type: EventType::ProviderFailure,
+        severity: Severity::Error,
+        detail: json!({
+            "kind": failure_kind,
+            "provider_id": normalized.provider_id,
+            "model_requested": normalized.model_requested,
+            "model_resolved": normalized.model_resolved,
+            "http_status": status.as_u16(),
+            "error": payload.get("error").cloned().unwrap_or_else(|| payload.clone()),
+        }),
+    };
+    if let Err(err) = EventRepo::insert(store, &event).await {
+        log_internal_error("provider_failure_event_insert_failed", err.to_string());
+    }
 }
 
 fn detect_git_root_from(headers: &HeaderMap) -> Option<PathBuf> {
@@ -1165,12 +1225,47 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct StaticErrorProvider {
+        status: u16,
+        payload: Value,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for StaticErrorProvider {
+        async fn send(&self, _req: NormalizedRequest) -> Result<ProviderResponse, ProviderError> {
+            Ok(ProviderResponse {
+                status: self.status,
+                body: ResponseBody::Complete(self.payload.clone()),
+                upstream_ms: 0,
+            })
+        }
+
+        fn provider_id(&self) -> &str {
+            "static-error"
+        }
+
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+    }
+
     async fn app_with_incomplete_stream_provider() -> (Router, SqliteStore) {
         let store = SqliteStore::connect("sqlite::memory:")
             .await
             .expect("create in-memory store");
         let provider: Arc<dyn ProviderAdapter> = Arc::new(IncompleteStreamProvider::default());
         let state = ProxyState::with_provider(provider, vec!["gpt-4.1".to_string()])
+            .with_store(store.clone());
+        (build_router(state), store)
+    }
+
+    async fn app_with_static_error_provider(status: u16, payload: Value) -> (Router, SqliteStore) {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        let provider: Arc<dyn ProviderAdapter> = Arc::new(StaticErrorProvider { status, payload });
+        let state = ProxyState::with_provider(provider, vec!["claude-sonnet-4-6".to_string()])
             .with_store(store.clone());
         (build_router(state), store)
     }
@@ -1666,6 +1761,17 @@ action_on_soft = "warn"
         assert_eq!(pricing_json["stream_completed"], false);
         assert!(row.get::<i64, _>("input_tokens") > 0);
         assert!(row.get::<i64, _>("output_tokens") > 0);
+
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail FROM events WHERE request_id = ?1 AND event_type = 'provider_failure' ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("provider failure event");
+        let detail_json: Value = serde_json::from_str(&detail).expect("event detail json");
+        assert_eq!(detail_json["kind"], "incomplete_stream");
+        assert_eq!(detail_json["http_status"], 200);
     }
 
     #[test]
@@ -1787,6 +1893,101 @@ action_on_soft = "warn"
         );
         assert_eq!(json_body["error"]["budget"]["limit_usd"], 0.0);
         assert!(json_body["error"]["budget"]["resets_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn provider_429_passthrough_is_distinct_from_budget_failure() {
+        let (app, _store) = app_with_static_error_provider(
+            429,
+            json!({
+                "error": {
+                    "message": "provider rate limit",
+                    "type": "rate_limit_error",
+                    "code": 429
+                }
+            }),
+        )
+        .await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"rate-limit check"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_ne!(response.status(), StatusCode::PAYMENT_REQUIRED);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json_body["error"]["type"], "rate_limit_error");
+        assert!(json_body["error"]["budget"].is_null());
+        assert!(json_body["error"]["retryable"].is_null());
+    }
+
+    #[tokio::test]
+    async fn provider_5xx_passthrough_logs_provider_failure_event() {
+        let (app, store) = app_with_static_error_provider(
+            503,
+            json!({
+                "error": {
+                    "message": "upstream overloaded",
+                    "type": "server_error",
+                    "code": 503
+                }
+            }),
+        )
+        .await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"5xx check"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json_body["error"]["type"], "server_error");
+
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail FROM events WHERE request_id = ?1 AND event_type = 'provider_failure' ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("provider failure event");
+        let detail_json: Value = serde_json::from_str(&detail).expect("event detail json");
+        assert_eq!(detail_json["kind"], "upstream_http");
+        assert_eq!(detail_json["http_status"], 503);
+        assert_eq!(detail_json["provider_id"], "static-error");
     }
 
     #[tokio::test]
