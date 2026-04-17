@@ -429,6 +429,7 @@ pub enum EventType {
     LoopDetected,
     BurnRateAlert,
     SessionPaused,
+    SessionResumed,
     ProviderFailure,
     ModeFailsafe,
 }

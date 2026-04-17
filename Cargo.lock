@@ -1390,6 +1390,13 @@ dependencies = [
 [[package]]
 name = "penny-detect"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "penny-config",
+ "penny-types",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "penny-ledger"
