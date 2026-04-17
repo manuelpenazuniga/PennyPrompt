@@ -1,6 +1,7 @@
 //! Provider adapter abstractions.
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use penny_types::{NormalizedRequest, ProviderResponse, ResponseBody, StreamDescriptor};
 use reqwest::{header::CONTENT_TYPE, Client, StatusCode};
 use serde_json::{json, Value};
@@ -9,6 +10,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
@@ -23,6 +25,9 @@ pub trait ProviderAdapter: Send + Sync {
     async fn send(&self, req: NormalizedRequest) -> Result<ProviderResponse, ProviderError>;
     fn provider_id(&self) -> &str;
     fn supports_model(&self, model: &str) -> bool;
+    fn take_stream_receiver(&self, _req: &NormalizedRequest) -> Option<mpsc::Receiver<String>> {
+        None
+    }
     fn stream_response_lines(&self, _req: &NormalizedRequest) -> Option<Vec<String>> {
         None
     }
@@ -53,7 +58,7 @@ impl Default for OpenAiProviderConfig {
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     client: Client,
-    pending_streams: ArcStreamCache,
+    pending_streams: ArcReceiverCache,
 }
 
 impl OpenAiProvider {
@@ -108,25 +113,9 @@ impl OpenAiProvider {
         }
     }
 
-    fn normalize_sse_lines(&self, raw_body: &str) -> Vec<String> {
-        let mut lines = raw_body
-            .split("\n\n")
-            .filter_map(|segment| {
-                let trimmed = segment.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                Some(format!("{trimmed}\n\n"))
-            })
-            .collect::<Vec<_>>();
-
-        if lines.is_empty() && !raw_body.trim().is_empty() {
-            lines.push(format!("{}\n\n", raw_body.trim()));
-        }
-        lines
-    }
-
-    fn lock_streams(&self) -> Result<MutexGuard<'_, HashMap<String, Vec<String>>>, ProviderError> {
+    fn lock_streams(
+        &self,
+    ) -> Result<MutexGuard<'_, HashMap<String, mpsc::Receiver<String>>>, ProviderError> {
         self.pending_streams
             .lock()
             .map_err(|err| ProviderError::InternalState(err.to_string()))
@@ -160,10 +149,10 @@ impl Default for AnthropicProviderConfig {
 pub struct AnthropicProvider {
     config: AnthropicProviderConfig,
     client: Client,
-    pending_streams: ArcStreamCache,
+    pending_streams: ArcReceiverCache,
 }
 
-type ArcStreamCache = std::sync::Arc<Mutex<HashMap<String, Vec<String>>>>;
+type ArcReceiverCache = std::sync::Arc<Mutex<HashMap<String, mpsc::Receiver<String>>>>;
 
 #[derive(Debug, Default)]
 struct AnthropicStreamState {
@@ -173,6 +162,8 @@ struct AnthropicStreamState {
     output_tokens: Option<u64>,
     finish_reason: Option<String>,
     deltas: Vec<String>,
+    role_sent: bool,
+    done_sent: bool,
 }
 
 impl AnthropicProvider {
@@ -326,88 +317,106 @@ impl AnthropicProvider {
         })
     }
 
-    fn map_stream_lines(&self, req: &NormalizedRequest, raw_body: &str) -> Vec<String> {
-        let mut state = AnthropicStreamState::default();
-        for block in split_sse_blocks(raw_body) {
-            let event = parse_sse_event(block);
-            if event.data.eq_ignore_ascii_case("[done]") {
-                continue;
+    fn map_stream_event(
+        req: &NormalizedRequest,
+        state: &mut AnthropicStreamState,
+        event: &SseEvent,
+    ) -> Vec<String> {
+        if event.data.eq_ignore_ascii_case("[done]") {
+            if state.done_sent {
+                return Vec::new();
             }
-            let parsed: Value = match serde_json::from_str(&event.data) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            match event.name.as_deref() {
-                Some("message_start") => {
-                    let message = parsed.get("message").unwrap_or(&Value::Null);
-                    state.message_id = message
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    state.model = message
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    state.input_tokens = message
-                        .get("usage")
-                        .and_then(|usage| usage.get("input_tokens"))
-                        .and_then(Value::as_u64)
-                        .or(state.input_tokens);
-                    state.output_tokens = message
-                        .get("usage")
-                        .and_then(|usage| usage.get("output_tokens"))
-                        .and_then(Value::as_u64)
-                        .or(state.output_tokens);
-                }
-                Some("content_block_start") => {
-                    if let Some(text) = parsed
-                        .get("content_block")
-                        .and_then(|block| block.get("text"))
-                        .and_then(Value::as_str)
-                    {
-                        if !text.is_empty() {
-                            state.deltas.push(text.to_string());
-                        }
-                    }
-                }
-                Some("content_block_delta") => {
-                    if let Some(text) = parsed
-                        .get("delta")
-                        .and_then(|delta| delta.get("text"))
-                        .and_then(Value::as_str)
-                    {
-                        if !text.is_empty() {
-                            state.deltas.push(text.to_string());
-                        }
-                    }
-                }
-                Some("message_delta") => {
-                    state.output_tokens = parsed
-                        .get("usage")
-                        .and_then(|usage| usage.get("output_tokens"))
-                        .and_then(Value::as_u64)
-                        .or(state.output_tokens);
-                    state.finish_reason = parsed
-                        .get("delta")
-                        .and_then(|delta| delta.get("stop_reason"))
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .or(state.finish_reason);
-                }
-                Some("message_stop") => {
-                    state.finish_reason = state
-                        .finish_reason
-                        .take()
-                        .or_else(|| Some("end_turn".to_string()));
-                }
-                _ => {}
-            }
+            state.done_sent = true;
+            return vec!["data: [DONE]\n\n".to_string()];
         }
 
-        build_openai_sse_lines(req, &state)
+        let parsed: Value = match serde_json::from_str(&event.data) {
+            Ok(value) => value,
+            Err(_) => return Vec::new(),
+        };
+        match event.name.as_deref() {
+            Some("message_start") => {
+                let message = parsed.get("message").unwrap_or(&Value::Null);
+                state.message_id = message
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                state.model = message
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                state.input_tokens = message
+                    .get("usage")
+                    .and_then(|usage| usage.get("input_tokens"))
+                    .and_then(Value::as_u64)
+                    .or(state.input_tokens);
+                state.output_tokens = message
+                    .get("usage")
+                    .and_then(|usage| usage.get("output_tokens"))
+                    .and_then(Value::as_u64)
+                    .or(state.output_tokens);
+
+                if state.role_sent {
+                    return Vec::new();
+                }
+                state.role_sent = true;
+                vec![build_openai_role_chunk(req, state)]
+            }
+            Some("content_block_start") => parsed
+                .get("content_block")
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| {
+                    state.deltas.push(text.to_string());
+                    vec![build_openai_delta_chunk(req, state, text)]
+                })
+                .unwrap_or_default(),
+            Some("content_block_delta") => parsed
+                .get("delta")
+                .and_then(|delta| delta.get("text"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| {
+                    state.deltas.push(text.to_string());
+                    vec![build_openai_delta_chunk(req, state, text)]
+                })
+                .unwrap_or_default(),
+            Some("message_delta") => {
+                state.output_tokens = parsed
+                    .get("usage")
+                    .and_then(|usage| usage.get("output_tokens"))
+                    .and_then(Value::as_u64)
+                    .or(state.output_tokens);
+                state.finish_reason = parsed
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| state.finish_reason.clone());
+                Vec::new()
+            }
+            Some("message_stop") => {
+                if state.done_sent {
+                    return Vec::new();
+                }
+                state.finish_reason = state
+                    .finish_reason
+                    .take()
+                    .or_else(|| Some("end_turn".to_string()));
+                state.done_sent = true;
+                vec![
+                    build_openai_final_chunk(req, state),
+                    "data: [DONE]\n\n".to_string(),
+                ]
+            }
+            _ => Vec::new(),
+        }
     }
 
-    fn lock_streams(&self) -> Result<MutexGuard<'_, HashMap<String, Vec<String>>>, ProviderError> {
+    fn lock_streams(
+        &self,
+    ) -> Result<MutexGuard<'_, HashMap<String, mpsc::Receiver<String>>>, ProviderError> {
         self.pending_streams
             .lock()
             .map_err(|err| ProviderError::InternalState(err.to_string()))
@@ -569,6 +578,19 @@ impl ProviderAdapter for MockProvider {
         self.config.supported_models.iter().any(|m| m == model)
     }
 
+    fn take_stream_receiver(&self, req: &NormalizedRequest) -> Option<mpsc::Receiver<String>> {
+        let lines = self.stream_sse_lines(req);
+        let (tx, rx) = mpsc::channel(lines.len().max(1));
+        tokio::spawn(async move {
+            for line in lines {
+                if tx.send(line).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Some(rx)
+    }
+
     fn stream_response_lines(&self, req: &NormalizedRequest) -> Option<Vec<String>> {
         Some(self.stream_sse_lines(req))
     }
@@ -601,9 +623,8 @@ impl ProviderAdapter for AnthropicProvider {
             }
         };
         let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-
         if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
             return Ok(ProviderResponse {
                 status: status.as_u16(),
                 body: ResponseBody::Complete(self.map_error_response(status, &body_text)),
@@ -612,9 +633,35 @@ impl ProviderAdapter for AnthropicProvider {
         }
 
         if req.stream {
-            let lines = self.map_stream_lines(&req, &body_text);
+            let (tx, rx) = mpsc::channel::<String>(64);
+            let stream_req = req.clone();
+            tokio::spawn(async move {
+                let mut upstream = response.bytes_stream();
+                let mut buffer = String::new();
+                let mut state = AnthropicStreamState::default();
+                while let Some(chunk_result) = upstream.next().await {
+                    let chunk = match chunk_result {
+                        Ok(bytes) => bytes,
+                        Err(_) => break,
+                    };
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    for raw_event in drain_sse_events(&mut buffer) {
+                        let event = parse_sse_event(&raw_event);
+                        let mapped =
+                            AnthropicProvider::map_stream_event(&stream_req, &mut state, &event);
+                        for line in mapped {
+                            if tx.send(line).await.is_err() {
+                                return;
+                            }
+                        }
+                        if state.done_sent {
+                            return;
+                        }
+                    }
+                }
+            });
             let mut streams = self.lock_streams()?;
-            streams.insert(req.id.clone(), lines);
+            streams.insert(req.id.clone(), rx);
             return Ok(ProviderResponse {
                 status: status.as_u16(),
                 body: ResponseBody::Stream(StreamDescriptor {
@@ -625,6 +672,7 @@ impl ProviderAdapter for AnthropicProvider {
             });
         }
 
+        let body_text = response.text().await.unwrap_or_default();
         let parsed: Value = serde_json::from_str(&body_text).unwrap_or_else(|_| json!({}));
         Ok(ProviderResponse {
             status: status.as_u16(),
@@ -644,9 +692,18 @@ impl ProviderAdapter for AnthropicProvider {
         model.starts_with("claude")
     }
 
-    fn stream_response_lines(&self, req: &NormalizedRequest) -> Option<Vec<String>> {
+    fn take_stream_receiver(&self, req: &NormalizedRequest) -> Option<mpsc::Receiver<String>> {
         let mut streams = self.lock_streams().ok()?;
         streams.remove(&req.id)
+    }
+
+    fn stream_response_lines(&self, req: &NormalizedRequest) -> Option<Vec<String>> {
+        let mut receiver = self.take_stream_receiver(req)?;
+        let mut lines = Vec::new();
+        while let Ok(line) = receiver.try_recv() {
+            lines.push(line);
+        }
+        Some(lines)
     }
 }
 
@@ -677,9 +734,8 @@ impl ProviderAdapter for OpenAiProvider {
             }
         };
         let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-
         if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
             return Ok(ProviderResponse {
                 status: status.as_u16(),
                 body: ResponseBody::Complete(self.map_error_response(status, &body_text)),
@@ -688,9 +744,33 @@ impl ProviderAdapter for OpenAiProvider {
         }
 
         if req.stream {
-            let lines = self.normalize_sse_lines(&body_text);
+            let (tx, rx) = mpsc::channel::<String>(64);
+            tokio::spawn(async move {
+                let mut upstream = response.bytes_stream();
+                let mut buffer = String::new();
+                while let Some(chunk_result) = upstream.next().await {
+                    let chunk = match chunk_result {
+                        Ok(bytes) => bytes,
+                        Err(_) => break,
+                    };
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    for raw_event in drain_sse_events(&mut buffer) {
+                        let line = format!("{}\n\n", raw_event.trim());
+                        if tx.send(line.clone()).await.is_err() {
+                            return;
+                        }
+                        if raw_event.trim().eq_ignore_ascii_case("data: [done]") {
+                            return;
+                        }
+                    }
+                }
+                let remaining = buffer.trim();
+                if !remaining.is_empty() {
+                    let _ = tx.send(format!("{remaining}\n\n")).await;
+                }
+            });
             let mut streams = self.lock_streams()?;
-            streams.insert(req.id.clone(), lines);
+            streams.insert(req.id.clone(), rx);
             return Ok(ProviderResponse {
                 status: status.as_u16(),
                 body: ResponseBody::Stream(StreamDescriptor {
@@ -701,6 +781,7 @@ impl ProviderAdapter for OpenAiProvider {
             });
         }
 
+        let body_text = response.text().await.unwrap_or_default();
         let parsed = serde_json::from_str::<Value>(&body_text).unwrap_or_else(|_| json!({}));
         Ok(ProviderResponse {
             status: status.as_u16(),
@@ -723,9 +804,18 @@ impl ProviderAdapter for OpenAiProvider {
             || model.starts_with("omni")
     }
 
-    fn stream_response_lines(&self, req: &NormalizedRequest) -> Option<Vec<String>> {
+    fn take_stream_receiver(&self, req: &NormalizedRequest) -> Option<mpsc::Receiver<String>> {
         let mut streams = self.lock_streams().ok()?;
         streams.remove(&req.id)
+    }
+
+    fn stream_response_lines(&self, req: &NormalizedRequest) -> Option<Vec<String>> {
+        let mut receiver = self.take_stream_receiver(req)?;
+        let mut lines = Vec::new();
+        while let Ok(line) = receiver.try_recv() {
+            lines.push(line);
+        }
+        Some(lines)
     }
 }
 
@@ -735,11 +825,18 @@ struct SseEvent {
     data: String,
 }
 
-fn split_sse_blocks(raw_body: &str) -> Vec<&str> {
-    raw_body
-        .split("\n\n")
-        .filter(|chunk| !chunk.trim().is_empty())
-        .collect()
+fn drain_sse_events(buffer: &mut String) -> Vec<String> {
+    let mut events = Vec::new();
+    while let Some(idx) = buffer.find("\n\n") {
+        let raw = buffer[..idx].to_string();
+        let rest = buffer[idx + 2..].to_string();
+        *buffer = rest;
+        if raw.trim().is_empty() {
+            continue;
+        }
+        events.push(raw);
+    }
+    events
 }
 
 fn parse_sse_event(raw_event: &str) -> SseEvent {
@@ -758,18 +855,13 @@ fn parse_sse_event(raw_event: &str) -> SseEvent {
     event
 }
 
-fn build_openai_sse_lines(req: &NormalizedRequest, state: &AnthropicStreamState) -> Vec<String> {
+fn build_openai_role_chunk(req: &NormalizedRequest, state: &AnthropicStreamState) -> String {
     let message_id = state.message_id.as_deref().unwrap_or(&req.id).to_string();
     let model = state
         .model
         .as_deref()
         .unwrap_or(&req.model_resolved)
         .to_string();
-    let finish_reason = map_finish_reason(state.finish_reason.as_deref().unwrap_or("end_turn"));
-    let prompt_tokens = state.input_tokens.unwrap_or(0);
-    let completion_tokens = state.output_tokens.unwrap_or(0);
-
-    let mut lines = Vec::with_capacity(state.deltas.len() + 3);
     let first_chunk = json!({
         "id": message_id,
         "object": "chat.completion.chunk",
@@ -781,23 +873,44 @@ fn build_openai_sse_lines(req: &NormalizedRequest, state: &AnthropicStreamState)
             "finish_reason": Value::Null,
         }],
     });
-    lines.push(format!("data: {first_chunk}\n\n"));
+    format!("data: {first_chunk}\n\n")
+}
 
-    for delta in &state.deltas {
-        let chunk = json!({
-            "id": message_id,
-            "object": "chat.completion.chunk",
-            "created": req.timestamp.timestamp(),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {"content": delta},
-                "finish_reason": Value::Null,
-            }],
-        });
-        lines.push(format!("data: {chunk}\n\n"));
-    }
+fn build_openai_delta_chunk(
+    req: &NormalizedRequest,
+    state: &AnthropicStreamState,
+    delta: &str,
+) -> String {
+    let message_id = state.message_id.as_deref().unwrap_or(&req.id).to_string();
+    let model = state
+        .model
+        .as_deref()
+        .unwrap_or(&req.model_resolved)
+        .to_string();
+    let chunk = json!({
+        "id": message_id,
+        "object": "chat.completion.chunk",
+        "created": req.timestamp.timestamp(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"content": delta},
+            "finish_reason": Value::Null,
+        }],
+    });
+    format!("data: {chunk}\n\n")
+}
 
+fn build_openai_final_chunk(req: &NormalizedRequest, state: &AnthropicStreamState) -> String {
+    let message_id = state.message_id.as_deref().unwrap_or(&req.id).to_string();
+    let model = state
+        .model
+        .as_deref()
+        .unwrap_or(&req.model_resolved)
+        .to_string();
+    let finish_reason = map_finish_reason(state.finish_reason.as_deref().unwrap_or("end_turn"));
+    let prompt_tokens = state.input_tokens.unwrap_or(0);
+    let completion_tokens = state.output_tokens.unwrap_or(0);
     let final_chunk = json!({
         "id": message_id,
         "object": "chat.completion.chunk",
@@ -814,9 +927,7 @@ fn build_openai_sse_lines(req: &NormalizedRequest, state: &AnthropicStreamState)
             "total_tokens": prompt_tokens + completion_tokens,
         }
     });
-    lines.push(format!("data: {final_chunk}\n\n"));
-    lines.push("data: [DONE]\n\n".to_string());
-    lines
+    format!("data: {final_chunk}\n\n")
 }
 
 fn extract_message_text(content: &Value) -> Option<String> {
@@ -996,6 +1107,18 @@ mod tests {
         (format!("http://{addr}"), rx)
     }
 
+    async fn collect_stream_lines(mut receiver: mpsc::Receiver<String>) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Some(line) = receiver.recv().await {
+            let is_done = line.trim().eq_ignore_ascii_case("data: [done]");
+            lines.push(line);
+            if is_done {
+                break;
+            }
+        }
+        lines
+    }
+
     #[tokio::test]
     async fn anthropic_non_stream_is_mapped_to_openai_shape() {
         let (base_url, request_rx) = spawn_single_response_server(
@@ -1066,9 +1189,10 @@ mod tests {
             }
             other => panic!("expected stream response, got {other:?}"),
         }
-        let lines = provider
-            .stream_response_lines(&req)
-            .expect("stream lines should exist");
+        let receiver = provider
+            .take_stream_receiver(&req)
+            .expect("stream receiver should exist");
+        let lines = collect_stream_lines(receiver).await;
         assert!(lines.iter().any(|line| line.contains("\"Hello\"")));
         assert!(lines.iter().any(|line| line.contains("\"usage\"")));
         assert_eq!(lines.last(), Some(&"data: [DONE]\n\n".to_string()));
@@ -1209,9 +1333,10 @@ mod tests {
             other => panic!("expected stream response, got {other:?}"),
         }
 
-        let lines = provider
-            .stream_response_lines(&req)
-            .expect("stream lines should exist");
+        let receiver = provider
+            .take_stream_receiver(&req)
+            .expect("stream receiver should exist");
+        let lines = collect_stream_lines(receiver).await;
         assert!(lines.iter().any(|line| line.contains("\"usage\"")));
         assert!(lines
             .iter()
@@ -1239,9 +1364,10 @@ mod tests {
 
         let response = provider.send(req.clone()).await.expect("stream response");
         assert!(matches!(response.body, ResponseBody::Stream(_)));
-        let lines = provider
-            .stream_response_lines(&req)
-            .expect("stream lines should exist");
+        let receiver = provider
+            .take_stream_receiver(&req)
+            .expect("stream receiver should exist");
+        let lines = collect_stream_lines(receiver).await;
         assert!(!lines.iter().any(|line| line.contains("\"usage\"")));
         assert_eq!(lines.last(), Some(&"data: [DONE]\n\n".to_string()));
     }

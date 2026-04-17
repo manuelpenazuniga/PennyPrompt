@@ -1,6 +1,7 @@
 //! Proxy plane implementation for PennyPrompt.
 
 use std::{
+    convert::Infallible,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -15,6 +16,7 @@ use axum::{
     routing::{get, post},
     Extension, Router,
 };
+use bytes::Bytes;
 use chrono::Utc;
 use penny_budget::BudgetEvaluator;
 use penny_config::{
@@ -36,7 +38,9 @@ use serde_json::{json, Value};
 use sqlx::{query, query_scalar};
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
 use uuid::Uuid;
 
@@ -314,50 +318,32 @@ async fn post_chat_completions(
             (status, Json(value)).into_response()
         }
         ResponseBody::Stream(_) => {
-            if let Some(lines) = state.provider.stream_response_lines(&normalized) {
-                let usage = provider_usage_from_sse_lines(&lines)
-                    .unwrap_or_else(|| estimated_usage_from_request(&normalized));
-                let usage_cost_usd = compute_usage_cost_or_fallback(
-                    &state,
-                    &normalized,
-                    &usage,
-                    enforcement.as_ref(),
+            if let Some(receiver) = state.provider.take_stream_receiver(&normalized) {
+                stream_passthrough_response(
+                    status,
+                    state.clone(),
+                    normalized.clone(),
+                    enforcement,
+                    receiver,
                 )
-                .await;
-                if let Some(context) = enforcement {
-                    if let Err(message) = reconcile_after_dispatch(
-                        &state,
-                        &normalized.id,
-                        usage_cost_usd,
-                        context.reserve_persisted,
-                    )
-                    .await
-                    {
-                        return internal_error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "ledger_reconcile_failed",
-                            "failed to reconcile request accounting".to_string(),
-                            message,
-                        );
+                .await
+            } else if let Some(lines) = state.provider.stream_response_lines(&normalized) {
+                let (tx, rx) = mpsc::channel::<String>(lines.len().max(1));
+                tokio::spawn(async move {
+                    for line in lines {
+                        if tx.send(line).await.is_err() {
+                            return;
+                        }
                     }
-                }
-                if let Err(message) =
-                    persist_request_and_usage(&state, &normalized, &usage, usage_cost_usd).await
-                {
-                    return internal_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "persistence_failed",
-                        "failed to persist request metadata".to_string(),
-                        message,
-                    );
-                }
-
-                let mut response = (status, lines.concat()).into_response();
-                response.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/event-stream; charset=utf-8"),
-                );
-                response
+                });
+                stream_passthrough_response(
+                    status,
+                    state.clone(),
+                    normalized.clone(),
+                    enforcement,
+                    rx,
+                )
+                .await
             } else {
                 if let Some(context) = enforcement {
                     maybe_release_on_dispatch_failure(
@@ -891,6 +877,81 @@ async fn persist_request_and_usage(
     Ok(())
 }
 
+async fn stream_passthrough_response(
+    status: StatusCode,
+    state: Arc<ProxyState>,
+    normalized: NormalizedRequest,
+    enforcement: Option<BudgetEnforcementContext>,
+    mut upstream: mpsc::Receiver<String>,
+) -> Response {
+    let (client_tx, client_rx) = mpsc::channel::<Result<Bytes, Infallible>>(64);
+    tokio::spawn(async move {
+        let mut lines = Vec::new();
+        let mut saw_done = false;
+        while let Some(line) = upstream.recv().await {
+            if line.trim().eq_ignore_ascii_case("data: [done]") {
+                saw_done = true;
+            }
+            lines.push(line.clone());
+            if client_tx.send(Ok(Bytes::from(line))).await.is_err() {
+                break;
+            }
+            if saw_done {
+                break;
+            }
+        }
+
+        let mut usage = provider_usage_from_sse_lines(&lines)
+            .unwrap_or_else(|| estimated_usage_from_request(&normalized));
+        if !saw_done {
+            mark_stream_incomplete(&mut usage);
+        }
+
+        let usage_cost_usd =
+            compute_usage_cost_or_fallback(&state, &normalized, &usage, enforcement.as_ref()).await;
+        if let Some(context) = enforcement {
+            if let Err(message) = reconcile_after_dispatch(
+                &state,
+                &normalized.id,
+                usage_cost_usd,
+                context.reserve_persisted,
+            )
+            .await
+            {
+                log_internal_error("ledger_reconcile_failed", message);
+            }
+        }
+        if let Err(message) =
+            persist_request_and_usage(&state, &normalized, &usage, usage_cost_usd).await
+        {
+            log_internal_error("persistence_failed", message);
+        }
+    });
+
+    let mut response = Response::builder()
+        .status(status)
+        .body(axum::body::Body::from_stream(ReceiverStream::new(
+            client_rx,
+        )))
+        .unwrap_or_else(|_| Response::new(axum::body::Body::empty()));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    response
+}
+
+fn mark_stream_incomplete(usage: &mut NormalizedUsage) {
+    let mut snapshot = usage
+        .pricing_snapshot
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    snapshot.insert("stream_incomplete".to_string(), Value::Bool(true));
+    snapshot.insert("stream_completed".to_string(), Value::Bool(false));
+    usage.pricing_snapshot = Value::Object(snapshot);
+}
+
 fn detect_git_root_from(headers: &HeaderMap) -> Option<PathBuf> {
     let start_path = header_value(headers, CWD_OVERRIDE_HEADER)
         .map(PathBuf::from)
@@ -1005,6 +1066,7 @@ fn log_internal_error(tag: &str, detail: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use axum::{
         body::{to_bytes, Body},
         http::Request,
@@ -1013,11 +1075,17 @@ mod tests {
     use penny_config::{load_config, LoadOptions};
     use penny_cost::import_pricebook_files;
     use penny_store::BudgetRepo;
-    use penny_types::{Budget, Money, RouteDecision, ScopeType, WindowType};
+    use penny_types::{
+        Budget, Money, ProviderResponse, RouteDecision, ScopeType, StreamDescriptor, WindowType,
+    };
     use sqlx::Row;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+    use tokio::sync::mpsc;
+    use tokio::time::{sleep, Duration};
     use tower::ServiceExt;
 
     fn app() -> Router {
@@ -1029,6 +1097,81 @@ mod tests {
             .await
             .expect("create in-memory store");
         let state = ProxyState::mock_default().with_store(store.clone());
+        (build_router(state), store)
+    }
+
+    #[derive(Debug, Default)]
+    struct IncompleteStreamProvider {
+        pending: Mutex<HashMap<String, mpsc::Receiver<String>>>,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for IncompleteStreamProvider {
+        async fn send(&self, req: NormalizedRequest) -> Result<ProviderResponse, ProviderError> {
+            if !req.stream {
+                return Ok(ProviderResponse {
+                    status: 200,
+                    body: ResponseBody::Complete(json!({
+                        "id": format!("chatcmpl_{}", req.id),
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "non-stream"},
+                            "finish_reason": "stop"
+                        }]
+                    })),
+                    upstream_ms: 0,
+                });
+            }
+
+            let (tx, rx) = mpsc::channel(8);
+            let req_id = req.id.clone();
+            tokio::spawn(async move {
+                let lines = vec![
+                    "data: {\"id\":\"chatcmpl_incomplete\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n".to_string(),
+                    "data: {\"id\":\"chatcmpl_incomplete\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n".to_string(),
+                ];
+                for line in lines {
+                    if tx.send(line).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            self.pending
+                .lock()
+                .expect("pending lock")
+                .insert(req_id, rx);
+
+            Ok(ProviderResponse {
+                status: 200,
+                body: ResponseBody::Stream(StreamDescriptor {
+                    provider: "incomplete".to_string(),
+                    format: "sse".to_string(),
+                }),
+                upstream_ms: 1,
+            })
+        }
+
+        fn provider_id(&self) -> &str {
+            "incomplete"
+        }
+
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+
+        fn take_stream_receiver(&self, req: &NormalizedRequest) -> Option<mpsc::Receiver<String>> {
+            self.pending.lock().ok()?.remove(&req.id)
+        }
+    }
+
+    async fn app_with_incomplete_stream_provider() -> (Router, SqliteStore) {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        let provider: Arc<dyn ProviderAdapter> = Arc::new(IncompleteStreamProvider::default());
+        let state = ProxyState::with_provider(provider, vec!["gpt-4.1".to_string()])
+            .with_store(store.clone());
         (build_router(state), store)
     }
 
@@ -1472,6 +1615,57 @@ action_on_soft = "warn"
         let text = String::from_utf8(body.to_vec()).expect("utf8 body");
         assert!(text.contains("data: [DONE]"));
         assert!(text.contains("\"usage\""));
+    }
+
+    #[tokio::test]
+    async fn interrupted_streams_are_marked_incomplete_and_accounted() {
+        let (app, store) = app_with_incomplete_stream_provider().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "gpt-4.1",
+                    "messages": [{"role":"user","content":"interrupt me"}],
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(text.contains("\"partial\""));
+        assert!(!text.contains("data: [DONE]"));
+
+        sleep(Duration::from_millis(50)).await;
+        let row = sqlx::query(
+            "SELECT source, pricing_snapshot, input_tokens, output_tokens FROM request_usage WHERE request_id = ?1",
+        )
+        .bind(&request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("usage row");
+
+        assert_eq!(row.get::<String, _>("source"), "estimated");
+        let pricing_snapshot: String = row.get("pricing_snapshot");
+        let pricing_json: Value =
+            serde_json::from_str(&pricing_snapshot).expect("pricing snapshot json");
+        assert_eq!(pricing_json["stream_incomplete"], true);
+        assert_eq!(pricing_json["stream_completed"], false);
+        assert!(row.get::<i64, _>("input_tokens") > 0);
+        assert!(row.get::<i64, _>("output_tokens") > 0);
     }
 
     #[test]
