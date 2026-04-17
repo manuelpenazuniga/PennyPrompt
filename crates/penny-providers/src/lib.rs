@@ -29,6 +29,111 @@ pub trait ProviderAdapter: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+pub struct OpenAiProviderConfig {
+    pub provider_id: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub supported_models: Vec<String>,
+    pub timeout_ms: u64,
+}
+
+impl Default for OpenAiProviderConfig {
+    fn default() -> Self {
+        Self {
+            provider_id: "openai".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            api_key: String::new(),
+            supported_models: vec!["gpt-4.1".to_string()],
+            timeout_ms: 60_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAiProvider {
+    config: OpenAiProviderConfig,
+    client: Client,
+    pending_streams: ArcStreamCache,
+}
+
+impl OpenAiProvider {
+    pub fn new(config: OpenAiProviderConfig) -> Result<Self, String> {
+        let timeout = std::time::Duration::from_millis(config.timeout_ms.max(1));
+        let client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|err| err.to_string())?;
+        Ok(Self {
+            config,
+            client,
+            pending_streams: std::sync::Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    fn endpoint_url(&self) -> String {
+        format!(
+            "{}/v1/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        )
+    }
+
+    fn openai_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header("authorization", format!("Bearer {}", self.config.api_key))
+            .header(CONTENT_TYPE, "application/json")
+    }
+
+    fn build_payload(&self, req: &NormalizedRequest) -> Value {
+        json!({
+            "model": req.model_resolved,
+            "messages": req.messages,
+            "stream": req.stream,
+        })
+    }
+
+    fn map_error_response(&self, status: StatusCode, body: &str) -> Value {
+        match serde_json::from_str::<Value>(body) {
+            Ok(parsed) if parsed.get("error").is_some() => parsed,
+            _ => json!({
+                "error": {
+                    "message": if body.trim().is_empty() {
+                        format!("upstream request failed with status {}", status.as_u16())
+                    } else {
+                        body.trim().to_string()
+                    },
+                    "type": "provider_error",
+                    "code": status.as_u16(),
+                }
+            }),
+        }
+    }
+
+    fn normalize_sse_lines(&self, raw_body: &str) -> Vec<String> {
+        let mut lines = raw_body
+            .split("\n\n")
+            .filter_map(|segment| {
+                let trimmed = segment.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                Some(format!("{trimmed}\n\n"))
+            })
+            .collect::<Vec<_>>();
+
+        if lines.is_empty() && !raw_body.trim().is_empty() {
+            lines.push(format!("{}\n\n", raw_body.trim()));
+        }
+        lines
+    }
+
+    fn lock_streams(&self) -> Result<MutexGuard<'_, HashMap<String, Vec<String>>>, ProviderError> {
+        self.pending_streams
+            .lock()
+            .map_err(|err| ProviderError::InternalState(err.to_string()))
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AnthropicProviderConfig {
     pub provider_id: String,
     pub base_url: String,
@@ -545,6 +650,85 @@ impl ProviderAdapter for AnthropicProvider {
     }
 }
 
+#[async_trait]
+impl ProviderAdapter for OpenAiProvider {
+    async fn send(&self, req: NormalizedRequest) -> Result<ProviderResponse, ProviderError> {
+        if !self.supports_model(&req.model_resolved) && !self.supports_model(&req.model_requested) {
+            return Err(ProviderError::UnsupportedModel(req.model_requested));
+        }
+
+        let payload = self.build_payload(&req);
+        let request = self.client.post(self.endpoint_url()).json(&payload);
+        let request = self.openai_headers(request);
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(ProviderResponse {
+                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                    body: ResponseBody::Complete(json!({
+                        "error": {
+                            "message": error.to_string(),
+                            "type": "upstream_unavailable",
+                            "code": StatusCode::BAD_GATEWAY.as_u16(),
+                        }
+                    })),
+                    upstream_ms: 0,
+                });
+            }
+        };
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            return Ok(ProviderResponse {
+                status: status.as_u16(),
+                body: ResponseBody::Complete(self.map_error_response(status, &body_text)),
+                upstream_ms: 0,
+            });
+        }
+
+        if req.stream {
+            let lines = self.normalize_sse_lines(&body_text);
+            let mut streams = self.lock_streams()?;
+            streams.insert(req.id.clone(), lines);
+            return Ok(ProviderResponse {
+                status: status.as_u16(),
+                body: ResponseBody::Stream(StreamDescriptor {
+                    provider: self.provider_id().to_string(),
+                    format: "sse".to_string(),
+                }),
+                upstream_ms: 0,
+            });
+        }
+
+        let parsed = serde_json::from_str::<Value>(&body_text).unwrap_or_else(|_| json!({}));
+        Ok(ProviderResponse {
+            status: status.as_u16(),
+            body: ResponseBody::Complete(parsed),
+            upstream_ms: 0,
+        })
+    }
+
+    fn provider_id(&self) -> &str {
+        &self.config.provider_id
+    }
+
+    fn supports_model(&self, model: &str) -> bool {
+        if self.config.supported_models.iter().any(|m| m == model) {
+            return true;
+        }
+        model.starts_with("gpt-")
+            || model.starts_with("o1")
+            || model.starts_with("o3")
+            || model.starts_with("omni")
+    }
+
+    fn stream_response_lines(&self, req: &NormalizedRequest) -> Option<Vec<String>> {
+        let mut streams = self.lock_streams().ok()?;
+        streams.remove(&req.id)
+    }
+}
+
 #[derive(Debug, Default)]
 struct SseEvent {
     name: Option<String>,
@@ -936,5 +1120,181 @@ mod tests {
 
         let error = provider.send(req).await.expect_err("unsupported model");
         assert!(matches!(error, ProviderError::UnsupportedModel(model) if model == "gpt-4.1"));
+    }
+
+    fn openai_provider(base_url: String) -> OpenAiProvider {
+        OpenAiProvider::new(OpenAiProviderConfig {
+            base_url,
+            api_key: "test-openai-key".to_string(),
+            supported_models: vec!["gpt-4.1".to_string()],
+            ..OpenAiProviderConfig::default()
+        })
+        .expect("provider should build")
+    }
+
+    #[tokio::test]
+    async fn openai_non_stream_forwards_payload_and_auth_header() {
+        let (base_url, request_rx) = spawn_single_response_server(
+            200,
+            "application/json",
+            json!({
+                "id": "chatcmpl_abc",
+                "object": "chat.completion",
+                "created": 1_712_345_678_i64,
+                "model": "gpt-4.1",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hello from OpenAI"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let provider = openai_provider(base_url);
+        let mut req = request(false);
+        req.provider_id = "openai".to_string();
+        req.model_requested = "gpt-4.1".to_string();
+        req.model_resolved = "gpt-4.1".to_string();
+        req.messages = json!([{ "role": "user", "content": "ping" }]);
+
+        let response = provider.send(req).await.expect("response");
+        assert_eq!(response.status, 200);
+        let request_raw = request_rx.await.expect("captured request").to_lowercase();
+        assert!(request_raw.starts_with("post /v1/chat/completions"));
+        assert!(request_raw.contains("authorization: bearer test-openai-key"));
+        assert!(request_raw.contains("\"model\":\"gpt-4.1\""));
+        assert!(request_raw.contains("\"stream\":false"));
+        assert!(request_raw.contains("\"role\":\"user\""));
+
+        match response.body {
+            ResponseBody::Complete(payload) => {
+                assert_eq!(
+                    payload["choices"][0]["message"]["content"],
+                    "Hello from OpenAI"
+                );
+                assert_eq!(payload["usage"]["prompt_tokens"], 7);
+                assert_eq!(payload["usage"]["completion_tokens"], 5);
+            }
+            other => panic!("expected complete response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_stream_preserves_usage_when_present() {
+        let sse = [
+            "data: {\"id\":\"chatcmpl_stream\",\"object\":\"chat.completion.chunk\",\"created\":1712345678,\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_stream\",\"object\":\"chat.completion.chunk\",\"created\":1712345678,\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_stream\",\"object\":\"chat.completion.chunk\",\"created\":1712345678,\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        ]
+        .concat();
+        let (base_url, _) = spawn_single_response_server(200, "text/event-stream", sse).await;
+
+        let provider = openai_provider(base_url);
+        let mut req = request(true);
+        req.id = "req_openai_stream_usage".to_string();
+        req.provider_id = "openai".to_string();
+        req.model_requested = "gpt-4.1".to_string();
+        req.model_resolved = "gpt-4.1".to_string();
+
+        let response = provider.send(req.clone()).await.expect("stream response");
+        match response.body {
+            ResponseBody::Stream(descriptor) => {
+                assert_eq!(descriptor.provider, "openai");
+                assert_eq!(descriptor.format, "sse");
+            }
+            other => panic!("expected stream response, got {other:?}"),
+        }
+
+        let lines = provider
+            .stream_response_lines(&req)
+            .expect("stream lines should exist");
+        assert!(lines.iter().any(|line| line.contains("\"usage\"")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("\"content\":\"hello\"")));
+        assert_eq!(lines.last(), Some(&"data: [DONE]\n\n".to_string()));
+    }
+
+    #[tokio::test]
+    async fn openai_stream_can_arrive_without_usage_for_estimation_fallback() {
+        let sse = [
+            "data: {\"id\":\"chatcmpl_no_usage\",\"object\":\"chat.completion.chunk\",\"created\":1712345678,\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_no_usage\",\"object\":\"chat.completion.chunk\",\"created\":1712345678,\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_no_usage\",\"object\":\"chat.completion.chunk\",\"created\":1712345678,\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ]
+        .concat();
+        let (base_url, _) = spawn_single_response_server(200, "text/event-stream", sse).await;
+
+        let provider = openai_provider(base_url);
+        let mut req = request(true);
+        req.id = "req_openai_stream_no_usage".to_string();
+        req.provider_id = "openai".to_string();
+        req.model_requested = "gpt-4.1".to_string();
+        req.model_resolved = "gpt-4.1".to_string();
+
+        let response = provider.send(req.clone()).await.expect("stream response");
+        assert!(matches!(response.body, ResponseBody::Stream(_)));
+        let lines = provider
+            .stream_response_lines(&req)
+            .expect("stream lines should exist");
+        assert!(!lines.iter().any(|line| line.contains("\"usage\"")));
+        assert_eq!(lines.last(), Some(&"data: [DONE]\n\n".to_string()));
+    }
+
+    #[tokio::test]
+    async fn openai_error_payload_is_mapped() {
+        let (base_url, _) = spawn_single_response_server(
+            401,
+            "application/json",
+            json!({
+                "error": {
+                    "message": "invalid api key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+        let provider = openai_provider(base_url);
+        let mut req = request(false);
+        req.provider_id = "openai".to_string();
+        req.model_requested = "gpt-4.1".to_string();
+        req.model_resolved = "gpt-4.1".to_string();
+
+        let response = provider.send(req).await.expect("response");
+        assert_eq!(response.status, 401);
+        match response.body {
+            ResponseBody::Complete(payload) => {
+                assert_eq!(payload["error"]["type"], "invalid_request_error");
+                assert_eq!(payload["error"]["message"], "invalid api key");
+            }
+            other => panic!("expected mapped error payload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_unsupported_model_returns_error() {
+        let provider = OpenAiProvider::new(OpenAiProviderConfig {
+            api_key: "test-openai-key".to_string(),
+            supported_models: vec!["gpt-4.1".to_string()],
+            ..OpenAiProviderConfig::default()
+        })
+        .expect("provider");
+        let mut req = request(false);
+        req.provider_id = "openai".to_string();
+        req.model_requested = "claude-sonnet-4-6".to_string();
+        req.model_resolved = "claude-sonnet-4-6".to_string();
+
+        let error = provider.send(req).await.expect_err("unsupported model");
+        assert!(
+            matches!(error, ProviderError::UnsupportedModel(model) if model == "claude-sonnet-4-6")
+        );
     }
 }
