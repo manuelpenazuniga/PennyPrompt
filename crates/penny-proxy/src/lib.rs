@@ -37,6 +37,7 @@ use sqlx::{query, query_scalar};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
+use tracing::error;
 use uuid::Uuid;
 
 pub const DEFAULT_PROXY_BIND: &str = "127.0.0.1:8585";
@@ -264,14 +265,9 @@ async fn post_chat_completions(
         ResponseBody::Complete(value) => {
             let usage = provider_usage_from_completion(&value)
                 .unwrap_or_else(|| estimated_usage_from_request(&normalized));
-            let usage_cost_usd = actual_usage_cost_usd(&state, &normalized, &usage)
-                .await
-                .unwrap_or_else(|_| {
-                    enforcement
-                        .as_ref()
-                        .map(|ctx| ctx.estimated_cost_usd)
-                        .unwrap_or(Money::ZERO)
-                });
+            let usage_cost_usd =
+                compute_usage_cost_or_fallback(&state, &normalized, &usage, enforcement.as_ref())
+                    .await;
             if let Some(context) = enforcement {
                 if let Err(message) = reconcile_after_dispatch(
                     &state,
@@ -306,14 +302,13 @@ async fn post_chat_completions(
             if let Some(lines) = state.provider.stream_response_lines(&normalized) {
                 let usage = provider_usage_from_sse_lines(&lines)
                     .unwrap_or_else(|| estimated_usage_from_request(&normalized));
-                let usage_cost_usd = actual_usage_cost_usd(&state, &normalized, &usage)
-                    .await
-                    .unwrap_or_else(|_| {
-                        enforcement
-                            .as_ref()
-                            .map(|ctx| ctx.estimated_cost_usd)
-                            .unwrap_or(Money::ZERO)
-                    });
+                let usage_cost_usd = compute_usage_cost_or_fallback(
+                    &state,
+                    &normalized,
+                    &usage,
+                    enforcement.as_ref(),
+                )
+                .await;
                 if let Some(context) = enforcement {
                     if let Err(message) = reconcile_after_dispatch(
                         &state,
@@ -598,8 +593,8 @@ pub async fn seed_budgets_from_runtime_config(
     config: &RuntimeConfig,
 ) -> Result<Vec<Budget>, String> {
     let mut seeded = Vec::with_capacity(config.budgets.len());
-    for budget in &config.budgets {
-        let mapped = map_config_budget(budget);
+    for (idx, budget) in config.budgets.iter().enumerate() {
+        let mapped = map_config_budget(budget, idx)?;
         let stored = BudgetRepo::upsert(store, &mapped)
             .await
             .map_err(|err| err.to_string())?;
@@ -608,22 +603,29 @@ pub async fn seed_budgets_from_runtime_config(
     Ok(seeded)
 }
 
-fn map_config_budget(budget: &RuntimeBudgetConfig) -> Budget {
-    Budget {
+fn map_config_budget(budget: &RuntimeBudgetConfig, index: usize) -> Result<Budget, String> {
+    let hard_limit_usd = budget
+        .hard_limit_usd
+        .map(Money::from_usd)
+        .transpose()
+        .map_err(|err| format!("budgets[{index}].hard_limit_usd: {err}"))?;
+    let soft_limit_usd = budget
+        .soft_limit_usd
+        .map(Money::from_usd)
+        .transpose()
+        .map_err(|err| format!("budgets[{index}].soft_limit_usd: {err}"))?;
+
+    Ok(Budget {
         id: 0,
         scope_type: scope_type_from_config(&budget.scope_type),
         scope_id: budget.scope_id.clone(),
         window_type: window_type_from_config(&budget.window_type),
-        hard_limit_usd: budget
-            .hard_limit_usd
-            .and_then(|value| Money::from_usd(value).ok()),
-        soft_limit_usd: budget
-            .soft_limit_usd
-            .and_then(|value| Money::from_usd(value).ok()),
+        hard_limit_usd,
+        soft_limit_usd,
         action_on_hard: budget.action_on_hard.clone(),
         action_on_soft: budget.action_on_soft.clone(),
         preset_source: budget.preset_source.clone(),
-    }
+    })
 }
 
 fn scope_type_from_config(scope: &ConfigScopeType) -> ScopeType {
@@ -766,6 +768,21 @@ async fn actual_usage_cost_usd(
         )
         .await
         .map_err(|err| err.to_string())
+}
+
+async fn compute_usage_cost_or_fallback(
+    state: &ProxyState,
+    request: &NormalizedRequest,
+    usage: &NormalizedUsage,
+    enforcement: Option<&BudgetEnforcementContext>,
+) -> Money {
+    actual_usage_cost_usd(state, request, usage)
+        .await
+        .unwrap_or_else(|_| {
+            enforcement
+                .map(|ctx| ctx.estimated_cost_usd)
+                .unwrap_or(Money::ZERO)
+        })
 }
 
 async fn has_reserve_entry(store: &SqliteStore, request_id: &str) -> Result<bool, String> {
@@ -967,7 +984,7 @@ fn budget_error_response(
 }
 
 fn log_internal_error(tag: &str, detail: String) {
-    eprintln!("[{tag}] {detail}");
+    error!(tag = tag, detail = %detail, "internal proxy error");
 }
 
 #[cfg(test)]

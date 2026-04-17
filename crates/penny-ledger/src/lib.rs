@@ -410,11 +410,18 @@ async fn request_entry_ids_by_type(
     request_id: &str,
     entry_type: &'static str,
 ) -> Result<Vec<i64>, sqlx::Error> {
-    Ok(request_entries_by_type(tx, request_id, entry_type)
-        .await?
-        .into_iter()
-        .map(|row| row.id)
-        .collect())
+    query_scalar(
+        r#"
+        SELECT id
+        FROM cost_ledger
+        WHERE request_id = ?1 AND entry_type = ?2
+        ORDER BY id
+        "#,
+    )
+    .bind(request_id)
+    .bind(entry_type)
+    .fetch_all(&mut **tx)
+    .await
 }
 
 async fn has_request_entries_of_type(
@@ -422,9 +429,19 @@ async fn has_request_entries_of_type(
     request_id: &str,
     entry_type: &'static str,
 ) -> Result<bool, sqlx::Error> {
-    Ok(!request_entry_ids_by_type(tx, request_id, entry_type)
-        .await?
-        .is_empty())
+    let exists: Option<i64> = query_scalar(
+        r#"
+        SELECT 1
+        FROM cost_ledger
+        WHERE request_id = ?1 AND entry_type = ?2
+        LIMIT 1
+        "#,
+    )
+    .bind(request_id)
+    .bind(entry_type)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(exists.is_some())
 }
 
 #[cfg(test)]

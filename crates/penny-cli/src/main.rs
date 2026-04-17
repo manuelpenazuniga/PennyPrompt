@@ -90,7 +90,16 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     .as_deref()
                     .map(parse_since_duration)
                     .transpose()?
-                    .map(|duration| Utc::now() - chrono::Duration::from_std(duration).unwrap());
+                    .map(|duration| {
+                        chrono::Duration::from_std(duration)
+                            .map(|chrono_duration| Utc::now() - chrono_duration)
+                            .map_err(|_| {
+                                CliError::InvalidSince(
+                                    since.clone().unwrap_or_else(|| "unknown".to_string()),
+                                )
+                            })
+                    })
+                    .transpose()?;
                 let rows = fetch_summary_rows(&store, by, cutoff).await?;
                 print_summary_table(by, since.as_deref(), &rows);
             }
@@ -146,13 +155,19 @@ fn parse_since_duration(raw: &str) -> Result<Duration, CliError> {
         .parse()
         .map_err(|_| CliError::InvalidSince(raw.to_string()))?;
 
-    let duration = match unit {
-        'm' => Duration::from_secs(amount * 60),
-        'h' => Duration::from_secs(amount * 60 * 60),
-        'd' => Duration::from_secs(amount * 60 * 60 * 24),
+    const SECONDS_PER_MINUTE: u64 = 60;
+    const SECONDS_PER_HOUR: u64 = 60 * 60;
+    const SECONDS_PER_DAY: u64 = 60 * 60 * 24;
+
+    let seconds = match unit {
+        'm' => amount.checked_mul(SECONDS_PER_MINUTE),
+        'h' => amount.checked_mul(SECONDS_PER_HOUR),
+        'd' => amount.checked_mul(SECONDS_PER_DAY),
         _ => return Err(CliError::InvalidSince(raw.to_string())),
-    };
-    Ok(duration)
+    }
+    .ok_or_else(|| CliError::InvalidSince(raw.to_string()))?;
+
+    Ok(Duration::from_secs(seconds))
 }
 
 async fn fetch_summary_rows(
@@ -161,66 +176,37 @@ async fn fetch_summary_rows(
     since: Option<DateTime<Utc>>,
 ) -> Result<Vec<SummaryRow>, CliError> {
     let since_text = since.map(|ts| ts.to_rfc3339());
-    let rows = match by {
-        SummaryBy::Project => query(
-            r#"
-                SELECT
-                    COALESCE(projects.name, requests.project_id) AS group_key,
-                    COUNT(requests.id) AS request_count,
-                    COALESCE(SUM(request_usage.input_tokens), 0) AS input_tokens,
-                    COALESCE(SUM(request_usage.output_tokens), 0) AS output_tokens,
-                    COALESCE(SUM(request_usage.cost_usd), 0.0) AS total_cost_usd
-                FROM requests
-                JOIN request_usage ON request_usage.request_id = requests.id
-                LEFT JOIN projects ON projects.id = requests.project_id
-                WHERE (?1 IS NULL OR datetime(requests.started_at) >= datetime(?1))
-                GROUP BY group_key
-                ORDER BY total_cost_usd DESC, group_key ASC
-                "#,
-        )
-        .bind(since_text.clone())
-        .fetch_all(store.pool())
-        .await
-        .map_err(|error| CliError::Store(error.to_string()))?,
-        SummaryBy::Model => query(
-            r#"
+    let (group_key_expr, extra_join) = match by {
+        SummaryBy::Project => (
+            "COALESCE(projects.name, requests.project_id)",
+            "LEFT JOIN projects ON projects.id = requests.project_id",
+        ),
+        SummaryBy::Model => ("requests.model_used", ""),
+        SummaryBy::Session => ("COALESCE(requests.session_id, '(none)')", ""),
+    };
+
+    let sql = format!(
+        r#"
             SELECT
-                requests.model_used AS group_key,
+                {group_key_expr} AS group_key,
                 COUNT(requests.id) AS request_count,
-                COALESCE(SUM(request_usage.input_tokens), 0) AS input_tokens,
-                COALESCE(SUM(request_usage.output_tokens), 0) AS output_tokens,
+                CAST(COALESCE(SUM(request_usage.input_tokens), 0) AS INTEGER) AS input_tokens,
+                CAST(COALESCE(SUM(request_usage.output_tokens), 0) AS INTEGER) AS output_tokens,
                 COALESCE(SUM(request_usage.cost_usd), 0.0) AS total_cost_usd
             FROM requests
             JOIN request_usage ON request_usage.request_id = requests.id
+            {extra_join}
             WHERE (?1 IS NULL OR datetime(requests.started_at) >= datetime(?1))
             GROUP BY group_key
             ORDER BY total_cost_usd DESC, group_key ASC
-            "#,
-        )
-        .bind(since_text.clone())
-        .fetch_all(store.pool())
-        .await
-        .map_err(|error| CliError::Store(error.to_string()))?,
-        SummaryBy::Session => query(
-            r#"
-            SELECT
-                COALESCE(requests.session_id, '(none)') AS group_key,
-                COUNT(requests.id) AS request_count,
-                COALESCE(SUM(request_usage.input_tokens), 0) AS input_tokens,
-                COALESCE(SUM(request_usage.output_tokens), 0) AS output_tokens,
-                COALESCE(SUM(request_usage.cost_usd), 0.0) AS total_cost_usd
-            FROM requests
-            JOIN request_usage ON request_usage.request_id = requests.id
-            WHERE (?1 IS NULL OR datetime(requests.started_at) >= datetime(?1))
-            GROUP BY group_key
-            ORDER BY total_cost_usd DESC, group_key ASC
-            "#,
-        )
+        "#
+    );
+
+    let rows = query(&sql)
         .bind(since_text)
         .fetch_all(store.pool())
         .await
-        .map_err(|error| CliError::Store(error.to_string()))?,
-    };
+        .map_err(|error| CliError::Store(error.to_string()))?;
 
     Ok(rows
         .into_iter()
@@ -292,7 +278,7 @@ fn print_summary_table(by: SummaryBy, since: Option<&str>, rows: &[SummaryRow]) 
 mod tests {
     use chrono::Duration as ChronoDuration;
     use penny_store::{NewRequest, ProjectRepo, RequestRepo, UsageRecord};
-    use penny_types::UsageSource;
+    use penny_types::{Money, UsageSource};
 
     use super::*;
 
@@ -302,29 +288,30 @@ mod tests {
             .expect("create in-memory store")
     }
 
-    async fn insert_request_usage(
-        store: &SqliteStore,
-        request_id: &str,
-        project_seed: &str,
-        model_used: &str,
+    struct RequestUsageFixture<'a> {
+        request_id: &'a str,
+        project_seed: &'a str,
+        model_used: &'a str,
         started_at: DateTime<Utc>,
         input_tokens: u64,
         output_tokens: u64,
         cost_usd: f64,
-    ) {
-        let project_id = ProjectRepo::upsert_by_path(store, project_seed)
+    }
+
+    async fn insert_request_usage(store: &SqliteStore, fixture: RequestUsageFixture<'_>) {
+        let project_id = ProjectRepo::upsert_by_path(store, fixture.project_seed)
             .await
             .expect("upsert project");
         RequestRepo::insert(
             store,
             &NewRequest {
-                id: request_id.to_string(),
+                id: fixture.request_id.to_string(),
                 session_id: None,
                 project_id,
-                model_requested: model_used.to_string(),
-                model_used: model_used.to_string(),
+                model_requested: fixture.model_used.to_string(),
+                model_used: fixture.model_used.to_string(),
                 provider_id: "mock".to_string(),
-                started_at,
+                started_at: fixture.started_at,
                 is_streaming: false,
             },
         )
@@ -333,10 +320,10 @@ mod tests {
         RequestRepo::insert_usage(
             store,
             &UsageRecord {
-                request_id: request_id.to_string(),
-                input_tokens,
-                output_tokens,
-                cost_usd,
+                request_id: fixture.request_id.to_string(),
+                input_tokens: fixture.input_tokens,
+                output_tokens: fixture.output_tokens,
+                cost_usd: Money::from_usd(fixture.cost_usd).expect("money fixture"),
                 source: UsageSource::Provider,
                 pricing_snapshot: serde_json::json!({ "source": "test" }),
             },
@@ -374,35 +361,41 @@ mod tests {
         let now = Utc::now();
         insert_request_usage(
             &store,
-            "req_a1",
-            "/tmp/proj-a",
-            "claude-sonnet-4-6",
-            now,
-            100,
-            50,
-            1.5,
+            RequestUsageFixture {
+                request_id: "req_a1",
+                project_seed: "/tmp/proj-a",
+                model_used: "claude-sonnet-4-6",
+                started_at: now,
+                input_tokens: 100,
+                output_tokens: 50,
+                cost_usd: 1.5,
+            },
         )
         .await;
         insert_request_usage(
             &store,
-            "req_a2",
-            "/tmp/proj-a",
-            "gpt-4.1",
-            now,
-            200,
-            100,
-            2.0,
+            RequestUsageFixture {
+                request_id: "req_a2",
+                project_seed: "/tmp/proj-a",
+                model_used: "gpt-4.1",
+                started_at: now,
+                input_tokens: 200,
+                output_tokens: 100,
+                cost_usd: 2.0,
+            },
         )
         .await;
         insert_request_usage(
             &store,
-            "req_b1",
-            "/tmp/proj-b",
-            "gpt-4.1",
-            now,
-            300,
-            120,
-            3.0,
+            RequestUsageFixture {
+                request_id: "req_b1",
+                project_seed: "/tmp/proj-b",
+                model_used: "gpt-4.1",
+                started_at: now,
+                input_tokens: 300,
+                output_tokens: 120,
+                cost_usd: 3.0,
+            },
         )
         .await;
 
@@ -422,24 +415,28 @@ mod tests {
         let now = Utc::now();
         insert_request_usage(
             &store,
-            "req_old",
-            "/tmp/proj-old",
-            "claude-sonnet-4-6",
-            now - ChronoDuration::days(3),
-            100,
-            50,
-            1.0,
+            RequestUsageFixture {
+                request_id: "req_old",
+                project_seed: "/tmp/proj-old",
+                model_used: "claude-sonnet-4-6",
+                started_at: now - ChronoDuration::days(3),
+                input_tokens: 100,
+                output_tokens: 50,
+                cost_usd: 1.0,
+            },
         )
         .await;
         insert_request_usage(
             &store,
-            "req_new",
-            "/tmp/proj-new",
-            "claude-sonnet-4-6",
-            now - ChronoDuration::hours(2),
-            100,
-            50,
-            2.0,
+            RequestUsageFixture {
+                request_id: "req_new",
+                project_seed: "/tmp/proj-new",
+                model_used: "claude-sonnet-4-6",
+                started_at: now - ChronoDuration::hours(2),
+                input_tokens: 100,
+                output_tokens: 50,
+                cost_usd: 2.0,
+            },
         )
         .await;
 

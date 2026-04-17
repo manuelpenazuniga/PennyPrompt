@@ -166,8 +166,8 @@ impl Default for EventQuery {
 pub struct PricebookEntryRecord {
     pub id: i64,
     pub model_id: String,
-    pub input_per_mtok: f64,
-    pub output_per_mtok: f64,
+    pub input_per_mtok: Money,
+    pub output_per_mtok: Money,
     pub effective_from: DateTime<Utc>,
     pub effective_until: Option<DateTime<Utc>>,
     pub source: String,
@@ -176,8 +176,8 @@ pub struct PricebookEntryRecord {
 #[derive(Debug, Clone)]
 pub struct NewPricebookEntry {
     pub model_id: String,
-    pub input_per_mtok: f64,
-    pub output_per_mtok: f64,
+    pub input_per_mtok: Money,
+    pub output_per_mtok: Money,
     pub effective_from: DateTime<Utc>,
     pub effective_until: Option<DateTime<Utc>>,
     pub source: String,
@@ -684,7 +684,7 @@ impl PricebookRepo for SqliteStore {
         let at_iso = at.to_rfc3339();
         let row = sqlx::query(
             r#"
-            SELECT id, model_id, input_per_mtok, output_per_mtok, effective_from, effective_until, source
+            SELECT id, model_id, input_per_mtok_micros, output_per_mtok_micros, effective_from, effective_until, source
             FROM pricebook_entries
             WHERE model_id = ?1
               AND datetime(effective_from) <= datetime(?2)
@@ -707,14 +707,16 @@ impl PricebookRepo for SqliteStore {
             sqlx::query(
                 r#"
                 INSERT INTO pricebook_entries (
-                    model_id, input_per_mtok, output_per_mtok, effective_from, effective_until, source
+                    model_id, input_per_mtok, output_per_mtok, input_per_mtok_micros, output_per_mtok_micros, effective_from, effective_until, source
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 "#,
             )
             .bind(&entry.model_id)
-            .bind(entry.input_per_mtok)
-            .bind(entry.output_per_mtok)
+            .bind(entry.input_per_mtok.to_usd())
+            .bind(entry.output_per_mtok.to_usd())
+            .bind(entry.input_per_mtok.micros())
+            .bind(entry.output_per_mtok.micros())
             .bind(entry.effective_from.to_rfc3339())
             .bind(entry.effective_until.map(|ts| ts.to_rfc3339()))
             .bind(&entry.source)
@@ -929,8 +931,8 @@ fn pricebook_from_row(row: sqlx::sqlite::SqliteRow) -> Result<PricebookEntryReco
     Ok(PricebookEntryRecord {
         id: row.get("id"),
         model_id: row.get("model_id"),
-        input_per_mtok: row.get("input_per_mtok"),
-        output_per_mtok: row.get("output_per_mtok"),
+        input_per_mtok: Money::from_micros(row.get("input_per_mtok_micros")),
+        output_per_mtok: Money::from_micros(row.get("output_per_mtok_micros")),
         effective_from: parse_db_datetime(
             row.get("effective_from"),
             "pricebook_entries.effective_from",
@@ -1223,8 +1225,8 @@ mod tests {
             .import(&[
                 NewPricebookEntry {
                     model_id: "claude-sonnet-4-6".into(),
-                    input_per_mtok: 3.0,
-                    output_per_mtok: 15.0,
+                    input_per_mtok: Money::from_usd(3.0).expect("money"),
+                    output_per_mtok: Money::from_usd(15.0).expect("money"),
                     effective_from: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap(),
                     effective_until: Some(
                         Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
@@ -1233,8 +1235,8 @@ mod tests {
                 },
                 NewPricebookEntry {
                     model_id: "claude-sonnet-4-6".into(),
-                    input_per_mtok: 3.5,
-                    output_per_mtok: 16.0,
+                    input_per_mtok: Money::from_usd(3.5).expect("money"),
+                    output_per_mtok: Money::from_usd(16.0).expect("money"),
                     effective_from: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
                     effective_until: None,
                     source: "local".into(),
@@ -1254,8 +1256,8 @@ mod tests {
             .expect("get price")
             .expect("price exists");
 
-        assert_eq!(price.input_per_mtok, 3.5);
-        assert_eq!(price.output_per_mtok, 16.0);
+        assert_eq!(price.input_per_mtok, Money::from_usd(3.5).expect("money"));
+        assert_eq!(price.output_per_mtok, Money::from_usd(16.0).expect("money"));
     }
 
     #[tokio::test]

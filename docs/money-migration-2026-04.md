@@ -11,10 +11,13 @@
 
 ## Database compatibility strategy
 - Added migration `0008_money_micros.sql`.
+- Added migration `0008_money_micros.sql`.
+- Added migration `0009_pricebook_micros.sql`.
 - New deterministic columns were introduced and backfilled from legacy `REAL` columns:
   - `budgets.hard_limit_micros`, `budgets.soft_limit_micros`
   - `request_usage.cost_micros`
   - `cost_ledger.amount_micros`, `cost_ledger.running_total_micros`
+  - `pricebook_entries.input_per_mtok_micros`, `pricebook_entries.output_per_mtok_micros`
 - Existing `REAL` columns remain during transition for compatibility and diagnostics.
 - Repositories now read/write the `*_micros` columns for accounting logic, and still dual-write legacy `REAL` columns where relevant.
 

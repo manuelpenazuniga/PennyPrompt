@@ -96,9 +96,11 @@ impl BudgetEvaluator {
                 entries,
                 remaining_by_budget,
             } => {
-                let mut warnings = self.compute_over_limit_warnings(&budgets, &remaining_by_budget);
+                let remaining_map = Self::build_remaining_map(&remaining_by_budget);
+                let (mut warnings, has_hard_violation) =
+                    self.compute_over_limit_warnings(&budgets, &remaining_map);
                 let soft_warnings = match self
-                    .compute_soft_limit_warnings(&budgets, &remaining_by_budget)
+                    .compute_soft_limit_warnings(&budgets, &remaining_map)
                     .await
                 {
                     Ok(warnings) => warnings,
@@ -134,11 +136,7 @@ impl BudgetEvaluator {
                         Severity::Warn,
                         json!({
                             "mode": self.mode_tag(),
-                            "result": if warnings.iter().any(|warning| warning.contains("hard limit exceeded")) {
-                                "allow_budget_violation"
-                            } else {
-                                "allow_with_warnings"
-                            },
+                            "result": if has_hard_violation { "allow_budget_violation" } else { "allow_with_warnings" },
                             "warnings": warnings,
                             "estimated_cost_usd": estimated_cost.to_usd()
                         }),
@@ -161,41 +159,19 @@ impl BudgetEvaluator {
                     limit_usd: limit,
                     resets_at: window_reset_at(&budget.window_type),
                 };
-                match self.mode {
-                    Mode::Guard => {
-                        self.record_event(
-                            request,
-                            EventType::BudgetBlock,
-                            Severity::Warn,
-                            json!({
-                                "mode": self.mode_tag(),
-                                "result": "block",
-                                "reason": reason,
-                                "detail": detail
-                            }),
-                        )
-                        .await;
-                        RouteDecision::Block { reason, detail }
-                    }
-                    Mode::Observe => {
-                        let warning = format!("observe mode budget violation: {reason}");
-                        self.record_event(
-                            request,
-                            EventType::BudgetWarn,
-                            Severity::Warn,
-                            json!({
-                                "mode": self.mode_tag(),
-                                "result": "allow_budget_violation",
-                                "reason": reason,
-                                "detail": detail
-                            }),
-                        )
-                        .await;
-                        RouteDecision::Allow {
-                            warnings: vec![warning],
-                        }
-                    }
-                }
+                self.record_event(
+                    request,
+                    EventType::BudgetBlock,
+                    Severity::Warn,
+                    json!({
+                        "mode": self.mode_tag(),
+                        "result": "block",
+                        "reason": reason,
+                        "detail": detail
+                    }),
+                )
+                .await;
+                RouteDecision::Block { reason, detail }
             }
         }
     }
@@ -204,28 +180,32 @@ impl BudgetEvaluator {
         &self,
         request: &NormalizedRequest,
     ) -> Result<Vec<Budget>, String> {
-        let mut budgets = BudgetRepo::list_applicable_for_request(
+        let budgets = BudgetRepo::list_applicable_for_request(
             &self.store,
             &request.project_id,
             &request.session_id,
         )
         .await
         .map_err(|error| error.to_string())?;
-        budgets.sort_by_key(|budget| budget.id);
         Ok(budgets)
+    }
+
+    fn build_remaining_map(
+        remaining_by_budget: &[penny_types::BudgetRemaining],
+    ) -> HashMap<i64, Option<Money>> {
+        remaining_by_budget
+            .iter()
+            .map(|item| (item.budget_id, item.remaining_usd))
+            .collect()
     }
 
     fn compute_over_limit_warnings(
         &self,
         budgets: &[Budget],
-        remaining_by_budget: &[penny_types::BudgetRemaining],
-    ) -> Vec<String> {
-        let mut remaining_map = HashMap::with_capacity(remaining_by_budget.len());
-        for item in remaining_by_budget {
-            remaining_map.insert(item.budget_id, item.remaining_usd);
-        }
-
+        remaining_map: &HashMap<i64, Option<Money>>,
+    ) -> (Vec<String>, bool) {
         let mut warnings = Vec::new();
+        let mut has_hard_violation = false;
         for budget in budgets {
             let Some(limit) = budget.hard_limit_usd else {
                 continue;
@@ -239,6 +219,7 @@ impl BudgetEvaluator {
                 let Some(accumulated) = limit.checked_sub(remaining) else {
                     continue;
                 };
+                has_hard_violation = true;
                 warnings.push(format!(
                     "hard limit exceeded for {} ({:?}): {} / {}",
                     scope_string(budget),
@@ -249,19 +230,14 @@ impl BudgetEvaluator {
             }
         }
 
-        warnings
+        (warnings, has_hard_violation)
     }
 
     async fn compute_soft_limit_warnings(
         &self,
         budgets: &[Budget],
-        remaining_by_budget: &[penny_types::BudgetRemaining],
+        remaining_map: &HashMap<i64, Option<Money>>,
     ) -> Result<Vec<String>, String> {
-        let mut remaining_map = HashMap::with_capacity(remaining_by_budget.len());
-        for item in remaining_by_budget {
-            remaining_map.insert(item.budget_id, item.remaining_usd);
-        }
-
         let mut lookup_budget_ids = HashSet::new();
         for budget in budgets {
             if budget.hard_limit_usd.is_none() {
@@ -287,7 +263,9 @@ impl BudgetEvaluator {
 
             let accumulated = if let Some(limit) = budget.hard_limit_usd {
                 match remaining_map.get(&budget.id) {
-                    Some(Some(remaining)) => limit.checked_sub(*remaining).unwrap_or(Money::ZERO),
+                    Some(Some(remaining)) => limit
+                        .checked_sub(*remaining)
+                        .unwrap_or(Money::from_micros(i64::MAX)),
                     _ => *running_totals.get(&budget.id).unwrap_or(&Money::ZERO),
                 }
             } else {
@@ -318,9 +296,12 @@ impl BudgetEvaluator {
 
         let mut qb = QueryBuilder::<Sqlite>::new(
             r#"
-            SELECT budget_id, running_total_micros
-            FROM cost_ledger
-            WHERE budget_id IN (
+            SELECT ledger.budget_id, ledger.running_total_micros
+            FROM cost_ledger AS ledger
+            JOIN (
+                SELECT budget_id, MAX(id) AS max_id
+                FROM cost_ledger
+                WHERE budget_id IN (
             "#,
         );
         {
@@ -331,20 +312,22 @@ impl BudgetEvaluator {
         }
         qb.push(
             r#")
-            ORDER BY budget_id ASC, id DESC
+                GROUP BY budget_id
+            ) AS latest
+              ON latest.budget_id = ledger.budget_id
+             AND latest.max_id = ledger.id
+            ORDER BY ledger.budget_id ASC
             "#,
         );
 
         let rows = qb.build().fetch_all(self.store.pool()).await?;
-        let mut totals = HashMap::with_capacity(budget_ids.len());
-        for row in rows {
-            let budget_id: i64 = row.get("budget_id");
-            let running_total: i64 = row.get("running_total_micros");
-            totals.entry(budget_id).or_insert(running_total);
-        }
-        Ok(totals
+        Ok(rows
             .into_iter()
-            .map(|(budget_id, micros)| (budget_id, Money::from_micros(micros)))
+            .map(|row| {
+                let budget_id: i64 = row.get("budget_id");
+                let running_total: i64 = row.get("running_total_micros");
+                (budget_id, Money::from_micros(running_total))
+            })
             .collect())
     }
 
