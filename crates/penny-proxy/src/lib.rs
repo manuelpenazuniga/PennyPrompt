@@ -258,6 +258,21 @@ async fn post_chat_completions(
                 format!("model `{model}` is not configured in the active provider"),
             );
         }
+        Err(ProviderError::InternalState(message)) => {
+            if let Some(context) = enforcement {
+                maybe_release_on_dispatch_failure(
+                    &state,
+                    &normalized.id,
+                    context.reserve_persisted,
+                )
+                .await;
+            }
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "provider_internal_state",
+                format!("provider internal state error: {message}"),
+            );
+        }
     };
 
     let status = StatusCode::from_u16(provider_response.status).unwrap_or(StatusCode::BAD_GATEWAY);
