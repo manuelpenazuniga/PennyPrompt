@@ -63,11 +63,8 @@ impl<'a, R: PricebookRepo> PricingEngine<'a, R> {
             .await?
             .ok_or_else(|| CostError::PriceNotFound(model_id.to_string()))?;
 
-        let input_rate = Money::from_usd(price.input_per_mtok)?;
-        let output_rate = Money::from_usd(price.output_per_mtok)?;
-
-        let input_cost = prorate_mtok(input_tokens, input_rate)?;
-        let output_cost = prorate_mtok(output_tokens, output_rate)?;
+        let input_cost = prorate_mtok(input_tokens, price.input_per_mtok)?;
+        let output_cost = prorate_mtok(output_tokens, price.output_per_mtok)?;
         input_cost
             .checked_add(output_cost)
             .ok_or(CostError::MoneyOverflow)
@@ -174,7 +171,11 @@ fn estimate_output_tokens(input_tokens: u64) -> u64 {
 
 fn prorate_mtok(tokens: u64, usd_per_mtok: Money) -> Result<Money, CostError> {
     let numerator = i128::from(tokens) * i128::from(usd_per_mtok.micros());
-    let micros = (numerator + 500_000) / 1_000_000;
+    let micros = if numerator >= 0 {
+        (numerator + 500_000) / 1_000_000
+    } else {
+        (numerator - 500_000) / 1_000_000
+    };
     let micros_i64 = i64::try_from(micros).map_err(|_| CostError::MoneyOverflow)?;
     Ok(Money::from_micros(micros_i64))
 }
@@ -300,8 +301,8 @@ pub async fn import_pricebook_files<P: AsRef<Path>>(
 
             imported_entries.push(NewPricebookEntry {
                 model_id: entry.model_id,
-                input_per_mtok: entry.input_per_mtok,
-                output_per_mtok: entry.output_per_mtok,
+                input_per_mtok: Money::from_usd(entry.input_per_mtok)?,
+                output_per_mtok: Money::from_usd(entry.output_per_mtok)?,
                 effective_from: parse_datetime(&entry.effective_from, "effective_from")?,
                 effective_until: entry
                     .effective_until

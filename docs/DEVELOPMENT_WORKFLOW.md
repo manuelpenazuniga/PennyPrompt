@@ -28,7 +28,7 @@ Recommended branch naming:
 
 - `feat/m<phase>-issue-<number>-<short-name>`
 - `fix/m<phase>-issue-<number>-<short-name>`
-- `chore/<short-name>` for non-feature maintenance.
+- `chore/m<phase>-issue-<number>-<short-name>` for non-feature maintenance.
 
 ## Standard Execution Steps
 
@@ -64,8 +64,8 @@ Use conventional prefix + area + concise outcome + issue id.
 Examples:
 
 - `feat(ledger): implement atomic reserve/reconcile/release flow (#16)`
-- `fix(budget): allow observe mode on budget denial and avoid duplicate warn events`
-- `docs(backlog): record AI review follow-ups and issue mapping`
+- `fix(budget): allow observe mode on budget denial and avoid duplicate warn events (#17)`
+- `docs(backlog): record AI review follow-ups and issue mapping (#53)`
 
 ## Local Safety Checks Before Commit
 
@@ -78,7 +78,7 @@ Examples:
 
 - High-priority functional alerts: fix before continuing roadmap.
 - Medium/low optimization alerts: track in technical issues when not blocking.
-- Monetary precision (`f64`) concerns are tracked separately and must be addressed before broad M3/M4 scale.
+- Keep accounting paths on deterministic money representation (`Money`) and avoid reintroducing raw `f64` in persisted/comparative budget or ledger logic.
 
 ## End-of-Issue Output Checklist
 
@@ -106,4 +106,3 @@ gh pr list --state merged --limit 20
 gh issue list --state open --limit 200
 ```
 3. Resume from the next issue in roadmap order, unless a higher-priority bug fix is open.
-
