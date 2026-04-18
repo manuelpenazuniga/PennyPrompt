@@ -369,7 +369,7 @@ PennyPrompt works with any tool that speaks the OpenAI chat completions API:
 - [ ] **Post-alpha** — Launcher (`pennyprompt run <agent>`), TUI dashboard, payload cleanup, webhooks
 - [ ] **v1.0** — Team mode, PostgreSQL backend, plugin system, Grafana/Prometheus metrics
 
-See [docs/PennyPrompt-v2.md](docs/PennyPrompt-v2.md) for the full project specification.
+See [PennyPrompt-v2.md](PennyPrompt-v2.md) for the full project specification.
 
 ## Contributing
 
@@ -390,6 +390,15 @@ cargo run -- serve --mock
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the crate dependency map.
 For the day-to-day issue workflow used in this repo, see [docs/DEVELOPMENT_WORKFLOW.md](docs/DEVELOPMENT_WORKFLOW.md).
+
+Alpha documentation set:
+
+- [docs/INSTALL.md](docs/INSTALL.md)
+- [docs/QUICKSTART.md](docs/QUICKSTART.md)
+- [docs/CONFIG-REFERENCE.md](docs/CONFIG-REFERENCE.md)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/PRICEBOOK.md](docs/PRICEBOOK.md)
+- [docs/LIMITATIONS.md](docs/LIMITATIONS.md)
 
 ## License
 
