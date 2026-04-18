@@ -27,9 +27,4 @@ This list documents current constraints as of April 18, 2026.
 - Reports reflect local persisted usage only.
 - Empty datasets produce explicit "no rows" style output (expected in fresh installs).
 
-## Roadmap-Tracked Gaps
-
-- Integration/golden release-grade test expansion is tracked in issue `#36`.
-- Release automation and install script/changelog are tracked in issue `#37`.
-
-These limitations are intentional scope boundaries for M6 sequencing.
+These limitations are intentional scope boundaries for current alpha sequencing.

@@ -1,12 +1,40 @@
 # PennyPrompt Alpha Installation
 
-This document describes the current alpha installation path for this repository.
+This document describes alpha installation paths for PennyPrompt.
 
 ## 1. Prerequisites
 
 - macOS or Linux shell environment
-- Rust toolchain (stable) with `cargo`
-- SQLite support (already included via `sqlx` + bundled SQLite driver)
+- `curl`, `tar`, and `shasum` or `sha256sum`
+- Rust toolchain (stable) with `cargo` (only required for source builds)
+
+## 2. Quick Install from GitHub Release (`curl | sh`)
+
+Install latest alpha release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/PennyPrompt/main/scripts/install.sh | sh
+```
+
+Install specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/PennyPrompt/main/scripts/install.sh | PENNY_VERSION=v0.1.0-alpha.1 sh
+```
+
+By default the binary is installed to:
+
+```text
+~/.local/bin/penny-cli
+```
+
+Override install location:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/PennyPrompt/main/scripts/install.sh | PENNY_INSTALL_DIR=/usr/local/bin sh
+```
+
+## 3. Build from Source (Alternative)
 
 Check toolchain:
 
@@ -15,7 +43,7 @@ rustc --version
 cargo --version
 ```
 
-## 2. Clone and Build
+Clone and build:
 
 ```bash
 git clone https://github.com/manuelpenazuniga/PennyPrompt.git
@@ -29,7 +57,7 @@ The binary is generated at:
 target/release/penny-cli
 ```
 
-## 3. Run Commands
+## 4. Run Commands
 
 You can either:
 
@@ -52,7 +80,7 @@ alias pp='cargo run -p penny-cli --'
 pp doctor
 ```
 
-## 4. Configure Initial Settings
+## 5. Configure Initial Settings
 
 Create a local config from a preset:
 
@@ -72,7 +100,7 @@ You can override config path with:
 export PENNY_CONFIG=/absolute/path/to/config.toml
 ```
 
-## 5. Seed Pricebook and Verify
+## 6. Seed Pricebook and Verify
 
 ```bash
 ./target/release/penny-cli prices update
@@ -80,7 +108,7 @@ export PENNY_CONFIG=/absolute/path/to/config.toml
 ./target/release/penny-cli config --json
 ```
 
-## 6. API Key Environment Variables
+## 7. API Key Environment Variables
 
 Set keys for providers you plan to use:
 
@@ -97,3 +125,4 @@ export OPENAI_API_KEY=...
 - `HOME not set`: define `HOME` or use `PENNY_CONFIG`.
 - `no active pricebook entries`: run `prices update`.
 - DB connectivity errors: verify `server.database_path` and file permissions.
+- `unsupported OS/architecture`: install script currently supports Linux/macOS on x86_64 and arm64.

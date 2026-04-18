@@ -399,6 +399,8 @@ Alpha documentation set:
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - [docs/PRICEBOOK.md](docs/PRICEBOOK.md)
 - [docs/LIMITATIONS.md](docs/LIMITATIONS.md)
+- [docs/RELEASE.md](docs/RELEASE.md)
+- [CHANGELOG.md](CHANGELOG.md)
 
 ## License
 
