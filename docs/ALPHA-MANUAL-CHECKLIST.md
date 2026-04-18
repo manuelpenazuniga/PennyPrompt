@@ -67,6 +67,14 @@ Use this checklist before cutting an alpha release candidate.
 - [ ] `docs/ARCHITECTURE.md` matches current crate boundaries.
 - [ ] `docs/PRICEBOOK.md` matches current import/update flow.
 - [ ] `docs/LIMITATIONS.md` reflects known alpha constraints.
+- [ ] `docs/RELEASE.md` reflects current release workflow.
+- [ ] `CHANGELOG.md` updated for the target tag.
+
+## Release Artifacts
+
+- [ ] Tag pushed as `v*` and `Release` workflow finished.
+- [ ] Artifacts published for 4 targets (Linux/macOS on x86_64 + arm64).
+- [ ] SHA-256 checksum files published and verified.
 
 ## Release Readiness Decision
 
