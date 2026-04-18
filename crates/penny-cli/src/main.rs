@@ -14,7 +14,8 @@ use penny_cost::{estimate_tokens, PricingEngine};
 use penny_store::{BudgetRepo, ProjectRepo, SqliteStore};
 use penny_types::{Confidence, Event, EventType, Money, ScopeType, TaskType, WindowType};
 use reqwest::Client;
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{json, Value};
 use sqlx::{query, Row};
 use thiserror::Error;
 
@@ -46,6 +47,10 @@ enum Commands {
         #[arg(long, default_value_t = 200)]
         max_files: usize,
     },
+    Detect {
+        #[command(subcommand)]
+        command: DetectCommands,
+    },
     Tail {
         #[arg(long, default_value = "http://127.0.0.1:8586")]
         admin_url: String,
@@ -71,6 +76,21 @@ enum ReportCommands {
         since: Option<String>,
         #[arg(long, value_enum, default_value_t = SummaryBy::Project)]
         by: SummaryBy,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DetectCommands {
+    Status {
+        #[arg(long, default_value = "http://127.0.0.1:8586")]
+        admin_url: String,
+    },
+    Resume {
+        session_id: String,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long, default_value = "http://127.0.0.1:8586")]
+        admin_url: String,
     },
 }
 
@@ -210,6 +230,28 @@ struct SseMessage {
     data: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DetectStatusResponse {
+    enabled: bool,
+    paused_sessions: Vec<DetectPausedSession>,
+    active_alerts: Vec<DetectSessionAlert>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DetectPausedSession {
+    session_id: String,
+    reason: String,
+    paused_at: DateTime<Utc>,
+    triggered_by: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct DetectSessionAlert {
+    session_id: String,
+    alert: Value,
+    triggered_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Error)]
 enum CliError {
     #[error("config error: {0}")]
@@ -234,6 +276,12 @@ enum CliError {
     TailStatus { status: u16, body: String },
     #[error("tail stream parse error: {0}")]
     TailParse(String),
+    #[error("detect request failed: {0}")]
+    DetectRequest(String),
+    #[error("detect endpoint returned {status}: {body}")]
+    DetectStatus { status: u16, body: String },
+    #[error("detect payload parse error: {0}")]
+    DetectParse(String),
 }
 
 #[tokio::main]
@@ -271,6 +319,18 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             )
             .await?;
         }
+        Commands::Detect { command } => match command {
+            DetectCommands::Status { admin_url } => {
+                run_detect_status(&admin_url).await?;
+            }
+            DetectCommands::Resume {
+                session_id,
+                request_id,
+                admin_url,
+            } => {
+                run_detect_resume(&admin_url, &session_id, request_id.as_deref()).await?;
+            }
+        },
         Commands::Tail {
             admin_url,
             since_id,
@@ -404,6 +464,99 @@ async fn run_tail(command: TailCommand) -> Result<(), CliError> {
         print_sse_message(&message, no_color)?;
     }
 
+    Ok(())
+}
+
+async fn run_detect_status(admin_url: &str) -> Result<(), CliError> {
+    let url = format!("{}/admin/detect/status", admin_url.trim_end_matches('/'));
+    let response = Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| CliError::DetectRequest(error.to_string()))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| CliError::DetectRequest(error.to_string()))?;
+    if !status.is_success() {
+        return Err(CliError::DetectStatus {
+            status: status.as_u16(),
+            body,
+        });
+    }
+
+    let payload: DetectStatusResponse =
+        serde_json::from_str(&body).map_err(|error| CliError::DetectParse(error.to_string()))?;
+
+    println!("Detect status");
+    println!("  enabled: {}", payload.enabled);
+    println!("  paused_sessions: {}", payload.paused_sessions.len());
+    for paused in payload.paused_sessions {
+        println!(
+            "  - session={} paused_at={} reason={} triggered_by={}",
+            paused.session_id,
+            paused.paused_at.to_rfc3339(),
+            paused.reason,
+            paused.triggered_by
+        );
+    }
+    println!("  active_alerts: {}", payload.active_alerts.len());
+    for alert in payload.active_alerts {
+        println!(
+            "  - session={} triggered_at={} alert={}",
+            alert.session_id,
+            alert.triggered_at.to_rfc3339(),
+            alert.alert
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_detect_resume(
+    admin_url: &str,
+    session_id: &str,
+    request_id: Option<&str>,
+) -> Result<(), CliError> {
+    let url = format!("{}/admin/detect/resume", admin_url.trim_end_matches('/'));
+    let payload = json!({
+        "session_id": session_id,
+        "request_id": request_id,
+    });
+    let response = Client::new()
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| CliError::DetectRequest(error.to_string()))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| CliError::DetectRequest(error.to_string()))?;
+    if !status.is_success() {
+        return Err(CliError::DetectStatus {
+            status: status.as_u16(),
+            body,
+        });
+    }
+
+    let parsed: Value =
+        serde_json::from_str(&body).map_err(|error| CliError::DetectParse(error.to_string()))?;
+    let resumed = parsed
+        .get("resumed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if resumed {
+        println!(
+            "Detect resume succeeded: session={} request_id={}",
+            session_id,
+            request_id.unwrap_or("(none)")
+        );
+    } else {
+        println!("Detect resume response: {parsed}");
+    }
     Ok(())
 }
 
