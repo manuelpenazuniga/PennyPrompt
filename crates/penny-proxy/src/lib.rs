@@ -2,6 +2,7 @@
 
 use std::{
     convert::Infallible,
+    hash::Hasher,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -20,10 +21,11 @@ use bytes::Bytes;
 use chrono::Utc;
 use penny_budget::BudgetEvaluator;
 use penny_config::{
-    AppConfig as RuntimeConfig, BudgetConfig as RuntimeBudgetConfig, ScopeType as ConfigScopeType,
-    WindowType as ConfigWindowType,
+    AppConfig as RuntimeConfig, BudgetConfig as RuntimeBudgetConfig, LoopAction,
+    ScopeType as ConfigScopeType, WindowType as ConfigWindowType,
 };
 use penny_cost::{estimate_tokens, PricingEngine};
+use penny_detect::{DetectEngine, DetectEventRecord, DetectorConfig, SESSION_PAUSED_LOOP_REASON};
 use penny_ledger::CostLedger;
 use penny_providers::{MockProvider, MockProviderConfig, ProviderAdapter, ProviderError};
 use penny_store::{
@@ -31,8 +33,8 @@ use penny_store::{
     SqliteStore, UsageRecord,
 };
 use penny_types::{
-    Budget, BudgetBlockDetail, EventType, Mode, Money, NormalizedRequest, ResponseBody,
-    RouteDecision, ScopeType, Severity, UsageSource, WindowType,
+    Budget, BudgetBlockDetail, EventType, Mode, Money, NormalizedRequest, RequestDigest,
+    ResponseBody, RouteDecision, ScopeType, Severity, UsageSource, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -64,6 +66,7 @@ pub enum ProxyError {
 #[derive(Clone)]
 pub struct ProxyState {
     provider: Arc<dyn ProviderAdapter>,
+    detector: Arc<DetectEngine>,
     store: Option<SqliteStore>,
     models: Vec<String>,
     mode: Mode,
@@ -78,6 +81,13 @@ impl ProxyState {
     pub fn with_provider(provider: Arc<dyn ProviderAdapter>, models: Vec<String>) -> Self {
         Self {
             provider,
+            detector: Arc::new(DetectEngine::new(DetectorConfig {
+                enabled: false,
+                burn_rate_alert_usd_per_hour: 10.0,
+                loop_window_seconds: 120,
+                loop_threshold_similar_requests: 8,
+                loop_action: LoopAction::Alert,
+            })),
             store: None,
             models,
             mode: Mode::Guard,
@@ -91,6 +101,11 @@ impl ProxyState {
 
     pub fn with_store(mut self, store: SqliteStore) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    pub fn with_detector(mut self, detector: Arc<DetectEngine>) -> Self {
+        self.detector = detector;
         self
     }
 
@@ -125,6 +140,7 @@ pub async fn build_state_from_config(
     seed_budgets_from_runtime_config(&store, config).await?;
     Ok(ProxyState::with_provider(provider, models)
         .with_store(store)
+        .with_detector(Arc::new(DetectEngine::from_runtime_config(&config.detect)))
         .with_mode(mode_from_config(&config.server.mode))
         .with_session_window_minutes(config.attribution.session_window_minutes as u64))
 }
@@ -241,6 +257,18 @@ async fn post_chat_completions(
     normalized.project_id = project_id;
     normalized.session_id = session_id;
 
+    if state.detector.is_session_paused(&normalized.session_id) {
+        let reason = state
+            .detector
+            .paused_reason(&normalized.session_id)
+            .unwrap_or_else(|| SESSION_PAUSED_LOOP_REASON.to_string());
+        return budget_error_response(
+            "session_paused_loop_detected",
+            format!("session `{}` is paused: {reason}", normalized.session_id),
+            None,
+        );
+    }
+
     let enforcement = match evaluate_budget_before_dispatch(&state, &normalized).await {
         Ok(context) => context,
         Err(response) => return response,
@@ -336,6 +364,11 @@ async fn post_chat_completions(
                     "failed to persist request metadata".to_string(),
                     message,
                 );
+            }
+            if let Err(message) =
+                run_detection_after_reconcile(&state, &normalized, &usage, usage_cost_usd).await
+            {
+                log_internal_error("detect_integration_failed", message);
             }
 
             (status, Json(value)).into_response()
@@ -957,6 +990,11 @@ async fn stream_passthrough_response(
         {
             log_internal_error("persistence_failed", message);
         }
+        if let Err(message) =
+            run_detection_after_reconcile(&state, &normalized, &usage, usage_cost_usd).await
+        {
+            log_internal_error("detect_integration_failed", message);
+        }
     });
 
     let mut response = Response::builder()
@@ -1009,6 +1047,142 @@ async fn log_provider_failure_event(
     };
     if let Err(err) = EventRepo::insert(store, &event).await {
         log_internal_error("provider_failure_event_insert_failed", err.to_string());
+    }
+}
+
+async fn run_detection_after_reconcile(
+    state: &ProxyState,
+    normalized: &NormalizedRequest,
+    usage: &NormalizedUsage,
+    usage_cost_usd: Money,
+) -> Result<(), String> {
+    if !state.detector.config().enabled {
+        return Ok(());
+    }
+
+    let digest = RequestDigest {
+        model: normalized.model_resolved.clone(),
+        input_tokens: usage.input_tokens,
+        cost_usd: usage_cost_usd,
+        tool_name: detect_tool_name(&normalized.messages),
+        tool_succeeded: true,
+        content_hash: detect_content_hash(&normalized.messages),
+        timestamp: normalized.timestamp,
+    };
+    let result = state
+        .detector
+        .feed(&normalized.session_id, Some(&normalized.id), digest);
+    if result.events.is_empty() {
+        return Ok(());
+    }
+
+    persist_detect_events(state, &result.events).await
+}
+
+async fn persist_detect_events(
+    state: &ProxyState,
+    events: &[DetectEventRecord],
+) -> Result<(), String> {
+    let Some(store) = &state.store else {
+        return Ok(());
+    };
+    for event in events {
+        let new_event = NewEvent {
+            request_id: event.request_id.clone(),
+            session_id: Some(event.session_id.clone()),
+            event_type: event.event_type.clone(),
+            severity: event.severity.clone(),
+            detail: event.detail.clone(),
+        };
+        EventRepo::insert(store, &new_event)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn detect_tool_name(messages: &Value) -> Option<String> {
+    let array = messages.as_array()?;
+    for message in array {
+        if let Some(tool) = message.get("tool_name").and_then(Value::as_str) {
+            let tool = tool.trim();
+            if !tool.is_empty() {
+                return Some(tool.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn detect_content_hash(messages: &Value) -> u64 {
+    let content = first_user_message_text(messages).unwrap_or_default();
+    let mut hasher = Fnv1a64::default();
+    let mut chars = content.chars();
+    for ch in chars.by_ref().take(500) {
+        let mut bytes = [0_u8; 4];
+        let encoded = ch.encode_utf8(&mut bytes);
+        hasher.write(encoded.as_bytes());
+    }
+    hasher.finish()
+}
+
+fn first_user_message_text(messages: &Value) -> Option<String> {
+    let array = messages.as_array()?;
+    for message in array {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if role != "user" {
+            continue;
+        }
+        let content = message.get("content")?;
+        return extract_message_text(content);
+    }
+    None
+}
+
+fn extract_message_text(content: &Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+        return None;
+    }
+
+    let blocks = content.as_array()?;
+    let joined = blocks
+        .iter()
+        .filter_map(|entry| entry.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    let joined = joined.trim();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined.to_string())
+    }
+}
+
+#[derive(Default)]
+struct Fnv1a64(u64);
+
+impl Hasher for Fnv1a64 {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        const OFFSET: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+        if self.0 == 0 {
+            self.0 = OFFSET;
+        }
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(PRIME);
+        }
     }
 }
 
@@ -1132,17 +1306,19 @@ mod tests {
         http::Request,
     };
     use penny_budget::BudgetEvaluator;
-    use penny_config::{load_config, LoadOptions};
+    use penny_config::{load_config, LoadOptions, LoopAction};
     use penny_cost::import_pricebook_files;
+    use penny_detect::{DetectEngine, DetectorConfig, SESSION_PAUSED_LOOP_REASON};
     use penny_store::BudgetRepo;
     use penny_types::{
-        Budget, Money, ProviderResponse, RouteDecision, ScopeType, StreamDescriptor, WindowType,
+        Budget, Money, ProviderResponse, RequestDigest, RouteDecision, ScopeType, StreamDescriptor,
+        WindowType,
     };
     use sqlx::Row;
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
     use tokio::time::{sleep, Duration};
@@ -1158,6 +1334,26 @@ mod tests {
             .expect("create in-memory store");
         let state = ProxyState::mock_default().with_store(store.clone());
         (build_router(state), store)
+    }
+
+    async fn app_with_store_and_detector(detector: Arc<DetectEngine>) -> (Router, SqliteStore) {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        let state = ProxyState::mock_default()
+            .with_store(store.clone())
+            .with_detector(detector);
+        (build_router(state), store)
+    }
+
+    fn detector(loop_action: LoopAction, threshold: u32) -> Arc<DetectEngine> {
+        Arc::new(DetectEngine::new(DetectorConfig {
+            enabled: true,
+            burn_rate_alert_usd_per_hour: 10_000.0,
+            loop_window_seconds: 120,
+            loop_threshold_similar_requests: threshold,
+            loop_action,
+        }))
     }
 
     #[derive(Debug, Default)]
@@ -1893,6 +2089,124 @@ action_on_soft = "warn"
         );
         assert_eq!(json_body["error"]["budget"]["limit_usd"], 0.0);
         assert!(json_body["error"]["budget"]["resets_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn paused_session_short_circuits_before_budget_evaluation() {
+        let detector = detector(LoopAction::Pause, 1);
+        detector.feed(
+            "sess-paused",
+            Some("seed-req"),
+            RequestDigest {
+                model: "claude-sonnet-4-6".to_string(),
+                input_tokens: 100,
+                cost_usd: Money::from_usd(0.1).expect("money"),
+                tool_name: None,
+                tool_succeeded: true,
+                content_hash: 99,
+                timestamp: Utc::now(),
+            },
+        );
+        assert!(detector.is_session_paused("sess-paused"));
+
+        let (app, store) = app_with_store_and_detector(detector).await;
+        seed_pricebooks(&store).await;
+        seed_global_day_budget(&store, Money::from_usd(10.0).expect("money")).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(SESSION_OVERRIDE_HEADER, "sess-paused")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"should be blocked by detect pause"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json_body["error"]["type"], "session_paused_loop_detected");
+        let message = json_body["error"]["message"]
+            .as_str()
+            .expect("message as str");
+        assert!(message.contains(SESSION_PAUSED_LOOP_REASON));
+
+        let ledger_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM cost_ledger WHERE request_id = ?1")
+                .bind(&request_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("ledger count");
+        assert_eq!(ledger_rows, 0);
+
+        let request_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE id = ?1")
+            .bind(&request_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("request count");
+        assert_eq!(request_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn detect_events_are_persisted_after_reconcile() {
+        let detector = detector(LoopAction::Alert, 1);
+        let (app, store) = app_with_store_and_detector(detector).await;
+        seed_pricebooks(&store).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(PROJECT_OVERRIDE_HEADER, "proj-detect")
+            .header(SESSION_OVERRIDE_HEADER, "sess-detect")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"trigger detect event"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail FROM events WHERE request_id = ?1 AND event_type = 'loop_detected' ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("detect event detail");
+        let detail_json: Value = serde_json::from_str(&detail).expect("detail json");
+        assert_eq!(detail_json["kind"], "content_similarity");
+        assert!(
+            detail_json["similar_count"]
+                .as_u64()
+                .expect("similar_count as u64")
+                >= 1
+        );
     }
 
     #[tokio::test]
