@@ -1,0 +1,1 @@
+[12:00:00] BURN_RATE session=sess_abcdef1.. usd_per_hour=$12.34 threshold=$10.00

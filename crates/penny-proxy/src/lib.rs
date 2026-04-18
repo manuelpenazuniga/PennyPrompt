@@ -1508,6 +1508,15 @@ mod tests {
             .expect("resolve repo root")
     }
 
+    fn golden_json(name: &str) -> Value {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join(name);
+        let content = fs::read_to_string(path).expect("golden file");
+        serde_json::from_str(&content).expect("golden json")
+    }
+
     fn budget_request(id: &str) -> NormalizedRequest {
         NormalizedRequest {
             id: id.to_string(),
@@ -1676,11 +1685,7 @@ action_on_soft = "warn"
             .await
             .expect("read body");
         let json_body: Value = serde_json::from_slice(&body).expect("json body");
-        assert_eq!(json_body["error"]["code"], "invalid_request");
-        assert_eq!(
-            json_body["error"]["message"],
-            "field `model` must not be empty"
-        );
+        assert_eq!(json_body, golden_json("invalid_request_error.json"));
     }
 
     #[tokio::test]
@@ -1822,11 +1827,7 @@ action_on_soft = "warn"
             .await
             .expect("read body");
         let json_body: Value = serde_json::from_slice(&body).expect("json body");
-        assert_eq!(json_body["error"]["code"], "attribution_failed");
-        assert_eq!(
-            json_body["error"]["message"],
-            "failed to resolve request attribution"
-        );
+        assert_eq!(json_body, golden_json("attribution_failed_error.json"));
         let msg = json_body["error"]["message"]
             .as_str()
             .expect("error message as str");
@@ -1861,11 +1862,7 @@ action_on_soft = "warn"
             .await
             .expect("read body");
         let json_body: Value = serde_json::from_slice(&body).expect("json body");
-        assert_eq!(json_body["error"]["code"], "persistence_failed");
-        assert_eq!(
-            json_body["error"]["message"],
-            "failed to persist request metadata"
-        );
+        assert_eq!(json_body, golden_json("persistence_failed_error.json"));
         let msg = json_body["error"]["message"]
             .as_str()
             .expect("error message as str");

@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "attribution_failed",
+    "message": "failed to resolve request attribution"
+  }
+}
