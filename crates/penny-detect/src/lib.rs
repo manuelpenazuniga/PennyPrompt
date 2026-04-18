@@ -318,9 +318,7 @@ fn tool_failure_repetition_alert(
     current: &RequestDigest,
     threshold: u32,
 ) -> Option<DetectAlert> {
-    let Some(tool_name) = current.tool_name.as_ref() else {
-        return None;
-    };
+    let tool_name = current.tool_name.as_ref()?;
     if current.tool_succeeded {
         return None;
     }
