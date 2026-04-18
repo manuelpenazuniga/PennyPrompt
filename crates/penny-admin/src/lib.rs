@@ -14,14 +14,17 @@ use axum::{
         sse::{Event as SseEvent, KeepAlive},
         IntoResponse, Response, Sse,
     },
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
+use penny_cost::{estimate_tokens, PricingEngine};
 use penny_store::{BudgetRepo, SqliteStore, StoreError};
-use penny_types::{Budget, Event, EventType, Money, ScopeType, Severity, WindowType};
+use penny_types::{
+    Budget, CostRange, Event, EventType, Money, ScopeType, Severity, TaskType, WindowType,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::{query, query_scalar, Row};
 use tokio::net::TcpListener;
 use tracing::error;
@@ -198,12 +201,65 @@ struct PricebookHealth {
     latest_effective_from: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EstimateRequest {
+    model: String,
+    #[serde(default = "default_task_type")]
+    task_type: TaskType,
+    context_tokens: Option<u64>,
+    messages: Option<Value>,
+    project_id: Option<String>,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EstimateResponse {
+    model: String,
+    task_type: TaskType,
+    context_tokens: u64,
+    range: CostRange,
+    pricebook_snapshot: Value,
+    route_preview: Option<RoutePreview>,
+    budget: EstimateBudgetSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct RoutePreview {
+    provider_id: String,
+    provider_name: String,
+    api_format: String,
+    external_model: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct EstimateBudgetSummary {
+    status: String,
+    max_estimated_cost_usd: Money,
+    rows: Vec<EstimateBudgetRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct EstimateBudgetRow {
+    budget_id: i64,
+    scope_type: ScopeType,
+    scope_id: String,
+    window_type: WindowType,
+    accumulated_usd: Money,
+    projected_usd: Money,
+    hard_limit_usd: Option<Money>,
+    soft_limit_usd: Option<Money>,
+    hard_limit_exceeded: bool,
+    soft_limit_reached: bool,
+}
+
 pub fn build_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/health", get(get_health))
         .route("/admin/report/summary", get(get_report_summary))
         .route("/admin/report/top", get(get_report_top))
         .route("/admin/budgets", get(get_budgets).post(post_budgets))
+        .route("/admin/estimate", post(post_estimate))
         .route("/admin/events", get(get_events))
         .with_state(state)
 }
@@ -435,30 +491,9 @@ async fn get_budgets(State(state): State<AdminState>) -> Response {
         }
     };
 
-    let totals_rows = query(
-        r#"
-        SELECT ledger.budget_id, ledger.running_total_micros
-        FROM cost_ledger AS ledger
-        JOIN (
-            SELECT budget_id, MAX(id) AS latest_id
-            FROM cost_ledger
-            GROUP BY budget_id
-        ) AS latest ON latest.latest_id = ledger.id
-        "#,
-    )
-    .fetch_all(state.store.pool())
-    .await
-    .unwrap_or_default();
-
-    let totals = totals_rows
-        .into_iter()
-        .map(|row| {
-            (
-                row.get::<i64, _>("budget_id"),
-                Money::from_micros(row.get("running_total_micros")),
-            )
-        })
-        .collect::<HashMap<_, _>>();
+    let totals = fetch_latest_running_totals(&state.store)
+        .await
+        .unwrap_or_default();
 
     let rows = budgets
         .into_iter()
@@ -513,6 +548,112 @@ async fn post_budgets(
         }
     };
     Json(stored).into_response()
+}
+
+async fn post_estimate(
+    State(state): State<AdminState>,
+    Json(payload): Json<EstimateRequest>,
+) -> Response {
+    let model = payload.model.trim();
+    if model.is_empty() {
+        return api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "estimate_invalid_model",
+            "model is required".to_string(),
+        );
+    }
+
+    let context_tokens = match payload.context_tokens {
+        Some(tokens) => tokens,
+        None => {
+            let Some(messages) = payload.messages.as_ref() else {
+                return api_error(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "estimate_invalid_request",
+                    "provide context_tokens or messages".to_string(),
+                );
+            };
+            estimate_tokens(messages).input_tokens
+        }
+    };
+
+    let engine = PricingEngine::new(&state.store);
+    let range = match engine
+        .estimate_range(model, context_tokens, payload.task_type.clone())
+        .await
+    {
+        Ok(range) => range,
+        Err(error) => {
+            let status = if is_price_not_found(&error.to_string()) {
+                axum::http::StatusCode::NOT_FOUND
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return api_error(status, "estimate_failed", error.to_string());
+        }
+    };
+    let pricebook_snapshot = match engine.snapshot(model).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let status = if is_price_not_found(&error.to_string()) {
+                axum::http::StatusCode::NOT_FOUND
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return api_error(status, "pricebook_snapshot_failed", error.to_string());
+        }
+    };
+
+    let max_estimated_cost_usd = match Money::from_usd(range.max_usd) {
+        Ok(value) => value,
+        Err(error) => {
+            return api_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "estimate_overflow",
+                error.to_string(),
+            )
+        }
+    };
+
+    let budget = match build_estimate_budget_summary(
+        &state.store,
+        payload.project_id.as_deref(),
+        payload.session_id.as_deref(),
+        max_estimated_cost_usd,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            return api_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "estimate_budget_summary_failed",
+                error.to_string(),
+            )
+        }
+    };
+
+    let route_preview = match fetch_route_preview(&state.store, model).await {
+        Ok(preview) => preview,
+        Err(error) => {
+            return api_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "estimate_route_preview_failed",
+                error.to_string(),
+            )
+        }
+    };
+
+    Json(EstimateResponse {
+        model: model.to_string(),
+        task_type: payload.task_type,
+        context_tokens,
+        range,
+        pricebook_snapshot,
+        route_preview,
+        budget,
+    })
+    .into_response()
 }
 
 async fn get_events(
@@ -605,6 +746,151 @@ async fn fetch_events_since(
     rows.into_iter().map(event_from_row).collect()
 }
 
+async fn fetch_latest_running_totals(
+    store: &SqliteStore,
+) -> Result<HashMap<i64, Money>, sqlx::Error> {
+    let rows = query(
+        r#"
+        SELECT ledger.budget_id, ledger.running_total_micros
+        FROM cost_ledger AS ledger
+        JOIN (
+            SELECT budget_id, MAX(id) AS latest_id
+            FROM cost_ledger
+            GROUP BY budget_id
+        ) AS latest ON latest.latest_id = ledger.id
+        "#,
+    )
+    .fetch_all(store.pool())
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<i64, _>("budget_id"),
+                Money::from_micros(row.get("running_total_micros")),
+            )
+        })
+        .collect())
+}
+
+async fn build_estimate_budget_summary(
+    store: &SqliteStore,
+    project_id: Option<&str>,
+    session_id: Option<&str>,
+    max_estimated_cost_usd: Money,
+) -> Result<EstimateBudgetSummary, StoreError> {
+    let mut budgets = if let (Some(project_id), Some(session_id)) = (project_id, session_id) {
+        store
+            .list_applicable_for_request(project_id, session_id)
+            .await?
+    } else {
+        store
+            .list_all()
+            .await?
+            .into_iter()
+            .filter(|budget| match budget.scope_type {
+                ScopeType::Global => budget.scope_id == "*",
+                ScopeType::Project => project_id.is_some_and(|project| project == budget.scope_id),
+                ScopeType::Session => session_id.is_some_and(|session| session == budget.scope_id),
+            })
+            .collect::<Vec<_>>()
+    };
+    budgets.sort_by_key(|budget| budget.id);
+
+    if budgets.is_empty() {
+        return Ok(EstimateBudgetSummary {
+            status: "no_budgets".to_string(),
+            max_estimated_cost_usd,
+            rows: Vec::new(),
+        });
+    }
+
+    let running_totals = fetch_latest_running_totals(store).await.unwrap_or_default();
+    let mut rows = Vec::with_capacity(budgets.len());
+    let mut hard_limit_exceeded = false;
+    let mut soft_limit_reached = false;
+
+    for budget in budgets {
+        let accumulated_usd = running_totals
+            .get(&budget.id)
+            .copied()
+            .unwrap_or(Money::ZERO);
+        let projected_usd = accumulated_usd
+            .checked_add(max_estimated_cost_usd)
+            .unwrap_or(Money::from_micros(i64::MAX));
+        let hard_exceeded = budget
+            .hard_limit_usd
+            .map(|limit| projected_usd > limit)
+            .unwrap_or(false);
+        let soft_reached = budget
+            .soft_limit_usd
+            .map(|limit| projected_usd >= limit)
+            .unwrap_or(false);
+
+        hard_limit_exceeded |= hard_exceeded;
+        soft_limit_reached |= soft_reached;
+
+        rows.push(EstimateBudgetRow {
+            budget_id: budget.id,
+            scope_type: budget.scope_type,
+            scope_id: budget.scope_id,
+            window_type: budget.window_type,
+            accumulated_usd,
+            projected_usd,
+            hard_limit_usd: budget.hard_limit_usd,
+            soft_limit_usd: budget.soft_limit_usd,
+            hard_limit_exceeded: hard_exceeded,
+            soft_limit_reached: soft_reached,
+        });
+    }
+
+    let status = if hard_limit_exceeded {
+        "over_hard_limit"
+    } else if soft_limit_reached {
+        "soft_limit_reached"
+    } else {
+        "within_limit"
+    };
+
+    Ok(EstimateBudgetSummary {
+        status: status.to_string(),
+        max_estimated_cost_usd,
+        rows,
+    })
+}
+
+async fn fetch_route_preview(
+    store: &SqliteStore,
+    model_id: &str,
+) -> Result<Option<RoutePreview>, sqlx::Error> {
+    let row = query(
+        r#"
+        SELECT
+            providers.id AS provider_id,
+            providers.name AS provider_name,
+            providers.api_format AS api_format,
+            providers.enabled AS provider_enabled,
+            models.external_name AS external_model
+        FROM models
+        JOIN providers ON providers.id = models.provider_id
+        WHERE models.id = ?1
+        LIMIT 1
+        "#,
+    )
+    .bind(model_id)
+    .fetch_optional(store.pool())
+    .await?;
+
+    Ok(row.map(|row| RoutePreview {
+        provider_id: row.get("provider_id"),
+        provider_name: row.get("provider_name"),
+        api_format: row.get("api_format"),
+        external_model: row.get("external_model"),
+        enabled: row.get::<i64, _>("provider_enabled") != 0,
+    }))
+}
+
 fn event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Event, StoreError> {
     let event_type: String = row.get("event_type");
     let severity: String = row.get("severity");
@@ -664,6 +950,14 @@ fn parse_db_datetime(value: String, field: &'static str) -> Result<DateTime<Utc>
     }
 
     Err(StoreError::InvalidTimestamp { field, value })
+}
+
+fn default_task_type() -> TaskType {
+    TaskType::SinglePass
+}
+
+fn is_price_not_found(message: &str) -> bool {
+    message.starts_with("no active pricebook entry found")
 }
 
 fn ratio(accumulated: Money, limit: Option<Money>) -> Option<f64> {
@@ -776,6 +1070,51 @@ mod tests {
         )
         .await
         .expect("insert event");
+    }
+
+    async fn seed_estimate_pricing(store: &SqliteStore, model_id: &str, provider_id: &str) {
+        query(
+            r#"
+            INSERT INTO providers (id, name, base_url, api_format, enabled)
+            VALUES (?1, 'Anthropic', 'https://api.anthropic.com', 'anthropic', 1)
+            "#,
+        )
+        .bind(provider_id)
+        .execute(store.pool())
+        .await
+        .expect("insert provider");
+
+        query(
+            r#"
+            INSERT INTO models (id, provider_id, external_name, display_name, class)
+            VALUES (?1, ?2, ?3, ?3, 'balanced')
+            "#,
+        )
+        .bind(model_id)
+        .bind(provider_id)
+        .bind(model_id)
+        .execute(store.pool())
+        .await
+        .expect("insert model");
+
+        query(
+            r#"
+            INSERT INTO pricebook_entries (
+                model_id,
+                input_per_mtok,
+                output_per_mtok,
+                input_per_mtok_micros,
+                output_per_mtok_micros,
+                effective_from,
+                source
+            )
+            VALUES (?1, 3.0, 15.0, 3000000, 15000000, datetime('now', '-1 day'), 'test')
+            "#,
+        )
+        .bind(model_id)
+        .execute(store.pool())
+        .await
+        .expect("insert pricebook");
     }
 
     #[tokio::test]
@@ -920,6 +1259,48 @@ mod tests {
             .expect("read body");
         let text = String::from_utf8(body.to_vec()).expect("utf8 body");
         assert!(text.contains("event: event") || text.contains("event: heartbeat"));
+    }
+
+    #[tokio::test]
+    async fn estimate_endpoint_returns_range_route_and_budget_summary() {
+        let store = setup_store().await;
+        seed_minimal_data(&store).await;
+        seed_estimate_pricing(&store, "claude-sonnet-4-6", "anthropic").await;
+        let app = build_router(AdminState::new(store));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/estimate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4-6",
+                            "task_type": "multi_round",
+                            "context_tokens": 1200,
+                            "project_id": "pennyprompt-admin",
+                            "session_id": "not-present"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(json_body["model"], "claude-sonnet-4-6");
+        assert_eq!(json_body["task_type"], "multi_round");
+        assert_eq!(json_body["context_tokens"], 1200);
+        assert_eq!(json_body["range"]["confidence"], "medium");
+        assert_eq!(json_body["route_preview"]["provider_id"], "anthropic");
+        assert_eq!(json_body["budget"]["status"], "within_limit");
+        assert_eq!(json_body["budget"]["rows"][0]["accumulated_usd"], 2.5);
     }
 
     #[tokio::test]
