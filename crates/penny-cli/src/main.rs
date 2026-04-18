@@ -12,7 +12,8 @@ use glob::glob;
 use penny_config::{load_config, LoadOptions};
 use penny_cost::{estimate_tokens, PricingEngine};
 use penny_store::{BudgetRepo, ProjectRepo, SqliteStore};
-use penny_types::{Confidence, Money, ScopeType, TaskType, WindowType};
+use penny_types::{Confidence, Event, EventType, Money, ScopeType, TaskType, WindowType};
+use reqwest::Client;
 use serde_json::Value;
 use sqlx::{query, Row};
 use thiserror::Error;
@@ -44,6 +45,18 @@ enum Commands {
         session_id: Option<String>,
         #[arg(long, default_value_t = 200)]
         max_files: usize,
+    },
+    Tail {
+        #[arg(long, default_value = "http://127.0.0.1:8586")]
+        admin_url: String,
+        #[arg(long)]
+        since_id: Option<i64>,
+        #[arg(long, default_value_t = 500)]
+        poll_ms: u64,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        #[arg(long, default_value_t = false)]
+        once: bool,
     },
     Report {
         #[command(subcommand)]
@@ -160,6 +173,15 @@ struct EstimateCommand {
     max_files: usize,
 }
 
+#[derive(Debug, Clone)]
+struct TailCommand {
+    admin_url: String,
+    since_id: Option<i64>,
+    poll_ms: u64,
+    limit: u32,
+    once: bool,
+}
+
 #[derive(Debug)]
 struct EstimateSummary<'a> {
     model: &'a str,
@@ -173,6 +195,19 @@ struct EstimateSummary<'a> {
     pricebook_snapshot: &'a Value,
     project_id: Option<&'a str>,
     session_id: Option<&'a str>,
+}
+
+#[derive(Debug, Default)]
+struct SseDecoder {
+    buffer: String,
+    current_event: Option<String>,
+    current_data: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct SseMessage {
+    event: Option<String>,
+    data: String,
 }
 
 #[derive(Debug, Error)]
@@ -193,6 +228,12 @@ enum CliError {
     NoContextFilesMatched,
     #[error("failed to read context file `{path}`: {reason}")]
     ContextFileRead { path: String, reason: String },
+    #[error("tail request failed: {0}")]
+    TailRequest(String),
+    #[error("tail endpoint returned {status}: {body}")]
+    TailStatus { status: u16, body: String },
+    #[error("tail stream parse error: {0}")]
+    TailParse(String),
 }
 
 #[tokio::main]
@@ -228,6 +269,22 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     max_files,
                 },
             )
+            .await?;
+        }
+        Commands::Tail {
+            admin_url,
+            since_id,
+            poll_ms,
+            limit,
+            once,
+        } => {
+            run_tail(TailCommand {
+                admin_url,
+                since_id,
+                poll_ms,
+                limit,
+                once,
+            })
             .await?;
         }
         Commands::Report { command } => match command {
@@ -305,6 +362,308 @@ async fn run_estimate(store: &SqliteStore, command: EstimateCommand) -> Result<(
         session_id: command.session_id.as_deref(),
     });
     Ok(())
+}
+
+async fn run_tail(command: TailCommand) -> Result<(), CliError> {
+    let url = build_tail_url(
+        &command.admin_url,
+        command.since_id,
+        command.poll_ms,
+        command.limit,
+        command.once,
+    );
+    let response = Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| CliError::TailRequest(error.to_string()))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(CliError::TailStatus {
+            status: status.as_u16(),
+            body,
+        });
+    }
+
+    let no_color = std::env::var_os("NO_COLOR").is_some();
+    let mut response = response;
+    let mut decoder = SseDecoder::default();
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| CliError::TailRequest(error.to_string()))?
+    {
+        for message in decoder.push(&chunk) {
+            print_sse_message(&message, no_color)?;
+        }
+    }
+    for message in decoder.finish() {
+        print_sse_message(&message, no_color)?;
+    }
+
+    Ok(())
+}
+
+fn build_tail_url(
+    admin_url: &str,
+    since_id: Option<i64>,
+    poll_ms: u64,
+    limit: u32,
+    once: bool,
+) -> String {
+    let mut url = format!(
+        "{}/admin/events?poll_ms={}&limit={}",
+        admin_url.trim_end_matches('/'),
+        poll_ms.max(100),
+        limit.clamp(1, 500)
+    );
+    if let Some(since_id) = since_id {
+        url.push_str("&since_id=");
+        url.push_str(&since_id.to_string());
+    }
+    if once {
+        url.push_str("&once=true");
+    }
+    url
+}
+
+fn print_sse_message(message: &SseMessage, no_color: bool) -> Result<(), CliError> {
+    let event_name = message.event.as_deref().unwrap_or("message");
+    match event_name {
+        "heartbeat" => Ok(()),
+        "error" => {
+            let payload = serde_json::from_str::<Value>(&message.data).unwrap_or(Value::Null);
+            let code = payload
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("admin_error");
+            let detail = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or(message.data.as_str());
+            let ts = Utc::now().format("%H:%M:%S");
+            println!(
+                "{}",
+                style(
+                    &format!("[{ts}] ADMIN_ERROR code={code} detail={detail}"),
+                    "31",
+                    no_color
+                )
+            );
+            Ok(())
+        }
+        "event" => {
+            let event = serde_json::from_str::<Event>(&message.data)
+                .map_err(|error| CliError::TailParse(error.to_string()))?;
+            println!("{}", format_event_line(&event, no_color));
+            Ok(())
+        }
+        _ => {
+            println!("{event_name}: {}", message.data);
+            Ok(())
+        }
+    }
+}
+
+fn format_event_line(event: &Event, no_color: bool) -> String {
+    let ts = event.created_at.format("%H:%M:%S");
+    let request = short_id(event.request_id.as_deref());
+    let session = short_id(event.session_id.as_deref());
+
+    match event.event_type {
+        EventType::BudgetCheck => {
+            let estimated = event
+                .detail
+                .get("estimated_cost_usd")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            format!(
+                "[{ts}] REQ request={} session={} est=${estimated:.6}",
+                request, session
+            )
+        }
+        EventType::BurnRateAlert => {
+            let usd_per_hour = event
+                .detail
+                .get("usd_per_hour")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let threshold = event
+                .detail
+                .get("threshold")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            style(
+                &format!(
+                    "[{ts}] BURN_RATE session={} usd_per_hour=${usd_per_hour:.2} threshold=${threshold:.2}",
+                    session
+                ),
+                "33",
+                no_color,
+            )
+        }
+        EventType::BudgetBlock => {
+            let (scope, window, accumulated, limit) = budget_block_detail(&event.detail);
+            style(
+                &format!(
+                    "[{ts}] BUDGET_BLOCK session={} scope={}/{} accumulated={} limit={}",
+                    session, scope, window, accumulated, limit
+                ),
+                "31",
+                no_color,
+            )
+        }
+        EventType::LoopDetected => {
+            let kind = event
+                .detail
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            style(
+                &format!(
+                    "[{ts}] LOOP_DETECTED session={} request={} kind={kind}",
+                    session, request
+                ),
+                "35",
+                no_color,
+            )
+        }
+        EventType::SessionPaused => style(
+            &format!(
+                "[{ts}] SESSION_PAUSED session={} reason={}",
+                session,
+                event
+                    .detail
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            ),
+            "33",
+            no_color,
+        ),
+        EventType::ProviderFailure => style(
+            &format!(
+                "[{ts}] PROVIDER_FAILURE request={} session={} provider={} status={}",
+                request,
+                session,
+                event
+                    .detail
+                    .get("provider_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                event
+                    .detail
+                    .get("http_status")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+            ),
+            "31",
+            no_color,
+        ),
+        _ => format!(
+            "[{ts}] EVENT type={:?} request={} session={}",
+            event.event_type, request, session
+        ),
+    }
+}
+
+fn budget_block_detail(detail: &Value) -> (String, String, String, String) {
+    let nested = detail.get("detail").unwrap_or(detail);
+    let scope = nested
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let window = nested
+        .get("window")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let accumulated = nested
+        .get("accumulated_usd")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "0".to_string());
+    let limit = nested
+        .get("limit_usd")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "0".to_string());
+    (scope, window, accumulated, limit)
+}
+
+fn short_id(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "(none)".to_string();
+    };
+    let mut chars = value.chars();
+    let prefix = chars.by_ref().take(12).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}..")
+    } else {
+        prefix
+    }
+}
+
+fn style(text: &str, ansi_code: &str, no_color: bool) -> String {
+    if no_color {
+        text.to_string()
+    } else {
+        format!("\u{1b}[{ansi_code}m{text}\u{1b}[0m")
+    }
+}
+
+impl SseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Vec<SseMessage> {
+        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        let mut messages = Vec::new();
+
+        while let Some(index) = self.buffer.find('\n') {
+            let mut line = self.buffer[..index].to_string();
+            self.buffer.drain(..=index);
+            if line.ends_with('\r') {
+                line.pop();
+            }
+
+            if line.is_empty() {
+                if let Some(message) = self.take_message() {
+                    messages.push(message);
+                }
+                continue;
+            }
+
+            if let Some(event) = line.strip_prefix("event:") {
+                self.current_event = Some(event.trim().to_string());
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data:") {
+                self.current_data.push(data.trim_start().to_string());
+            }
+        }
+
+        messages
+    }
+
+    fn finish(&mut self) -> Vec<SseMessage> {
+        if !self.buffer.is_empty() {
+            self.buffer.push('\n');
+            return self.push(&[]);
+        }
+        self.take_message().into_iter().collect()
+    }
+
+    fn take_message(&mut self) -> Option<SseMessage> {
+        if self.current_event.is_none() && self.current_data.is_empty() {
+            return None;
+        }
+
+        let event = self.current_event.take();
+        let data = self.current_data.join("\n");
+        self.current_data.clear();
+        Some(SseMessage { event, data })
+    }
 }
 
 async fn autodetect_project_id(store: &SqliteStore) -> Result<Option<String>, CliError> {
@@ -795,7 +1154,7 @@ mod tests {
 
     use chrono::Duration as ChronoDuration;
     use penny_store::{NewRequest, ProjectRepo, RequestRepo, UsageRecord};
-    use penny_types::{Money, UsageSource};
+    use penny_types::{EventType, Money, Severity, UsageSource};
     use tempfile::tempdir;
 
     use super::*;
@@ -898,6 +1257,83 @@ mod tests {
         let error = estimate_context(None, &[String::from("/tmp/does-not-exist/**/*.rs")], 100)
             .expect_err("expected no matches");
         assert!(matches!(error, CliError::NoContextFilesMatched));
+    }
+
+    fn event(event_type: EventType, detail: Value) -> Event {
+        Event {
+            id: 1,
+            request_id: Some("req_1234567890abcdef".to_string()),
+            session_id: Some("sess_abcdef1234567890".to_string()),
+            event_type,
+            severity: Severity::Warn,
+            detail,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn format_event_line_formats_burn_rate() {
+        let line = format_event_line(
+            &event(
+                EventType::BurnRateAlert,
+                serde_json::json!({
+                    "kind": "burn_rate",
+                    "usd_per_hour": 12.34,
+                    "threshold": 10.0
+                }),
+            ),
+            true,
+        );
+
+        assert!(line.contains("BURN_RATE"));
+        assert!(line.contains("usd_per_hour=$12.34"));
+        assert!(!line.contains("\u{1b}["));
+    }
+
+    #[test]
+    fn format_event_line_formats_budget_block_and_loop() {
+        let block_line = format_event_line(
+            &event(
+                EventType::BudgetBlock,
+                serde_json::json!({
+                    "detail": {
+                        "scope": "global:*",
+                        "window": "day",
+                        "accumulated_usd": 10.12,
+                        "limit_usd": 10.0
+                    }
+                }),
+            ),
+            true,
+        );
+        assert!(block_line.contains("BUDGET_BLOCK"));
+        assert!(block_line.contains("scope=global:*/day"));
+
+        let loop_line = format_event_line(
+            &event(
+                EventType::LoopDetected,
+                serde_json::json!({
+                    "kind": "content_similarity",
+                    "similar_count": 8
+                }),
+            ),
+            true,
+        );
+        assert!(loop_line.contains("LOOP_DETECTED"));
+        assert!(loop_line.contains("kind=content_similarity"));
+    }
+
+    #[test]
+    fn sse_decoder_parses_chunked_event() {
+        let mut decoder = SseDecoder::default();
+        let first = b"event: event\ndata: {\"id\":1";
+        let second = b",\"event_type\":\"budget_check\"}\n\n";
+
+        assert!(decoder.push(first).is_empty());
+        let messages = decoder.push(second);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].event.as_deref(), Some("event"));
+        assert!(messages[0].data.contains("\"event_type\":\"budget_check\""));
     }
 
     #[tokio::test]

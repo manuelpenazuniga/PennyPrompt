@@ -1363,6 +1363,7 @@ dependencies = [
  "penny-cost",
  "penny-store",
  "penny-types",
+ "reqwest",
  "serde_json",
  "sqlx",
  "tempfile",
