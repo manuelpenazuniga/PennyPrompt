@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "persistence_failed",
+    "message": "failed to persist request metadata"
+  }
+}

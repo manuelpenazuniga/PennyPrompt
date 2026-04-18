@@ -1,0 +1,1 @@
+[12:00:00] LOOP_DETECTED session=sess_abcdef1.. request=req_12345678.. kind=content_similarity

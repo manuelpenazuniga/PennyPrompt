@@ -1,0 +1,1 @@
+[12:00:00] BUDGET_BLOCK session=sess_abcdef1.. scope=global:*/day accumulated=10.12 limit=10.0

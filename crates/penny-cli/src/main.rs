@@ -1926,7 +1926,7 @@ fn print_summary_table(by: SummaryBy, since: Option<&str>, rows: &[SummaryRow]) 
 mod tests {
     use std::fs;
 
-    use chrono::Duration as ChronoDuration;
+    use chrono::{Duration as ChronoDuration, TimeZone};
     use penny_store::{NewRequest, ProjectRepo, RequestRepo, UsageRecord};
     use penny_types::{EventType, Money, Severity, UsageSource};
     use tempfile::tempdir;
@@ -2041,8 +2041,22 @@ mod tests {
             event_type,
             severity: Severity::Warn,
             detail,
-            created_at: Utc::now(),
+            created_at: Utc
+                .with_ymd_and_hms(2026, 4, 18, 12, 0, 0)
+                .single()
+                .expect("timestamp"),
         }
+    }
+
+    fn golden(name: &str) -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join(name);
+        fs::read_to_string(path)
+            .expect("golden file")
+            .trim_end()
+            .to_string()
     }
 
     #[test]
@@ -2108,6 +2122,56 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].event.as_deref(), Some("event"));
         assert!(messages[0].data.contains("\"event_type\":\"budget_check\""));
+    }
+
+    #[test]
+    fn golden_burn_rate_line_matches_fixture() {
+        let line = format_event_line(
+            &event(
+                EventType::BurnRateAlert,
+                serde_json::json!({
+                    "kind": "burn_rate",
+                    "usd_per_hour": 12.34,
+                    "threshold": 10.0
+                }),
+            ),
+            true,
+        );
+        assert_eq!(line, golden("burn_rate_line.txt"));
+    }
+
+    #[test]
+    fn golden_budget_block_line_matches_fixture() {
+        let line = format_event_line(
+            &event(
+                EventType::BudgetBlock,
+                serde_json::json!({
+                    "detail": {
+                        "scope": "global:*",
+                        "window": "day",
+                        "accumulated_usd": 10.12,
+                        "limit_usd": 10.0
+                    }
+                }),
+            ),
+            true,
+        );
+        assert_eq!(line, golden("budget_block_line.txt"));
+    }
+
+    #[test]
+    fn golden_loop_line_matches_fixture() {
+        let line = format_event_line(
+            &event(
+                EventType::LoopDetected,
+                serde_json::json!({
+                    "kind": "content_similarity",
+                    "similar_count": 8
+                }),
+            ),
+            true,
+        );
+        assert_eq!(line, golden("loop_detected_line.txt"));
     }
 
     #[tokio::test]
