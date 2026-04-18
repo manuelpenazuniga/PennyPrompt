@@ -9,10 +9,10 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use glob::glob;
-use penny_config::{load_config, LoadOptions};
-use penny_cost::{estimate_tokens, PricingEngine};
+use penny_config::{load_config, LoadOptions, PRESET_EXPLORE, PRESET_INDIE, PRESET_TEAM};
+use penny_cost::{estimate_tokens, import_pricebook_files, PricingEngine};
 use penny_store::{BudgetRepo, ProjectRepo, SqliteStore};
-use penny_types::{Confidence, Event, EventType, Money, ScopeType, TaskType, WindowType};
+use penny_types::{Budget, Confidence, Event, EventType, Money, ScopeType, TaskType, WindowType};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -31,6 +31,25 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    Init {
+        #[arg(long, default_value = PRESET_INDIE)]
+        preset: String,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    Doctor,
+    Config {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Prices {
+        #[command(subcommand)]
+        command: PricesCommands,
+    },
+    Budget {
+        #[command(subcommand)]
+        command: BudgetCommands,
+    },
     Estimate {
         #[arg(long)]
         model: String,
@@ -77,6 +96,10 @@ enum ReportCommands {
         #[arg(long, value_enum, default_value_t = SummaryBy::Project)]
         by: SummaryBy,
     },
+    Top {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -94,6 +117,44 @@ enum DetectCommands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum PricesCommands {
+    Show {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    Update,
+}
+
+#[derive(Debug, Subcommand)]
+enum BudgetCommands {
+    List,
+    Set {
+        #[arg(long, value_enum)]
+        scope_type: BudgetScopeArg,
+        #[arg(long)]
+        scope_id: String,
+        #[arg(long, value_enum)]
+        window_type: BudgetWindowArg,
+        #[arg(long)]
+        hard_limit_usd: Option<f64>,
+        #[arg(long)]
+        soft_limit_usd: Option<f64>,
+        #[arg(long, default_value = "block")]
+        action_on_hard: String,
+        #[arg(long, default_value = "warn")]
+        action_on_soft: String,
+    },
+    Reset {
+        #[arg(long, value_enum)]
+        scope_type: BudgetScopeArg,
+        #[arg(long)]
+        scope_id: String,
+        #[arg(long, value_enum)]
+        window_type: BudgetWindowArg,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SummaryBy {
     Project,
@@ -106,6 +167,21 @@ enum EstimateTaskType {
     SinglePass,
     MultiRound,
     AgentTask,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BudgetScopeArg {
+    Global,
+    Project,
+    Session,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BudgetWindowArg {
+    Day,
+    Week,
+    Month,
+    Total,
 }
 
 impl EstimateTaskType {
@@ -122,6 +198,27 @@ impl EstimateTaskType {
             Self::SinglePass => "single_pass",
             Self::MultiRound => "multi_round",
             Self::AgentTask => "agent_task",
+        }
+    }
+}
+
+impl BudgetScopeArg {
+    fn as_scope_type(self) -> ScopeType {
+        match self {
+            Self::Global => ScopeType::Global,
+            Self::Project => ScopeType::Project,
+            Self::Session => ScopeType::Session,
+        }
+    }
+}
+
+impl BudgetWindowArg {
+    fn as_window_type(self) -> WindowType {
+        match self {
+            Self::Day => WindowType::Day,
+            Self::Week => WindowType::Week,
+            Self::Month => WindowType::Month,
+            Self::Total => WindowType::Total,
         }
     }
 }
@@ -143,6 +240,39 @@ struct SummaryRow {
     input_tokens: i64,
     output_tokens: i64,
     total_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TopRow {
+    request_id: String,
+    project_id: String,
+    session_id: Option<String>,
+    model: String,
+    provider_id: String,
+    started_at: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cost_usd: f64,
+    source: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PricebookRow {
+    model_id: String,
+    source: String,
+    input_per_mtok_usd: f64,
+    output_per_mtok_usd: f64,
+    effective_from: String,
+}
+
+#[derive(Debug)]
+struct DoctorReport {
+    config_ok: bool,
+    db_ok: bool,
+    anthropic_key_present: bool,
+    openai_key_present: bool,
+    active_pricebook_models: i64,
+    budgets_configured: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +412,8 @@ enum CliError {
     DetectStatus { status: u16, body: String },
     #[error("detect payload parse error: {0}")]
     DetectParse(String),
+    #[error("init error: {0}")]
+    Init(String),
 }
 
 #[tokio::main]
@@ -296,6 +428,56 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), CliError> {
     let store = open_store(cli.database).await?;
     match cli.command {
+        Commands::Init { preset, force } => {
+            run_init(&preset, force)?;
+        }
+        Commands::Doctor => {
+            run_doctor(&store).await?;
+        }
+        Commands::Config { json } => {
+            run_config(json)?;
+        }
+        Commands::Prices { command } => match command {
+            PricesCommands::Show { limit } => {
+                run_prices_show(&store, limit).await?;
+            }
+            PricesCommands::Update => {
+                run_prices_update(&store).await?;
+            }
+        },
+        Commands::Budget { command } => match command {
+            BudgetCommands::List => {
+                run_budget_list(&store).await?;
+            }
+            BudgetCommands::Set {
+                scope_type,
+                scope_id,
+                window_type,
+                hard_limit_usd,
+                soft_limit_usd,
+                action_on_hard,
+                action_on_soft,
+            } => {
+                run_budget_set(
+                    &store,
+                    scope_type,
+                    &scope_id,
+                    window_type,
+                    hard_limit_usd,
+                    soft_limit_usd,
+                    &action_on_hard,
+                    &action_on_soft,
+                )
+                .await?;
+            }
+            BudgetCommands::Reset {
+                scope_type,
+                scope_id,
+                window_type,
+            } => {
+                run_budget_reset(&store, scope_type, &scope_id, window_type).await?;
+            }
+        },
         Commands::Estimate {
             model,
             task_type,
@@ -366,8 +548,293 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 let rows = fetch_summary_rows(&store, by, cutoff).await?;
                 print_summary_table(by, since.as_deref(), &rows);
             }
+            ReportCommands::Top { limit } => {
+                run_report_top(&store, limit).await?;
+            }
         },
     }
+    Ok(())
+}
+
+fn run_init(preset: &str, force: bool) -> Result<(), CliError> {
+    validate_preset(preset)?;
+    let target = resolve_user_config_target()?;
+    if target.exists() && !force {
+        return Err(CliError::Init(format!(
+            "config already exists at {} (use --force to overwrite)",
+            target.display()
+        )));
+    }
+
+    let source = std::env::current_dir()
+        .map_err(|error| CliError::Init(error.to_string()))?
+        .join("presets")
+        .join(format!("{preset}.toml"));
+    let raw = fs::read_to_string(&source).map_err(|error| {
+        CliError::Init(format!(
+            "failed to read preset {}: {}",
+            source.display(),
+            error
+        ))
+    })?;
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            CliError::Init(format!("failed creating {}: {error}", parent.display()))
+        })?;
+    }
+    fs::write(&target, raw)
+        .map_err(|error| CliError::Init(format!("failed writing {}: {error}", target.display())))?;
+
+    println!("Initialized config from preset `{preset}`");
+    println!("  path: {}", target.display());
+    println!("  next: run `pennyprompt doctor` then `pennyprompt report summary --since 1d`");
+    Ok(())
+}
+
+async fn run_doctor(store: &SqliteStore) -> Result<(), CliError> {
+    let config =
+        load_config(LoadOptions::default()).map_err(|error| CliError::Config(error.to_string()))?;
+    let db_ok = query_scalar_one(store, "SELECT 1").await.is_ok();
+    let active_pricebook_models = query_scalar_i64(
+        store,
+        "SELECT COUNT(DISTINCT model_id) FROM pricebook_entries WHERE datetime(effective_from) <= datetime('now') AND (effective_until IS NULL OR datetime(effective_until) > datetime('now'))",
+    )
+    .await
+    .unwrap_or(0);
+    let budgets_configured = query_scalar_i64(store, "SELECT COUNT(*) FROM budgets")
+        .await
+        .unwrap_or(0);
+
+    let anthropic_key_present = !config.providers.anthropic.api_key_env.trim().is_empty()
+        && std::env::var(&config.providers.anthropic.api_key_env)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+    let openai_key_present = !config.providers.openai.api_key_env.trim().is_empty()
+        && std::env::var(&config.providers.openai.api_key_env)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+
+    let report = DoctorReport {
+        config_ok: true,
+        db_ok,
+        anthropic_key_present,
+        openai_key_present,
+        active_pricebook_models,
+        budgets_configured,
+    };
+    print_doctor_report(&report, &config.server.database_path);
+    Ok(())
+}
+
+fn run_config(as_json: bool) -> Result<(), CliError> {
+    let config =
+        load_config(LoadOptions::default()).map_err(|error| CliError::Config(error.to_string()))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&config)
+                .map_err(|error| CliError::Config(error.to_string()))?
+        );
+    } else {
+        println!(
+            "{}",
+            toml::to_string_pretty(&config).map_err(|error| CliError::Config(error.to_string()))?
+        );
+    }
+    Ok(())
+}
+
+async fn run_prices_show(store: &SqliteStore, limit: u32) -> Result<(), CliError> {
+    let rows = fetch_pricebook_rows(store, limit).await?;
+    if rows.is_empty() {
+        println!("No active pricebook entries found.");
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL).set_header([
+        Cell::new("model").add_attribute(Attribute::Bold),
+        Cell::new("source").add_attribute(Attribute::Bold),
+        Cell::new("input_per_mtok").add_attribute(Attribute::Bold),
+        Cell::new("output_per_mtok").add_attribute(Attribute::Bold),
+        Cell::new("effective_from").add_attribute(Attribute::Bold),
+    ]);
+    for row in rows {
+        table.add_row([
+            Cell::new(row.model_id),
+            Cell::new(row.source),
+            Cell::new(format!("{:.6}", row.input_per_mtok_usd)),
+            Cell::new(format!("{:.6}", row.output_per_mtok_usd)),
+            Cell::new(row.effective_from),
+        ]);
+    }
+
+    println!("Active pricebook entries");
+    println!("{table}");
+    Ok(())
+}
+
+async fn run_prices_update(store: &SqliteStore) -> Result<(), CliError> {
+    let root = std::env::current_dir().map_err(|error| CliError::Store(error.to_string()))?;
+    let anthropic = root.join("prices/anthropic.toml");
+    let openai = root.join("prices/openai.toml");
+    let imported = import_pricebook_files(store, &[anthropic, openai])
+        .await
+        .map_err(|error| CliError::Cost(error.to_string()))?;
+    println!("Pricebook update completed");
+    println!("  imported_entries: {imported}");
+    Ok(())
+}
+
+async fn run_budget_list(store: &SqliteStore) -> Result<(), CliError> {
+    let budgets = store
+        .list_all()
+        .await
+        .map_err(|error| CliError::Store(error.to_string()))?;
+    if budgets.is_empty() {
+        println!("No budgets configured.");
+        return Ok(());
+    }
+    let totals = fetch_latest_running_totals(store).await?;
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL).set_header([
+        Cell::new("id").add_attribute(Attribute::Bold),
+        Cell::new("scope").add_attribute(Attribute::Bold),
+        Cell::new("window").add_attribute(Attribute::Bold),
+        Cell::new("hard_limit").add_attribute(Attribute::Bold),
+        Cell::new("soft_limit").add_attribute(Attribute::Bold),
+        Cell::new("accumulated").add_attribute(Attribute::Bold),
+    ]);
+    for budget in budgets {
+        let accumulated = totals.get(&budget.id).copied().unwrap_or(Money::ZERO);
+        table.add_row([
+            Cell::new(budget.id),
+            Cell::new(format!("{:?}:{}", budget.scope_type, budget.scope_id)),
+            Cell::new(format!("{:?}", budget.window_type)),
+            Cell::new(
+                budget
+                    .hard_limit_usd
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            Cell::new(
+                budget
+                    .soft_limit_usd
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            Cell::new(accumulated.to_string()),
+        ]);
+    }
+
+    println!("Budgets");
+    println!("{table}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_budget_set(
+    store: &SqliteStore,
+    scope_type: BudgetScopeArg,
+    scope_id: &str,
+    window_type: BudgetWindowArg,
+    hard_limit_usd: Option<f64>,
+    soft_limit_usd: Option<f64>,
+    action_on_hard: &str,
+    action_on_soft: &str,
+) -> Result<(), CliError> {
+    let hard_limit_usd = hard_limit_usd
+        .map(Money::from_usd)
+        .transpose()
+        .map_err(|error| CliError::Store(error.to_string()))?;
+    let soft_limit_usd = soft_limit_usd
+        .map(Money::from_usd)
+        .transpose()
+        .map_err(|error| CliError::Store(error.to_string()))?;
+
+    let budget = Budget {
+        id: 0,
+        scope_type: scope_type.as_scope_type(),
+        scope_id: scope_id.to_string(),
+        window_type: window_type.as_window_type(),
+        hard_limit_usd,
+        soft_limit_usd,
+        action_on_hard: action_on_hard.to_string(),
+        action_on_soft: action_on_soft.to_string(),
+        preset_source: Some("cli".to_string()),
+    };
+    let stored = store
+        .upsert(&budget)
+        .await
+        .map_err(|error| CliError::Store(error.to_string()))?;
+
+    println!("Budget upserted");
+    println!(
+        "  id={} scope={:?}:{} window={:?} hard={:?} soft={:?}",
+        stored.id,
+        stored.scope_type,
+        stored.scope_id,
+        stored.window_type,
+        stored.hard_limit_usd,
+        stored.soft_limit_usd
+    );
+    Ok(())
+}
+
+async fn run_budget_reset(
+    store: &SqliteStore,
+    scope_type: BudgetScopeArg,
+    scope_id: &str,
+    window_type: BudgetWindowArg,
+) -> Result<(), CliError> {
+    let affected = query(
+        r#"
+        DELETE FROM budgets
+        WHERE scope_type = ?1 AND scope_id = ?2 AND window_type = ?3
+        "#,
+    )
+    .bind(scope_type_db(scope_type.as_scope_type()))
+    .bind(scope_id)
+    .bind(window_type_db(window_type.as_window_type()))
+    .execute(store.pool())
+    .await
+    .map_err(|error| CliError::Store(error.to_string()))?
+    .rows_affected();
+
+    println!("Budget reset");
+    println!("  removed_rows: {affected}");
+    Ok(())
+}
+
+async fn run_report_top(store: &SqliteStore, limit: u32) -> Result<(), CliError> {
+    let rows = fetch_top_rows(store, limit).await?;
+    if rows.is_empty() {
+        println!("No usage rows found for report top.");
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL).set_header([
+        Cell::new("request_id").add_attribute(Attribute::Bold),
+        Cell::new("project").add_attribute(Attribute::Bold),
+        Cell::new("model").add_attribute(Attribute::Bold),
+        Cell::new("tokens").add_attribute(Attribute::Bold),
+        Cell::new("cost_usd").add_attribute(Attribute::Bold),
+    ]);
+    for row in rows {
+        table.add_row([
+            Cell::new(row.request_id),
+            Cell::new(row.project_id),
+            Cell::new(row.model),
+            Cell::new(format!("{}/{}", row.input_tokens, row.output_tokens)),
+            Cell::new(format!("{:.6}", row.cost_usd)),
+        ]);
+    }
+
+    println!("Top requests by cost");
+    println!("{table}");
     Ok(())
 }
 
@@ -558,6 +1025,160 @@ async fn run_detect_resume(
         println!("Detect resume response: {parsed}");
     }
     Ok(())
+}
+
+fn validate_preset(preset: &str) -> Result<(), CliError> {
+    match preset {
+        PRESET_INDIE | PRESET_TEAM | PRESET_EXPLORE => Ok(()),
+        _ => Err(CliError::Init(format!(
+            "invalid preset `{preset}` (expected: {PRESET_INDIE}|{PRESET_TEAM}|{PRESET_EXPLORE})"
+        ))),
+    }
+}
+
+fn resolve_user_config_target() -> Result<PathBuf, CliError> {
+    if let Ok(path) = std::env::var("PENNY_CONFIG") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    let home = std::env::var("HOME").map_err(|_| CliError::Init("HOME not set".to_string()))?;
+    Ok(PathBuf::from(home).join(".config/pennyprompt/config.toml"))
+}
+
+fn print_doctor_report(report: &DoctorReport, database_path: &str) {
+    println!("Doctor");
+    println!("  config: {}", if report.config_ok { "ok" } else { "fail" });
+    println!("  database: {}", if report.db_ok { "ok" } else { "fail" });
+    println!("  database_path: {database_path}");
+    println!(
+        "  anthropic_api_key: {}",
+        if report.anthropic_key_present {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  openai_api_key: {}",
+        if report.openai_key_present {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  active_pricebook_models: {}",
+        report.active_pricebook_models
+    );
+    println!("  budgets_configured: {}", report.budgets_configured);
+}
+
+async fn fetch_pricebook_rows(
+    store: &SqliteStore,
+    limit: u32,
+) -> Result<Vec<PricebookRow>, CliError> {
+    let rows = query(
+        r#"
+        SELECT model_id, source, input_per_mtok_micros, output_per_mtok_micros, effective_from
+        FROM pricebook_entries
+        WHERE datetime(effective_from) <= datetime('now')
+          AND (effective_until IS NULL OR datetime(effective_until) > datetime('now'))
+        ORDER BY model_id ASC, datetime(effective_from) DESC
+        LIMIT ?1
+        "#,
+    )
+    .bind(i64::from(limit.clamp(1, 500)))
+    .fetch_all(store.pool())
+    .await
+    .map_err(|error| CliError::Store(error.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| PricebookRow {
+            model_id: row.get("model_id"),
+            source: row.get("source"),
+            input_per_mtok_usd: Money::from_micros(row.get("input_per_mtok_micros")).to_usd(),
+            output_per_mtok_usd: Money::from_micros(row.get("output_per_mtok_micros")).to_usd(),
+            effective_from: row.get("effective_from"),
+        })
+        .collect())
+}
+
+async fn fetch_top_rows(store: &SqliteStore, limit: u32) -> Result<Vec<TopRow>, CliError> {
+    let rows = query(
+        r#"
+        SELECT
+            requests.id AS request_id,
+            requests.project_id,
+            requests.session_id,
+            requests.model_used,
+            requests.provider_id,
+            requests.started_at,
+            request_usage.input_tokens,
+            request_usage.output_tokens,
+            request_usage.cost_micros,
+            request_usage.source
+        FROM requests
+        JOIN request_usage ON request_usage.request_id = requests.id
+        ORDER BY request_usage.cost_micros DESC, requests.started_at DESC
+        LIMIT ?1
+        "#,
+    )
+    .bind(i64::from(limit.clamp(1, 500)))
+    .fetch_all(store.pool())
+    .await
+    .map_err(|error| CliError::Store(error.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| TopRow {
+            request_id: row.get("request_id"),
+            project_id: row.get("project_id"),
+            session_id: row.get("session_id"),
+            model: row.get("model_used"),
+            provider_id: row.get("provider_id"),
+            started_at: row.get("started_at"),
+            input_tokens: row.get("input_tokens"),
+            output_tokens: row.get("output_tokens"),
+            cost_usd: Money::from_micros(row.get("cost_micros")).to_usd(),
+            source: row.get("source"),
+        })
+        .collect())
+}
+
+async fn query_scalar_i64(store: &SqliteStore, sql: &str) -> Result<i64, CliError> {
+    query(sql)
+        .fetch_one(store.pool())
+        .await
+        .map(|row| row.get::<i64, _>(0))
+        .map_err(|error| CliError::Store(error.to_string()))
+}
+
+async fn query_scalar_one(store: &SqliteStore, sql: &str) -> Result<i64, CliError> {
+    query(sql)
+        .fetch_one(store.pool())
+        .await
+        .map(|row| row.get::<i64, _>(0))
+        .map_err(|error| CliError::Store(error.to_string()))
+}
+
+fn scope_type_db(scope_type: ScopeType) -> &'static str {
+    match scope_type {
+        ScopeType::Global => "global",
+        ScopeType::Project => "project",
+        ScopeType::Session => "session",
+    }
+}
+
+fn window_type_db(window_type: WindowType) -> &'static str {
+    match window_type {
+        WindowType::Day => "day",
+        WindowType::Week => "week",
+        WindowType::Month => "month",
+        WindowType::Total => "total",
+    }
 }
 
 fn build_tail_url(
