@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -18,8 +19,10 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
+use penny_config::LoopAction;
 use penny_cost::{estimate_tokens, PricingEngine};
-use penny_store::{BudgetRepo, SqliteStore, StoreError};
+use penny_detect::{DetectEngine, DetectStatus};
+use penny_store::{BudgetRepo, EventRepo, NewEvent, SqliteStore, StoreError};
 use penny_types::{
     Budget, CostRange, Event, EventType, Money, ScopeType, Severity, TaskType, WindowType,
 };
@@ -32,6 +35,7 @@ use tracing::error;
 #[derive(Debug, Clone)]
 pub struct AdminState {
     store: SqliteStore,
+    detector: Arc<DetectEngine>,
     started_at: Instant,
     event_poll_interval: Duration,
     event_batch_size: u32,
@@ -41,10 +45,22 @@ impl AdminState {
     pub fn new(store: SqliteStore) -> Self {
         Self {
             store,
+            detector: Arc::new(DetectEngine::new(penny_detect::DetectorConfig {
+                enabled: false,
+                burn_rate_alert_usd_per_hour: 10.0,
+                loop_window_seconds: 120,
+                loop_threshold_similar_requests: 8,
+                loop_action: LoopAction::Alert,
+            })),
             started_at: Instant::now(),
             event_poll_interval: Duration::from_millis(500),
             event_batch_size: 100,
         }
+    }
+
+    pub fn with_detector(mut self, detector: Arc<DetectEngine>) -> Self {
+        self.detector = detector;
+        self
     }
 
     pub fn with_event_poll_interval(mut self, interval: Duration) -> Self {
@@ -182,6 +198,19 @@ struct EventsQuery {
 }
 
 #[derive(Debug, Serialize)]
+struct DetectStatusResponse {
+    enabled: bool,
+    paused_sessions: Vec<penny_detect::PausedSession>,
+    active_alerts: Vec<penny_detect::SessionAlert>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DetectResumePayload {
+    session_id: String,
+    request_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct AdminHealth {
     status: &'static str,
     uptime_seconds: u64,
@@ -260,6 +289,8 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/admin/report/top", get(get_report_top))
         .route("/admin/budgets", get(get_budgets).post(post_budgets))
         .route("/admin/estimate", post(post_estimate))
+        .route("/admin/detect/status", get(get_detect_status))
+        .route("/admin/detect/resume", post(post_detect_resume))
         .route("/admin/events", get(get_events))
         .with_state(state)
 }
@@ -656,6 +687,66 @@ async fn post_estimate(
     .into_response()
 }
 
+async fn get_detect_status(State(state): State<AdminState>) -> Response {
+    let status = state.detector.status();
+    Json(detect_status_response(
+        state.detector.config().enabled,
+        status,
+    ))
+    .into_response()
+}
+
+async fn post_detect_resume(
+    State(state): State<AdminState>,
+    Json(payload): Json<DetectResumePayload>,
+) -> Response {
+    let session_id = payload.session_id.trim();
+    if session_id.is_empty() {
+        return api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "detect_resume_invalid_session",
+            "session_id is required".to_string(),
+        );
+    }
+
+    let Some(event) = state
+        .detector
+        .resume_session(session_id, payload.request_id.as_deref())
+    else {
+        return api_error(
+            axum::http::StatusCode::NOT_FOUND,
+            "detect_session_not_paused",
+            format!("session `{session_id}` is not paused"),
+        );
+    };
+
+    if let Err(error) = EventRepo::insert(
+        &state.store,
+        &NewEvent {
+            request_id: event.request_id.clone(),
+            session_id: Some(event.session_id.clone()),
+            event_type: event.event_type.clone(),
+            severity: event.severity.clone(),
+            detail: event.detail.clone(),
+        },
+    )
+    .await
+    {
+        return api_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "detect_resume_persist_failed",
+            error.to_string(),
+        );
+    }
+
+    Json(json!({
+        "resumed": true,
+        "session_id": session_id,
+        "event": event
+    }))
+    .into_response()
+}
+
 async fn get_events(
     State(state): State<AdminState>,
     Query(query_params): Query<EventsQuery>,
@@ -952,6 +1043,14 @@ fn parse_db_datetime(value: String, field: &'static str) -> Result<DateTime<Utc>
     Err(StoreError::InvalidTimestamp { field, value })
 }
 
+fn detect_status_response(enabled: bool, status: DetectStatus) -> DetectStatusResponse {
+    DetectStatusResponse {
+        enabled,
+        paused_sessions: status.paused_sessions,
+        active_alerts: status.active_alerts,
+    }
+}
+
 fn default_task_type() -> TaskType {
     TaskType::SinglePass
 }
@@ -984,16 +1083,21 @@ fn log_internal_error(tag: &str, detail: String) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use axum::{
         body::{to_bytes, Body},
         http::{header, Request, StatusCode},
     };
+    use penny_config::LoopAction;
+    use penny_detect::{DetectEngine, DetectorConfig};
     use penny_proxy::{build_router as build_proxy_router, ProxyState};
     use penny_store::{
         BudgetRepo, EventRepo, NewEvent, NewRequest, ProjectRepo, RequestRepo, SessionRepo,
         UsageRecord,
     };
+    use penny_types::RequestDigest;
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
@@ -1115,6 +1219,33 @@ mod tests {
         .execute(store.pool())
         .await
         .expect("insert pricebook");
+    }
+
+    fn detector_with_paused_session(session_id: &str) -> Arc<DetectEngine> {
+        let detector = Arc::new(DetectEngine::new(DetectorConfig {
+            enabled: true,
+            burn_rate_alert_usd_per_hour: 9999.0,
+            loop_window_seconds: 120,
+            loop_threshold_similar_requests: 2,
+            loop_action: LoopAction::Pause,
+        }));
+        let now = Utc::now();
+        let digest = |timestamp: DateTime<Utc>| RequestDigest {
+            model: "claude-sonnet-4-6".to_string(),
+            input_tokens: 100,
+            cost_usd: Money::from_usd(0.1).expect("money"),
+            tool_name: None,
+            tool_succeeded: true,
+            content_hash: 42,
+            timestamp,
+        };
+        detector.feed(session_id, Some("req-a"), digest(now));
+        detector.feed(
+            session_id,
+            Some("req-b"),
+            digest(now + chrono::Duration::seconds(2)),
+        );
+        detector
     }
 
     #[tokio::test]
@@ -1301,6 +1432,102 @@ mod tests {
         assert_eq!(json_body["route_preview"]["provider_id"], "anthropic");
         assert_eq!(json_body["budget"]["status"], "within_limit");
         assert_eq!(json_body["budget"]["rows"][0]["accumulated_usd"], 2.5);
+    }
+
+    #[tokio::test]
+    async fn detect_status_lists_paused_sessions_and_active_alerts() {
+        let store = setup_store().await;
+        let detector = detector_with_paused_session("sess-detect-a");
+        let app = build_router(AdminState::new(store).with_detector(detector));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/detect/status")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json_body["enabled"], true);
+        assert_eq!(
+            json_body["paused_sessions"][0]["session_id"],
+            "sess-detect-a"
+        );
+        assert_eq!(
+            json_body["paused_sessions"][0]["reason"],
+            "session_paused_loop_detected"
+        );
+        assert_eq!(json_body["active_alerts"][0]["session_id"], "sess-detect-a");
+    }
+
+    #[tokio::test]
+    async fn detect_resume_clears_paused_session_and_persists_event() {
+        let store = setup_store().await;
+        let detector = detector_with_paused_session("sess-detect-b");
+        let app = build_router(AdminState::new(store.clone()).with_detector(detector));
+
+        let resume_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/detect/resume")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_id": "sess-detect-b",
+                            "request_id": "req-resume-cli"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(resume_response.status(), StatusCode::OK);
+        let body = to_bytes(resume_response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let resume_json: Value = serde_json::from_slice(&body).expect("resume json");
+        assert_eq!(resume_json["resumed"], true);
+        assert_eq!(resume_json["session_id"], "sess-detect-b");
+
+        let status_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/detect/status")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("response");
+        let body = to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let status_json: Value = serde_json::from_slice(&body).expect("status json");
+        assert!(status_json["paused_sessions"]
+            .as_array()
+            .expect("array")
+            .is_empty());
+
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM events WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind("sess-detect-b")
+        .fetch_all(store.pool())
+        .await
+        .expect("event rows");
+        assert!(rows.iter().any(|row| row == "session_resumed"));
     }
 
     #[tokio::test]
