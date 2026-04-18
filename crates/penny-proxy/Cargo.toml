@@ -9,6 +9,7 @@ axum = "0.8"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 penny-cost = { path = "../penny-cost" }
+penny-detect = { path = "../penny-detect" }
 penny-budget = { path = "../penny-budget" }
 penny-config = { path = "../penny-config" }
 penny-ledger = { path = "../penny-ledger" }

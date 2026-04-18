@@ -1438,6 +1438,7 @@ dependencies = [
  "penny-budget",
  "penny-config",
  "penny-cost",
+ "penny-detect",
  "penny-ledger",
  "penny-providers",
  "penny-store",
