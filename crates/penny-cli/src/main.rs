@@ -11,10 +11,10 @@ use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use glob::glob;
 use penny_config::{load_config, LoadOptions, PRESET_EXPLORE, PRESET_INDIE, PRESET_TEAM};
 use penny_cost::{estimate_tokens, import_pricebook_files, PricingEngine};
-use penny_store::{BudgetRepo, ProjectRepo, SqliteStore};
+use penny_store::{BudgetRepo, ProjectRepo, SessionRepo, SqliteStore};
 use penny_types::{Budget, Confidence, Event, EventType, Money, ScopeType, TaskType, WindowType};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{query, Row};
 use thiserror::Error;
@@ -69,6 +69,19 @@ enum Commands {
     Detect {
         #[command(subcommand)]
         command: DetectCommands,
+    },
+    Run {
+        agent: String,
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     Tail {
         #[arg(long, default_value = "http://127.0.0.1:8586")]
@@ -332,6 +345,29 @@ struct TailCommand {
     once: bool,
 }
 
+#[derive(Debug, Clone)]
+struct RunCommand {
+    agent: String,
+    execute: bool,
+    project_id: Option<String>,
+    session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    as_json: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct LaunchPlan {
+    mode: String,
+    agent: String,
+    project_id: String,
+    session_id: String,
+    cwd: String,
+    proxy_bind: String,
+    admin_socket: String,
+    database_path: String,
+    config_path: String,
+}
+
 #[derive(Debug)]
 struct EstimateSummary<'a> {
     model: &'a str,
@@ -412,6 +448,8 @@ enum CliError {
     DetectStatus { status: u16, body: String },
     #[error("detect payload parse error: {0}")]
     DetectParse(String),
+    #[error("run command error: {0}")]
+    Run(String),
     #[error("init error: {0}")]
     Init(String),
 }
@@ -497,6 +535,27 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     project_id,
                     session_id,
                     max_files,
+                },
+            )
+            .await?;
+        }
+        Commands::Run {
+            agent,
+            execute,
+            project_id,
+            session_id,
+            cwd,
+            json,
+        } => {
+            run_launcher(
+                &store,
+                RunCommand {
+                    agent,
+                    execute,
+                    project_id,
+                    session_id,
+                    cwd,
+                    as_json: json,
                 },
             )
             .await?;
@@ -889,6 +948,155 @@ async fn run_estimate(store: &SqliteStore, command: EstimateCommand) -> Result<(
         session_id: command.session_id.as_deref(),
     });
     Ok(())
+}
+
+async fn run_launcher(store: &SqliteStore, command: RunCommand) -> Result<(), CliError> {
+    let agent = normalize_required_arg(&command.agent, "agent")?;
+    if command.execute {
+        return Err(CliError::Run(
+            "execute mode is not implemented yet. Rerun without --execute for deterministic dry-run output.".to_string(),
+        ));
+    }
+
+    let config =
+        load_config(LoadOptions::default()).map_err(|error| CliError::Config(error.to_string()))?;
+    let cwd = if let Some(path) = command.cwd {
+        path
+    } else {
+        std::env::current_dir().map_err(|error| CliError::Run(error.to_string()))?
+    };
+    let project_id = resolve_launch_project_id(
+        store,
+        &cwd,
+        command.project_id.as_deref(),
+        config.attribution.auto_detect_project,
+    )
+    .await?;
+    let session_id = resolve_launch_session_id(
+        store,
+        &project_id,
+        command.session_id.as_deref(),
+        config.attribution.session_window_minutes as u64,
+    )
+    .await?;
+    let config_path = resolve_user_config_target()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "(unresolved)".to_string());
+    let plan = LaunchPlan {
+        mode: "dry_run".to_string(),
+        agent,
+        project_id,
+        session_id,
+        cwd: cwd.display().to_string(),
+        proxy_bind: config.server.bind,
+        admin_socket: config.server.admin_socket,
+        database_path: config.server.database_path,
+        config_path,
+    };
+
+    if command.as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan)
+                .map_err(|error| CliError::Run(error.to_string()))?
+        );
+    } else {
+        println!("{}", render_launch_plan(&plan));
+    }
+    Ok(())
+}
+
+async fn resolve_launch_project_id(
+    store: &SqliteStore,
+    cwd: &Path,
+    project_override: Option<&str>,
+    auto_detect_project: bool,
+) -> Result<String, CliError> {
+    if let Some(project_id) = project_override {
+        return normalize_required_arg(project_id, "project_id");
+    }
+    if !auto_detect_project {
+        return Ok("default".to_string());
+    }
+
+    let cwd_text = cwd.display().to_string();
+    let project = store
+        .get_by_path(&cwd_text)
+        .await
+        .map_err(|error| CliError::Store(error.to_string()))?;
+    if let Some(project) = project {
+        return Ok(project.id);
+    }
+    Ok(default_project_id_from_cwd(cwd))
+}
+
+async fn resolve_launch_session_id(
+    store: &SqliteStore,
+    project_id: &str,
+    session_override: Option<&str>,
+    session_window_minutes: u64,
+) -> Result<String, CliError> {
+    if let Some(session_id) = session_override {
+        return normalize_required_arg(session_id, "session_id");
+    }
+
+    let session = store
+        .find_active(project_id, session_window_minutes.max(1))
+        .await
+        .map_err(|error| CliError::Store(error.to_string()))?;
+    Ok(session.unwrap_or_else(|| "session-auto".to_string()))
+}
+
+fn normalize_required_arg(raw: &str, field: &str) -> Result<String, CliError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(CliError::Run(format!("`{field}` must not be empty")));
+    }
+    Ok(value.to_string())
+}
+
+fn default_project_id_from_cwd(cwd: &Path) -> String {
+    let seed = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("default");
+    let mut slug = String::with_capacity(seed.len());
+    for ch in seed.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if normalized == '-' {
+            if slug.ends_with('-') {
+                continue;
+            }
+            slug.push('-');
+            continue;
+        }
+        slug.push(normalized);
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "default".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn render_launch_plan(plan: &LaunchPlan) -> String {
+    format!(
+        "Run launcher plan\n  mode: {}\n  agent: {}\n  project_id: {}\n  session_id: {}\n  cwd: {}\n  proxy_bind: {}\n  admin_socket: {}\n  database_path: {}\n  config_path: {}",
+        plan.mode,
+        plan.agent,
+        plan.project_id,
+        plan.session_id,
+        plan.cwd,
+        plan.proxy_bind,
+        plan.admin_socket,
+        plan.database_path,
+        plan.config_path
+    )
 }
 
 async fn run_tail(command: TailCommand) -> Result<(), CliError> {
@@ -1925,6 +2133,7 @@ fn print_summary_table(by: SummaryBy, since: Option<&str>, rows: &[SummaryRow]) 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use chrono::{Duration as ChronoDuration, TimeZone};
     use penny_store::{NewRequest, ProjectRepo, RequestRepo, UsageRecord};
@@ -2269,5 +2478,41 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!((rows[0].total_cost_usd - 2.0).abs() < 1e-9);
         assert_eq!(rows[0].request_count, 1);
+    }
+
+    #[test]
+    fn normalize_required_arg_rejects_empty_values() {
+        let error = normalize_required_arg("   ", "agent").expect_err("must fail");
+        assert!(matches!(error, CliError::Run(_)));
+    }
+
+    #[test]
+    fn default_project_id_from_cwd_slugifies_deterministically() {
+        let cwd = Path::new("/tmp/My Project__CLI!");
+        assert_eq!(default_project_id_from_cwd(cwd), "my-project-cli");
+
+        let only_symbols = Path::new("/tmp/___");
+        assert_eq!(default_project_id_from_cwd(only_symbols), "default");
+    }
+
+    #[test]
+    fn render_launch_plan_text_is_stable() {
+        let plan = LaunchPlan {
+            mode: "dry_run".to_string(),
+            agent: "codex".to_string(),
+            project_id: "my-project".to_string(),
+            session_id: "session-auto".to_string(),
+            cwd: "/tmp/work".to_string(),
+            proxy_bind: "127.0.0.1:8585".to_string(),
+            admin_socket: "127.0.0.1:8586".to_string(),
+            database_path: "~/.config/pennyprompt/pennyprompt.db".to_string(),
+            config_path: "~/.config/pennyprompt/config.toml".to_string(),
+        };
+
+        let rendered = render_launch_plan(&plan);
+        assert_eq!(
+            rendered,
+            "Run launcher plan\n  mode: dry_run\n  agent: codex\n  project_id: my-project\n  session_id: session-auto\n  cwd: /tmp/work\n  proxy_bind: 127.0.0.1:8585\n  admin_socket: 127.0.0.1:8586\n  database_path: ~/.config/pennyprompt/pennyprompt.db\n  config_path: ~/.config/pennyprompt/config.toml"
+        );
     }
 }

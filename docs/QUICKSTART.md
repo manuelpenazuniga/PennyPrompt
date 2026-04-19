@@ -96,6 +96,20 @@ Resume a paused session:
 ./target/release/penny-cli detect resume <session_id>
 ```
 
+## 8. Launcher Plan Preview (post-alpha foundation)
+
+Preview launcher attribution and runtime wiring:
+
+```bash
+./target/release/penny-cli run codex
+./target/release/penny-cli run codex --json
+```
+
+Notes:
+
+- current behavior is dry-run plan output only
+- use `--project-id` / `--session-id` to override detected defaults
+
 ## Expected First Outcomes
 
 - `doctor` shows config and DB status.
