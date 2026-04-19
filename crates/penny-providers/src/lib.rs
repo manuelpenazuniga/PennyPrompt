@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     sync::{Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -63,6 +64,35 @@ fn parse_failure_response(error: serde_json::Error) -> ProviderResponse {
             }
         })),
         upstream_ms: 0,
+    }
+}
+
+const PENDING_STREAM_TTL: Duration = Duration::from_secs(300);
+const MAX_PENDING_STREAMS: usize = 1024;
+
+#[derive(Debug)]
+struct PendingStreamEntry {
+    receiver: mpsc::Receiver<String>,
+    inserted_at: Instant,
+}
+
+type PendingStreamMap = HashMap<String, PendingStreamEntry>;
+
+fn prune_expired_streams(streams: &mut PendingStreamMap) {
+    let now = Instant::now();
+    streams.retain(|_, entry| now.duration_since(entry.inserted_at) <= PENDING_STREAM_TTL);
+}
+
+fn prune_overflow_stream(streams: &mut PendingStreamMap) {
+    while streams.len() > MAX_PENDING_STREAMS {
+        let Some(oldest_key) = streams
+            .iter()
+            .min_by_key(|(_, entry)| entry.inserted_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        streams.remove(&oldest_key);
     }
 }
 
@@ -146,12 +176,37 @@ impl OpenAiProvider {
         }
     }
 
-    fn lock_streams(
-        &self,
-    ) -> Result<MutexGuard<'_, HashMap<String, mpsc::Receiver<String>>>, ProviderError> {
+    fn lock_streams(&self) -> Result<MutexGuard<'_, PendingStreamMap>, ProviderError> {
         self.pending_streams
             .lock()
             .map_err(|err| ProviderError::InternalState(err.to_string()))
+    }
+
+    fn insert_stream(
+        &self,
+        request_id: String,
+        receiver: mpsc::Receiver<String>,
+    ) -> Result<(), ProviderError> {
+        let mut streams = self.lock_streams()?;
+        prune_expired_streams(&mut streams);
+        streams.insert(
+            request_id,
+            PendingStreamEntry {
+                receiver,
+                inserted_at: Instant::now(),
+            },
+        );
+        prune_overflow_stream(&mut streams);
+        Ok(())
+    }
+
+    fn take_stream(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<mpsc::Receiver<String>>, ProviderError> {
+        let mut streams = self.lock_streams()?;
+        prune_expired_streams(&mut streams);
+        Ok(streams.remove(request_id).map(|entry| entry.receiver))
     }
 }
 
@@ -185,7 +240,7 @@ pub struct AnthropicProvider {
     pending_streams: ArcReceiverCache,
 }
 
-type ArcReceiverCache = std::sync::Arc<Mutex<HashMap<String, mpsc::Receiver<String>>>>;
+type ArcReceiverCache = std::sync::Arc<Mutex<PendingStreamMap>>;
 
 #[derive(Debug, Default)]
 struct AnthropicStreamState {
@@ -447,12 +502,37 @@ impl AnthropicProvider {
         }
     }
 
-    fn lock_streams(
-        &self,
-    ) -> Result<MutexGuard<'_, HashMap<String, mpsc::Receiver<String>>>, ProviderError> {
+    fn lock_streams(&self) -> Result<MutexGuard<'_, PendingStreamMap>, ProviderError> {
         self.pending_streams
             .lock()
             .map_err(|err| ProviderError::InternalState(err.to_string()))
+    }
+
+    fn insert_stream(
+        &self,
+        request_id: String,
+        receiver: mpsc::Receiver<String>,
+    ) -> Result<(), ProviderError> {
+        let mut streams = self.lock_streams()?;
+        prune_expired_streams(&mut streams);
+        streams.insert(
+            request_id,
+            PendingStreamEntry {
+                receiver,
+                inserted_at: Instant::now(),
+            },
+        );
+        prune_overflow_stream(&mut streams);
+        Ok(())
+    }
+
+    fn take_stream(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<mpsc::Receiver<String>>, ProviderError> {
+        let mut streams = self.lock_streams()?;
+        prune_expired_streams(&mut streams);
+        Ok(streams.remove(request_id).map(|entry| entry.receiver))
     }
 }
 
@@ -660,14 +740,14 @@ impl ProviderAdapter for AnthropicProvider {
             let stream_req = req.clone();
             tokio::spawn(async move {
                 let mut upstream = response.bytes_stream();
-                let mut buffer = String::new();
+                let mut buffer = Vec::new();
                 let mut state = AnthropicStreamState::default();
                 while let Some(chunk_result) = upstream.next().await {
                     let chunk = match chunk_result {
                         Ok(bytes) => bytes,
                         Err(_) => break,
                     };
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    buffer.extend_from_slice(&chunk);
                     for raw_event in drain_sse_events(&mut buffer) {
                         let event = parse_sse_event(&raw_event);
                         let mapped =
@@ -683,8 +763,7 @@ impl ProviderAdapter for AnthropicProvider {
                     }
                 }
             });
-            let mut streams = self.lock_streams()?;
-            streams.insert(req.id.clone(), rx);
+            self.insert_stream(req.id.clone(), rx)?;
             return Ok(ProviderResponse {
                 status: status.as_u16(),
                 body: ResponseBody::Stream(StreamDescriptor {
@@ -719,17 +798,7 @@ impl ProviderAdapter for AnthropicProvider {
     }
 
     fn take_stream_receiver(&self, req: &NormalizedRequest) -> Option<mpsc::Receiver<String>> {
-        let mut streams = self.lock_streams().ok()?;
-        streams.remove(&req.id)
-    }
-
-    fn stream_response_lines(&self, req: &NormalizedRequest) -> Option<Vec<String>> {
-        let mut receiver = self.take_stream_receiver(req)?;
-        let mut lines = Vec::new();
-        while let Ok(line) = receiver.try_recv() {
-            lines.push(line);
-        }
-        Some(lines)
+        self.take_stream(&req.id).ok().flatten()
     }
 }
 
@@ -763,13 +832,13 @@ impl ProviderAdapter for OpenAiProvider {
             let (tx, rx) = mpsc::channel::<String>(64);
             tokio::spawn(async move {
                 let mut upstream = response.bytes_stream();
-                let mut buffer = String::new();
+                let mut buffer = Vec::new();
                 while let Some(chunk_result) = upstream.next().await {
                     let chunk = match chunk_result {
                         Ok(bytes) => bytes,
                         Err(_) => break,
                     };
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    buffer.extend_from_slice(&chunk);
                     for raw_event in drain_sse_events(&mut buffer) {
                         let line = format!("{}\n\n", raw_event.trim());
                         if tx.send(line.clone()).await.is_err() {
@@ -780,13 +849,12 @@ impl ProviderAdapter for OpenAiProvider {
                         }
                     }
                 }
-                let remaining = buffer.trim();
+                let remaining = String::from_utf8_lossy(&buffer).trim().to_string();
                 if !remaining.is_empty() {
                     let _ = tx.send(format!("{remaining}\n\n")).await;
                 }
             });
-            let mut streams = self.lock_streams()?;
-            streams.insert(req.id.clone(), rx);
+            self.insert_stream(req.id.clone(), rx)?;
             return Ok(ProviderResponse {
                 status: status.as_u16(),
                 body: ResponseBody::Stream(StreamDescriptor {
@@ -824,17 +892,7 @@ impl ProviderAdapter for OpenAiProvider {
     }
 
     fn take_stream_receiver(&self, req: &NormalizedRequest) -> Option<mpsc::Receiver<String>> {
-        let mut streams = self.lock_streams().ok()?;
-        streams.remove(&req.id)
-    }
-
-    fn stream_response_lines(&self, req: &NormalizedRequest) -> Option<Vec<String>> {
-        let mut receiver = self.take_stream_receiver(req)?;
-        let mut lines = Vec::new();
-        while let Ok(line) = receiver.try_recv() {
-            lines.push(line);
-        }
-        Some(lines)
+        self.take_stream(&req.id).ok().flatten()
     }
 }
 
@@ -844,12 +902,35 @@ struct SseEvent {
     data: String,
 }
 
-fn drain_sse_events(buffer: &mut String) -> Vec<String> {
+fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+    if buffer.len() < 2 {
+        return None;
+    }
+
+    for idx in 0..(buffer.len() - 1) {
+        if buffer[idx] == b'\n' && buffer[idx + 1] == b'\n' {
+            return Some((idx, 2));
+        }
+
+        if idx + 3 < buffer.len()
+            && buffer[idx] == b'\r'
+            && buffer[idx + 1] == b'\n'
+            && buffer[idx + 2] == b'\r'
+            && buffer[idx + 3] == b'\n'
+        {
+            return Some((idx, 4));
+        }
+    }
+
+    None
+}
+
+fn drain_sse_events(buffer: &mut Vec<u8>) -> Vec<String> {
     let mut events = Vec::new();
-    while let Some(idx) = buffer.find("\n\n") {
-        let raw = buffer[..idx].to_string();
-        let rest = buffer[idx + 2..].to_string();
-        *buffer = rest;
+    while let Some((idx, delimiter_len)) = find_sse_delimiter(buffer) {
+        let raw = buffer.drain(..idx).collect::<Vec<u8>>();
+        buffer.drain(..delimiter_len);
+        let raw = String::from_utf8_lossy(&raw).into_owned();
         if raw.trim().is_empty() {
             continue;
         }
@@ -862,12 +943,15 @@ fn parse_sse_event(raw_event: &str) -> SseEvent {
     let mut event = SseEvent::default();
     let mut data_lines = Vec::new();
     for line in raw_event.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if let Some(name) = line.strip_prefix("event:") {
-            event.name = Some(name.trim().to_string());
+            let name = name.strip_prefix(' ').unwrap_or(name);
+            event.name = Some(name.to_string());
             continue;
         }
         if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.trim().to_string());
+            let data = data.strip_prefix(' ').unwrap_or(data);
+            data_lines.push(data.to_string());
         }
     }
     event.data = data_lines.join("\n");
@@ -1004,6 +1088,26 @@ mod tests {
                 .single()
                 .expect("valid static timestamp"),
         }
+    }
+
+    #[test]
+    fn drain_sse_events_keeps_utf8_when_codepoint_arrives_split_between_chunks() {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"event: message_start\ndata: {\"text\":\"caf\xc3");
+        assert!(drain_sse_events(&mut buffer).is_empty());
+
+        buffer.extend_from_slice(b"\xa9\"}\n\n");
+        let events = drain_sse_events(&mut buffer);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("café"));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn parse_sse_event_removes_only_single_leading_space() {
+        let parsed = parse_sse_event("event:  message\ndata:  hello\r\n\r\n");
+        assert_eq!(parsed.name.as_deref(), Some(" message"));
+        assert_eq!(parsed.data, " hello");
     }
 
     #[tokio::test]

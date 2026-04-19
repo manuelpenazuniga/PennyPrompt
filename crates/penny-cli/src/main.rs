@@ -385,7 +385,7 @@ struct EstimateSummary<'a> {
 
 #[derive(Debug, Default)]
 struct SseDecoder {
-    buffer: String,
+    buffer: Vec<u8>,
     current_event: Option<String>,
     current_data: Vec<String>,
 }
@@ -1598,11 +1598,11 @@ fn style(text: &str, ansi_code: &str, no_color: bool) -> String {
 
 impl SseDecoder {
     fn push(&mut self, chunk: &[u8]) -> Vec<SseMessage> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        self.buffer.extend_from_slice(chunk);
         let mut messages = Vec::new();
 
-        while let Some(index) = self.buffer.find('\n') {
-            let mut line = self.buffer[..index].to_string();
+        while let Some(index) = self.buffer.iter().position(|&byte| byte == b'\n') {
+            let mut line = String::from_utf8_lossy(&self.buffer[..index]).into_owned();
             self.buffer.drain(..=index);
             if line.ends_with('\r') {
                 line.pop();
@@ -1616,12 +1616,14 @@ impl SseDecoder {
             }
 
             if let Some(event) = line.strip_prefix("event:") {
-                self.current_event = Some(event.trim().to_string());
+                let event = event.strip_prefix(' ').unwrap_or(event);
+                self.current_event = Some(event.to_string());
                 continue;
             }
 
             if let Some(data) = line.strip_prefix("data:") {
-                self.current_data.push(data.trim_start().to_string());
+                let data = data.strip_prefix(' ').unwrap_or(data);
+                self.current_data.push(data.to_string());
             }
         }
 
@@ -1630,7 +1632,7 @@ impl SseDecoder {
 
     fn finish(&mut self) -> Vec<SseMessage> {
         if !self.buffer.is_empty() {
-            self.buffer.push('\n');
+            self.buffer.push(b'\n');
             return self.push(&[]);
         }
         self.take_message().into_iter().collect()
@@ -2331,6 +2333,28 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].event.as_deref(), Some("event"));
         assert!(messages[0].data.contains("\"event_type\":\"budget_check\""));
+    }
+
+    #[test]
+    fn sse_decoder_preserves_utf8_when_codepoint_is_split_across_chunks() {
+        let mut decoder = SseDecoder::default();
+        let first = b"event: event\ndata: {\"text\":\"caf\xc3";
+        let second = b"\xa9\"}\n\n";
+
+        assert!(decoder.push(first).is_empty());
+        let messages = decoder.push(second);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].event.as_deref(), Some("event"));
+        assert!(messages[0].data.contains("café"));
+    }
+
+    #[test]
+    fn sse_decoder_removes_only_single_leading_space_after_field_separator() {
+        let mut decoder = SseDecoder::default();
+        let messages = decoder.push(b"event:  detect\ndata:  x\n\n");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].event.as_deref(), Some(" detect"));
+        assert_eq!(messages[0].data, " x");
     }
 
     #[test]
