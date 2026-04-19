@@ -5,6 +5,7 @@ This list documents current constraints as of April 18, 2026.
 ## CLI / Product Surface
 
 - `serve` lifecycle orchestration is not fully consolidated in `penny-cli` yet.
+- `run <agent>` currently emits deterministic dry-run launch plans; full process orchestration remains a follow-up.
 - Some outputs are operator-focused and intentionally minimal (not final UX polish).
 
 ## Pricebook Update

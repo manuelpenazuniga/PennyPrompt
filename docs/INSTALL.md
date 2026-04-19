@@ -80,6 +80,12 @@ alias pp='cargo run -p penny-cli --'
 pp doctor
 ```
 
+Launcher preview (dry-run):
+
+```bash
+./target/release/penny-cli run codex
+```
+
 ## 5. Configure Initial Settings
 
 Create a local config from a preset:
