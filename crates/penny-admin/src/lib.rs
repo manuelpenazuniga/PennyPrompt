@@ -143,6 +143,9 @@ struct ReportSummaryResponse {
     by: String,
     rows: Vec<SummaryRow>,
     totals: SummaryTotals,
+    page_totals: SummaryTotals,
+    total_groups: i64,
+    returned_groups: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,8 +335,14 @@ async fn get_health(State(state): State<AdminState>) -> Response {
     let latest_effective_from =
         query_scalar::<_, Option<String>>("SELECT MAX(effective_from) FROM pricebook_entries")
             .fetch_one(state.store.pool())
-            .await
-            .unwrap_or(None);
+            .await;
+    let latest_effective_from = match latest_effective_from {
+        Ok(value) => value,
+        Err(error) => {
+            log_internal_error("admin_health_pricebook_query_failed", error.to_string());
+            None
+        }
+    };
 
     (
         status_code,
@@ -363,6 +372,11 @@ async fn get_report_summary(
 ) -> Response {
     let by = query_params.by.unwrap_or(ReportSummaryBy::Project);
     let limit = i64::from(query_params.limit.unwrap_or(100).clamp(1, 1_000));
+    let project_filter = query_params.project.clone();
+    let model_filter = query_params.model.clone();
+    let session_filter = query_params.session.clone();
+    let since_filter = query_params.since.clone();
+    let until_filter = query_params.until.clone();
     let (group_expr, join_projects) = match by {
         ReportSummaryBy::Project => (
             "COALESCE(projects.name, requests.project_id)",
@@ -372,7 +386,7 @@ async fn get_report_summary(
         ReportSummaryBy::Session => ("COALESCE(requests.session_id, '(none)')", ""),
     };
 
-    let sql = format!(
+    let grouped_sql = format!(
         r#"
         SELECT
             {group_expr} AS group_key,
@@ -389,17 +403,36 @@ async fn get_report_summary(
           AND (?4 IS NULL OR datetime(requests.started_at) >= datetime(?4))
           AND (?5 IS NULL OR datetime(requests.started_at) <= datetime(?5))
         GROUP BY group_key
+        "#
+    );
+    let rows_sql = format!(
+        r#"
+        {grouped_sql}
         ORDER BY total_cost_micros DESC, group_key ASC
         LIMIT ?6
         "#
     );
+    let totals_sql = format!(
+        r#"
+        WITH grouped AS (
+            {grouped_sql}
+        )
+        SELECT
+            CAST(COALESCE(SUM(request_count), 0) AS INTEGER) AS request_count,
+            CAST(COALESCE(SUM(input_tokens), 0) AS INTEGER) AS input_tokens,
+            CAST(COALESCE(SUM(output_tokens), 0) AS INTEGER) AS output_tokens,
+            CAST(COALESCE(SUM(total_cost_micros), 0) AS INTEGER) AS total_cost_micros,
+            CAST(COUNT(*) AS INTEGER) AS total_groups
+        FROM grouped
+        "#
+    );
 
-    let rows = match query(&sql)
-        .bind(query_params.project)
-        .bind(query_params.model)
-        .bind(query_params.session)
-        .bind(query_params.since)
-        .bind(query_params.until)
+    let rows = match query(&rows_sql)
+        .bind(project_filter.clone())
+        .bind(model_filter.clone())
+        .bind(session_filter.clone())
+        .bind(since_filter.clone())
+        .bind(until_filter.clone())
         .bind(limit)
         .fetch_all(state.store.pool())
         .await
@@ -425,7 +458,7 @@ async fn get_report_summary(
         })
         .collect::<Vec<_>>();
 
-    let totals = SummaryTotals {
+    let page_totals = SummaryTotals {
         request_count: summary_rows.iter().map(|row| row.request_count).sum(),
         input_tokens: summary_rows.iter().map(|row| row.input_tokens).sum(),
         output_tokens: summary_rows.iter().map(|row| row.output_tokens).sum(),
@@ -436,11 +469,40 @@ async fn get_report_summary(
                 .sum::<i64>(),
         ),
     };
+    let totals_row = match query(&totals_sql)
+        .bind(project_filter)
+        .bind(model_filter)
+        .bind(session_filter)
+        .bind(since_filter)
+        .bind(until_filter)
+        .fetch_one(state.store.pool())
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            return api_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "report_totals_query_failed",
+                error.to_string(),
+            )
+        }
+    };
+    let totals = SummaryTotals {
+        request_count: totals_row.get("request_count"),
+        input_tokens: totals_row.get("input_tokens"),
+        output_tokens: totals_row.get("output_tokens"),
+        cost_usd: Money::from_micros(totals_row.get("total_cost_micros")),
+    };
+    let total_groups = totals_row.get::<i64, _>("total_groups");
+    let returned_groups = summary_rows.len() as i64;
 
     Json(ReportSummaryResponse {
         by: by.as_str().to_string(),
         rows: summary_rows,
         totals,
+        page_totals,
+        total_groups,
+        returned_groups,
     })
     .into_response()
 }
@@ -526,9 +588,16 @@ async fn get_budgets(State(state): State<AdminState>) -> Response {
         }
     };
 
-    let totals = fetch_latest_running_totals(&state.store)
-        .await
-        .unwrap_or_default();
+    let totals = match fetch_latest_running_totals(&state.store).await {
+        Ok(totals) => totals,
+        Err(error) => {
+            return api_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "budget_running_totals_query_failed",
+                error.to_string(),
+            )
+        }
+    };
 
     let rows = budgets
         .into_iter()
@@ -724,6 +793,7 @@ async fn post_detect_resume(
         );
     };
 
+    let mut persisted = true;
     if let Err(error) = EventRepo::insert(
         &state.store,
         &NewEvent {
@@ -736,17 +806,15 @@ async fn post_detect_resume(
     )
     .await
     {
-        return api_error(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "detect_resume_persist_failed",
-            error.to_string(),
-        );
+        persisted = false;
+        log_internal_error("detect_resume_persist_failed", error.to_string());
     }
 
     Json(json!({
         "resumed": true,
         "session_id": session_id,
-        "event": event
+        "event": event,
+        "persisted": persisted
     }))
     .into_response()
 }
@@ -784,7 +852,10 @@ async fn get_events(
 
                     for event in events {
                         last_id = last_id.max(event.id);
-                        let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+                        let payload = serde_json::to_string(&event).unwrap_or_else(|error| {
+                            log_internal_error("admin_events_serialize_failed", error.to_string());
+                            "{}".to_string()
+                        });
                         yield Ok::<SseEvent, Infallible>(
                             SseEvent::default()
                                 .id(event.id.to_string())
@@ -901,7 +972,9 @@ async fn build_estimate_budget_summary(
         });
     }
 
-    let running_totals = fetch_latest_running_totals(store).await.unwrap_or_default();
+    let running_totals = fetch_latest_running_totals(store)
+        .await
+        .map_err(StoreError::from)?;
     let mut rows = Vec::with_capacity(budgets.len());
     let mut hard_limit_exceeded = false;
     let mut soft_limit_reached = false;
@@ -1303,6 +1376,69 @@ mod tests {
         assert_eq!(json_body["totals"]["input_tokens"], 100);
         assert_eq!(json_body["totals"]["output_tokens"], 50);
         assert_eq!(json_body["totals"]["cost_usd"], 2.5);
+        assert_eq!(json_body["page_totals"]["request_count"], 1);
+        assert_eq!(json_body["returned_groups"], 1);
+        assert_eq!(json_body["total_groups"], 1);
+    }
+
+    #[tokio::test]
+    async fn report_summary_returns_filtered_totals_and_page_totals_separately() {
+        let store = setup_store().await;
+        seed_minimal_data(&store).await;
+
+        let project_id = store
+            .upsert_by_path("/tmp/pennyprompt-admin-2")
+            .await
+            .expect("upsert project");
+        let session_id = store.create(&project_id).await.expect("create session");
+        let request = NewRequest {
+            id: "req_admin_02".to_string(),
+            session_id: Some(session_id),
+            project_id,
+            model_requested: "gpt-4.1".to_string(),
+            model_used: "gpt-4.1".to_string(),
+            provider_id: "openai".to_string(),
+            started_at: Utc::now(),
+            is_streaming: false,
+        };
+        RequestRepo::insert(&store, &request)
+            .await
+            .expect("insert request");
+        store
+            .insert_usage(&UsageRecord {
+                request_id: request.id.clone(),
+                input_tokens: 200,
+                output_tokens: 100,
+                cost_usd: Money::from_usd(5.0).expect("money"),
+                source: penny_types::UsageSource::Provider,
+                pricing_snapshot: json!({"test": true}),
+            })
+            .await
+            .expect("insert usage");
+
+        let app = build_router(AdminState::new(store));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/report/summary?by=project&limit=1")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json_body["total_groups"], 2);
+        assert_eq!(json_body["returned_groups"], 1);
+        assert_eq!(json_body["totals"]["request_count"], 2);
+        assert_eq!(json_body["totals"]["input_tokens"], 300);
+        assert_eq!(json_body["totals"]["output_tokens"], 150);
+        assert_eq!(json_body["totals"]["cost_usd"], 7.5);
+        assert_eq!(json_body["page_totals"]["request_count"], 1);
     }
 
     #[tokio::test]
@@ -1508,6 +1644,7 @@ mod tests {
         let resume_json: Value = serde_json::from_slice(&body).expect("resume json");
         assert_eq!(resume_json["resumed"], true);
         assert_eq!(resume_json["session_id"], "sess-detect-b");
+        assert_eq!(resume_json["persisted"], true);
 
         let status_response = app
             .oneshot(
