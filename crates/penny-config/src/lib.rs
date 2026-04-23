@@ -208,7 +208,9 @@ fn resolve_repo_root(repository_root: Option<PathBuf>) -> Result<PathBuf, Config
     env::current_dir().map_err(|e| ConfigError::CurrentDir(e.to_string()))
 }
 
-fn resolve_user_config_path(config_path: Option<PathBuf>) -> Result<Option<PathBuf>, ConfigError> {
+pub fn resolve_user_config_path(
+    config_path: Option<PathBuf>,
+) -> Result<Option<PathBuf>, ConfigError> {
     if config_path.is_some() {
         return Ok(config_path);
     }
