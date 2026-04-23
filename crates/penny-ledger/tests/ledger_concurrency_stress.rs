@@ -3,7 +3,7 @@ use std::sync::Arc;
 use penny_ledger::{CostLedger, LedgerError};
 use penny_store::{BudgetRepo, SqliteStore};
 use penny_types::{Budget, Money, Reservation, ScopeType, WindowType};
-use sqlx::query_scalar;
+use sqlx::{query, query_scalar};
 use tempfile::tempdir;
 use tokio::sync::Barrier;
 
@@ -12,9 +12,14 @@ fn sqlite_url(path: &std::path::Path) -> String {
 }
 
 async fn connect_store(url: &str) -> SqliteStore {
-    SqliteStore::connect(url)
+    let store = SqliteStore::connect(url)
         .await
-        .expect("connect shared sqlite")
+        .expect("connect shared sqlite");
+    query("PRAGMA busy_timeout = 5000")
+        .execute(store.pool())
+        .await
+        .expect("set busy timeout");
+    store
 }
 
 async fn insert_budget(store: &SqliteStore, hard_limit: f64) -> Budget {
@@ -38,10 +43,10 @@ async fn insert_budget(store: &SqliteStore, hard_limit: f64) -> Budget {
 
 fn is_sqlite_lock(err: &LedgerError) -> bool {
     match err {
-        LedgerError::Sqlx(inner) => {
-            let text = inner.to_string();
-            text.contains("database is locked") || text.contains("database table is locked")
-        }
+        LedgerError::Sqlx(inner) => inner
+            .as_database_error()
+            .and_then(|db_err| db_err.code())
+            .is_some_and(|code| code == "5" || code == "6"),
         _ => false,
     }
 }
