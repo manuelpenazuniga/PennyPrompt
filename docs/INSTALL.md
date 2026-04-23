@@ -5,7 +5,7 @@ This document describes alpha installation paths for PennyPrompt.
 ## 1. Prerequisites
 
 - macOS or Linux shell environment
-- `curl`, `tar`, and `shasum` or `sha256sum`
+- `curl`, `tar`, `mktemp`, and `shasum` or `sha256sum`
 - Rust toolchain (stable) with `cargo` (only required for source builds)
 
 ## 2. Quick Install from GitHub Release (`curl | sh`)

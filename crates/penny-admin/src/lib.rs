@@ -385,6 +385,8 @@ async fn get_report_summary(
         ReportSummaryBy::Model => ("requests.model_used", ""),
         ReportSummaryBy::Session => ("COALESCE(requests.session_id, '(none)')", ""),
     };
+    // SQL fragments below are selected from trusted enum variants only.
+    // All user-provided filters stay parameterized through bind placeholders.
 
     let grouped_sql = format!(
         r#"
