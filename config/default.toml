@@ -47,3 +47,7 @@ burn_rate_alert_usd_per_hour = 10.0
 loop_window_seconds = 120
 loop_threshold_similar_requests = 8
 loop_action = "pause"
+
+[cleanup]
+strip_ansi = true
+minify_json = false

@@ -5,7 +5,7 @@ use std::{
     hash::Hasher,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -21,8 +21,9 @@ use bytes::Bytes;
 use chrono::Utc;
 use penny_budget::BudgetEvaluator;
 use penny_config::{
-    AppConfig as RuntimeConfig, BudgetConfig as RuntimeBudgetConfig, LoopAction,
-    ScopeType as ConfigScopeType, WindowType as ConfigWindowType,
+    AppConfig as RuntimeConfig, BudgetConfig as RuntimeBudgetConfig,
+    CleanupConfig as RuntimeCleanupConfig, LoopAction, ScopeType as ConfigScopeType,
+    WindowType as ConfigWindowType,
 };
 use penny_cost::{estimate_tokens, PricingEngine};
 use penny_detect::{DetectEngine, DetectEventRecord, DetectorConfig, SESSION_PAUSED_LOOP_REASON};
@@ -36,6 +37,7 @@ use penny_types::{
     Budget, BudgetBlockDetail, EventType, Mode, Money, NormalizedRequest, RequestDigest,
     ResponseBody, RouteDecision, ScopeType, Severity, UsageSource, WindowType,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{query, query_scalar};
@@ -74,6 +76,7 @@ pub struct ProxyState {
     default_session_id: String,
     session_window_minutes: u64,
     health_db_probe_timeout: Duration,
+    cleanup: CleanupSettings,
     started_at: Instant,
 }
 
@@ -99,6 +102,7 @@ impl ProxyState {
             default_session_id: "session-auto".to_string(),
             session_window_minutes: 30,
             health_db_probe_timeout: Duration::from_millis(200),
+            cleanup: CleanupSettings::default(),
             started_at: Instant::now(),
         }
     }
@@ -128,6 +132,11 @@ impl ProxyState {
         self
     }
 
+    fn with_cleanup(mut self, cleanup: CleanupSettings) -> Self {
+        self.cleanup = cleanup;
+        self
+    }
+
     pub fn mock_default() -> Self {
         let mock = MockProvider::new(MockProviderConfig::default());
         let models = mock.config().supported_models.clone();
@@ -146,6 +155,7 @@ pub async fn build_state_from_config(
         .with_store(store)
         .with_detector(Arc::new(DetectEngine::from_runtime_config(&config.detect)))
         .with_mode(mode_from_config(&config.server.mode))
+        .with_cleanup(CleanupSettings::from(&config.cleanup))
         .with_session_window_minutes(config.attribution.session_window_minutes as u64))
 }
 
@@ -201,6 +211,36 @@ struct NormalizedUsage {
 struct BudgetEnforcementContext {
     estimated_cost_usd: Money,
     reserve_persisted: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CleanupSettings {
+    strip_ansi: bool,
+    minify_json: bool,
+}
+
+impl Default for CleanupSettings {
+    fn default() -> Self {
+        Self {
+            strip_ansi: true,
+            minify_json: false,
+        }
+    }
+}
+
+impl CleanupSettings {
+    fn enabled(self) -> bool {
+        self.strip_ansi || self.minify_json
+    }
+}
+
+impl From<&RuntimeCleanupConfig> for CleanupSettings {
+    fn from(config: &RuntimeCleanupConfig) -> Self {
+        Self {
+            strip_ansi: config.strip_ansi,
+            minify_json: config.minify_json,
+        }
+    }
 }
 
 pub fn build_router(state: ProxyState) -> Router {
@@ -314,7 +354,7 @@ async fn post_chat_completions(
 
     let status = StatusCode::from_u16(provider_response.status).unwrap_or(StatusCode::BAD_GATEWAY);
     match provider_response.body {
-        ResponseBody::Complete(value) => {
+        ResponseBody::Complete(mut value) => {
             if !status.is_success() {
                 if let Some(context) = enforcement.as_ref() {
                     maybe_release_on_dispatch_failure(
@@ -375,6 +415,7 @@ async fn post_chat_completions(
                 usage.clone(),
                 usage_cost_usd,
             );
+            apply_cleanup_to_json(&mut value, state.cleanup);
 
             (status, Json(value)).into_response()
         }
@@ -548,6 +589,95 @@ fn provider_usage_from_completion(payload: &Value) -> Option<NormalizedUsage> {
         source: UsageSource::Provider,
         pricing_snapshot: usage.clone(),
     })
+}
+
+fn apply_cleanup_to_json(value: &mut Value, cleanup: CleanupSettings) {
+    if !cleanup.enabled() {
+        return;
+    }
+    match value {
+        Value::String(text) => {
+            *text = cleanup_text(text, cleanup);
+        }
+        Value::Array(items) => {
+            for item in items {
+                apply_cleanup_to_json(item, cleanup);
+            }
+        }
+        Value::Object(map) => {
+            for nested in map.values_mut() {
+                apply_cleanup_to_json(nested, cleanup);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cleanup_text(input: &str, cleanup: CleanupSettings) -> String {
+    let mut output = if cleanup.strip_ansi {
+        strip_ansi_sequences(input)
+    } else {
+        input.to_string()
+    };
+    if cleanup.minify_json {
+        if let Some(minified) = minify_json_string(&output) {
+            output = minified;
+        }
+    }
+    output
+}
+
+fn strip_ansi_sequences(input: &str) -> String {
+    static CSI_RE: OnceLock<Regex> = OnceLock::new();
+    static OSC_RE: OnceLock<Regex> = OnceLock::new();
+    let csi = CSI_RE
+        .get_or_init(|| Regex::new(r"\x1B\[[0-?]*[ -/]*[@-~]").expect("valid ANSI CSI regex"));
+    let osc = OSC_RE.get_or_init(|| {
+        Regex::new(r"\x1B\][^\x1B\x07]*(\x07|\x1B\\)").expect("valid ANSI OSC regex")
+    });
+    let no_csi = csi.replace_all(input, "");
+    osc.replace_all(&no_csi, "").into_owned()
+}
+
+fn minify_json_string(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(trimmed).ok()?;
+    serde_json::to_string(&parsed).ok()
+}
+
+fn cleanup_sse_line(line: &str, cleanup: CleanupSettings) -> String {
+    if !cleanup.enabled() {
+        return line.to_string();
+    }
+
+    let trimmed = line.trim_end_matches(|ch| ch == '\r' || ch == '\n');
+    let trailing_newline = &line[trimmed.len()..];
+    let Some(data) = trimmed.strip_prefix("data:") else {
+        return if cleanup.strip_ansi {
+            strip_ansi_sequences(line)
+        } else {
+            line.to_string()
+        };
+    };
+    let payload = data.trim_start();
+    if payload.eq_ignore_ascii_case("[DONE]") {
+        return line.to_string();
+    }
+    let Ok(mut parsed) = serde_json::from_str::<Value>(payload) else {
+        return if cleanup.strip_ansi {
+            strip_ansi_sequences(line)
+        } else {
+            line.to_string()
+        };
+    };
+    apply_cleanup_to_json(&mut parsed, cleanup);
+    match serde_json::to_string(&parsed) {
+        Ok(serialized) => format!("data: {serialized}{trailing_newline}"),
+        Err(_) => line.to_string(),
+    }
 }
 
 fn provider_usage_from_sse_lines(lines: &[String]) -> Option<NormalizedUsage> {
@@ -950,6 +1080,7 @@ async fn stream_passthrough_response(
         let mut lines = Vec::new();
         let mut saw_done = false;
         while let Some(line) = upstream.recv().await {
+            let line = cleanup_sse_line(&line, state.cleanup);
             if line.trim().eq_ignore_ascii_case("data: [done]") {
                 saw_done = true;
             }
@@ -1491,6 +1622,98 @@ mod tests {
         (build_router(state), store)
     }
 
+    #[derive(Debug, Default)]
+    struct AnsiContentProvider;
+
+    #[async_trait]
+    impl ProviderAdapter for AnsiContentProvider {
+        async fn send(&self, req: NormalizedRequest) -> Result<ProviderResponse, ProviderError> {
+            if req.stream {
+                return Ok(ProviderResponse {
+                    status: 200,
+                    body: ResponseBody::Stream(StreamDescriptor {
+                        provider: "ansi".to_string(),
+                        format: "sse".to_string(),
+                    }),
+                    upstream_ms: 0,
+                });
+            }
+
+            Ok(ProviderResponse {
+                status: 200,
+                body: ResponseBody::Complete(json!({
+                    "id": format!("chatcmpl_{}", req.id),
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "\u{1b}[31mcolored response\u{1b}[0m"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 120,
+                        "completion_tokens": 48
+                    }
+                })),
+                upstream_ms: 0,
+            })
+        }
+
+        fn provider_id(&self) -> &str {
+            "ansi"
+        }
+
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+
+        fn stream_response_lines(&self, _req: &NormalizedRequest) -> Option<Vec<String>> {
+            let first_chunk = json!({
+                "id": "chatcmpl_ansi_stream",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": null
+                }]
+            });
+            let second_chunk = json!({
+                "id": "chatcmpl_ansi_stream",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "\u{1b}[31mstream colored\u{1b}[0m"},
+                    "finish_reason": null
+                }]
+            });
+            let final_chunk = json!({
+                "id": "chatcmpl_ansi_stream",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 48
+                }
+            });
+            Some(vec![
+                format!("data: {first_chunk}\n\n"),
+                format!("data: {second_chunk}\n\n"),
+                format!("data: {final_chunk}\n\n"),
+                "data: [DONE]\n\n".to_string(),
+            ])
+        }
+    }
+
+    fn app_with_ansi_provider(cleanup: CleanupSettings) -> Router {
+        let provider: Arc<dyn ProviderAdapter> = Arc::new(AnsiContentProvider);
+        let state = ProxyState::with_provider(provider, vec!["claude-sonnet-4-6".to_string()])
+            .with_cleanup(cleanup);
+        build_router(state)
+    }
+
     async fn seed_pricebooks(store: &SqliteStore) {
         let prices_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../prices")
@@ -1685,6 +1908,103 @@ action_on_soft = "warn"
             json_body["choices"][0]["message"]["content"],
             "Mock provider deterministic response."
         );
+    }
+
+    #[tokio::test]
+    async fn post_chat_completions_strips_ansi_by_default() {
+        let app = app_with_ansi_provider(CleanupSettings::default());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"hello"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            json_body["choices"][0]["message"]["content"],
+            "colored response"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_chat_completions_can_disable_payload_cleanup() {
+        let app = app_with_ansi_provider(CleanupSettings {
+            strip_ansi: false,
+            minify_json: false,
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"hello"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            json_body["choices"][0]["message"]["content"],
+            "\u{1b}[31mcolored response\u{1b}[0m"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_passthrough_cleans_ansi_payload_chunks() {
+        let app = app_with_ansi_provider(CleanupSettings::default());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"stream please"}],
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(text.contains("stream colored"));
+        assert!(!text.contains('\u{1b}'));
+        assert!(text.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn cleanup_text_minifies_json_when_enabled() {
+        let cleanup = CleanupSettings {
+            strip_ansi: false,
+            minify_json: true,
+        };
+        let input = " { \"a\": 1, \"b\": [1, 2] } ";
+        assert_eq!(cleanup_text(input, cleanup), "{\"a\":1,\"b\":[1,2]}");
     }
 
     #[tokio::test]
