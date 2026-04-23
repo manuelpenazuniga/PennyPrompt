@@ -2,14 +2,17 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use glob::glob;
-use penny_config::{load_config, LoadOptions, PRESET_EXPLORE, PRESET_INDIE, PRESET_TEAM};
+use penny_config::{
+    load_config, resolve_user_config_path, ConfigError, LoadOptions, PRESET_EXPLORE, PRESET_INDIE,
+    PRESET_TEAM,
+};
 use penny_cost::{estimate_tokens, import_pricebook_files, PricingEngine};
 use penny_store::{BudgetRepo, ProjectRepo, SessionRepo, SqliteStore};
 use penny_types::{Budget, Confidence, Event, EventType, Money, ScopeType, TaskType, WindowType};
@@ -18,6 +21,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{query, Row};
 use thiserror::Error;
+
+const PRESET_INDIE_TOML: &str = include_str!("../../../presets/indie.toml");
+const PRESET_TEAM_TOML: &str = include_str!("../../../presets/team.toml");
+const PRESET_EXPLORE_TOML: &str = include_str!("../../../presets/explore.toml");
+const PRICEBOOK_ANTHROPIC_TOML: &str = include_str!("../../../prices/anthropic.toml");
+const PRICEBOOK_OPENAI_TOML: &str = include_str!("../../../prices/openai.toml");
 
 #[derive(Debug, Parser)]
 #[command(name = "pennyprompt")]
@@ -625,17 +634,7 @@ fn run_init(preset: &str, force: bool) -> Result<(), CliError> {
         )));
     }
 
-    let source = std::env::current_dir()
-        .map_err(|error| CliError::Init(error.to_string()))?
-        .join("presets")
-        .join(format!("{preset}.toml"));
-    let raw = fs::read_to_string(&source).map_err(|error| {
-        CliError::Init(format!(
-            "failed to read preset {}: {}",
-            source.display(),
-            error
-        ))
-    })?;
+    let raw = preset_template(preset)?;
 
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|error| {
@@ -735,12 +734,40 @@ async fn run_prices_show(store: &SqliteStore, limit: u32) -> Result<(), CliError
 }
 
 async fn run_prices_update(store: &SqliteStore) -> Result<(), CliError> {
-    let root = std::env::current_dir().map_err(|error| CliError::Store(error.to_string()))?;
-    let anthropic = root.join("prices/anthropic.toml");
-    let openai = root.join("prices/openai.toml");
-    let imported = import_pricebook_files(store, &[anthropic, openai])
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let staging_dir = std::env::temp_dir().join(format!(
+        "pennyprompt-pricebooks-{}-{seed}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&staging_dir).map_err(|error| {
+        CliError::Cost(format!(
+            "failed to create temp pricebook directory {}: {error}",
+            staging_dir.display()
+        ))
+    })?;
+
+    let anthropic = staging_dir.join("anthropic.toml");
+    let openai = staging_dir.join("openai.toml");
+    fs::write(&anthropic, PRICEBOOK_ANTHROPIC_TOML).map_err(|error| {
+        CliError::Cost(format!(
+            "failed to stage embedded pricebook {}: {error}",
+            anthropic.display()
+        ))
+    })?;
+    fs::write(&openai, PRICEBOOK_OPENAI_TOML).map_err(|error| {
+        CliError::Cost(format!(
+            "failed to stage embedded pricebook {}: {error}",
+            openai.display()
+        ))
+    })?;
+
+    let imported = import_pricebook_files(store, &[anthropic.clone(), openai.clone()])
         .await
         .map_err(|error| CliError::Cost(error.to_string()))?;
+    let _ = fs::remove_dir_all(&staging_dir);
     println!("Pricebook update completed");
     println!("  imported_entries: {imported}");
     Ok(())
@@ -958,13 +985,17 @@ async fn run_launcher(store: &SqliteStore, command: RunCommand) -> Result<(), Cl
         ));
     }
 
-    let config =
-        load_config(LoadOptions::default()).map_err(|error| CliError::Config(error.to_string()))?;
-    let cwd = if let Some(path) = command.cwd {
-        path
-    } else {
-        std::env::current_dir().map_err(|error| CliError::Run(error.to_string()))?
-    };
+    let explicit_cwd = command.cwd.is_some();
+    let cwd = resolve_launcher_cwd(command.cwd)?;
+    let config = load_config(LoadOptions {
+        repository_root: Some(cwd.clone()),
+        ..Default::default()
+    })
+    .or_else(|error| match (explicit_cwd, error) {
+        (true, ConfigError::MissingDefaultConfig(_)) => load_config(LoadOptions::default()),
+        (_, other) => Err(other),
+    })
+    .map_err(|error| CliError::Config(error.to_string()))?;
     let project_id = resolve_launch_project_id(
         store,
         &cwd,
@@ -1245,14 +1276,32 @@ fn validate_preset(preset: &str) -> Result<(), CliError> {
 }
 
 fn resolve_user_config_target() -> Result<PathBuf, CliError> {
-    if let Ok(path) = std::env::var("PENNY_CONFIG") {
-        let path = path.trim();
-        if !path.is_empty() {
-            return Ok(PathBuf::from(path));
-        }
+    resolve_user_config_path(None)
+        .map_err(|error| CliError::Init(error.to_string()))?
+        .ok_or_else(|| {
+            CliError::Init("unable to resolve config path from PENNY_CONFIG or HOME".to_string())
+        })
+}
+
+fn preset_template(preset: &str) -> Result<&'static str, CliError> {
+    match preset {
+        PRESET_INDIE => Ok(PRESET_INDIE_TOML),
+        PRESET_TEAM => Ok(PRESET_TEAM_TOML),
+        PRESET_EXPLORE => Ok(PRESET_EXPLORE_TOML),
+        _ => Err(CliError::Init(format!(
+            "invalid preset `{preset}` (expected: {PRESET_INDIE}|{PRESET_TEAM}|{PRESET_EXPLORE})"
+        ))),
     }
-    let home = std::env::var("HOME").map_err(|_| CliError::Init("HOME not set".to_string()))?;
-    Ok(PathBuf::from(home).join(".config/pennyprompt/config.toml"))
+}
+
+fn resolve_launcher_cwd(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    let raw = if let Some(path) = path {
+        path
+    } else {
+        std::env::current_dir().map_err(|error| CliError::Run(error.to_string()))?
+    };
+    fs::canonicalize(&raw)
+        .map_err(|error| CliError::Run(format!("invalid --cwd path {}: {error}", raw.display())))
 }
 
 fn print_doctor_report(report: &DoctorReport, database_path: &str) {
@@ -2517,6 +2566,36 @@ mod tests {
 
         let only_symbols = Path::new("/tmp/___");
         assert_eq!(default_project_id_from_cwd(only_symbols), "default");
+    }
+
+    #[test]
+    fn resolve_launcher_cwd_canonicalizes_existing_path() {
+        let temp = tempdir().expect("temp dir");
+        let nested = temp.path().join("workspace");
+        fs::create_dir_all(&nested).expect("create nested dir");
+
+        let resolved = resolve_launcher_cwd(Some(nested.clone())).expect("resolve cwd");
+        let canonical = fs::canonicalize(&nested).expect("canonical path");
+        assert_eq!(resolved, canonical);
+    }
+
+    #[test]
+    fn resolve_launcher_cwd_rejects_missing_path() {
+        let temp = tempdir().expect("temp dir");
+        let missing = temp.path().join("does-not-exist");
+        let error = resolve_launcher_cwd(Some(missing)).expect_err("missing path must fail");
+        assert!(matches!(error, CliError::Run(_)));
+    }
+
+    #[test]
+    fn preset_template_uses_embedded_templates() {
+        let indie = preset_template(PRESET_INDIE).expect("indie preset");
+        let team = preset_template(PRESET_TEAM).expect("team preset");
+        let explore = preset_template(PRESET_EXPLORE).expect("explore preset");
+
+        assert!(indie.contains("[server]"));
+        assert!(team.contains("[server]"));
+        assert!(explore.contains("[server]"));
     }
 
     #[test]
