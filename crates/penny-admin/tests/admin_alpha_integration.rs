@@ -109,6 +109,10 @@ async fn admin_detect_status_and_resume_work_integration_flow() {
         loop_window_seconds: 120,
         loop_threshold_similar_requests: 2,
         loop_action: LoopAction::Pause,
+        min_burn_rate_observation_seconds: 30,
+        max_recorded_events: 5000,
+        session_state_retention_seconds: 3600,
+        max_sessions: 2048,
     }));
     let start = Utc::now();
     let digest = |at| RequestDigest {

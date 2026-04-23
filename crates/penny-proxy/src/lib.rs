@@ -87,6 +87,10 @@ impl ProxyState {
                 loop_window_seconds: 120,
                 loop_threshold_similar_requests: 8,
                 loop_action: LoopAction::Alert,
+                min_burn_rate_observation_seconds: 30,
+                max_recorded_events: 5000,
+                session_state_retention_seconds: 3600,
+                max_sessions: 2048,
             })),
             store: None,
             models,
@@ -365,11 +369,12 @@ async fn post_chat_completions(
                     message,
                 );
             }
-            if let Err(message) =
-                run_detection_after_reconcile(&state, &normalized, &usage, usage_cost_usd).await
-            {
-                log_internal_error("detect_integration_failed", message);
-            }
+            spawn_detection_after_reconcile(
+                state.clone(),
+                normalized.clone(),
+                usage.clone(),
+                usage_cost_usd,
+            );
 
             (status, Json(value)).into_response()
         }
@@ -990,11 +995,12 @@ async fn stream_passthrough_response(
         {
             log_internal_error("persistence_failed", message);
         }
-        if let Err(message) =
-            run_detection_after_reconcile(&state, &normalized, &usage, usage_cost_usd).await
-        {
-            log_internal_error("detect_integration_failed", message);
-        }
+        spawn_detection_after_reconcile(
+            state.clone(),
+            normalized.clone(),
+            usage.clone(),
+            usage_cost_usd,
+        );
     });
 
     let mut response = Response::builder()
@@ -1077,6 +1083,21 @@ async fn run_detection_after_reconcile(
     }
 
     persist_detect_events(state, &result.events).await
+}
+
+fn spawn_detection_after_reconcile(
+    state: Arc<ProxyState>,
+    normalized: NormalizedRequest,
+    usage: NormalizedUsage,
+    usage_cost_usd: Money,
+) {
+    tokio::spawn(async move {
+        if let Err(message) =
+            run_detection_after_reconcile(&state, &normalized, &usage, usage_cost_usd).await
+        {
+            log_internal_error("detect_integration_failed", message);
+        }
+    });
 }
 
 async fn persist_detect_events(
@@ -1353,6 +1374,10 @@ mod tests {
             loop_window_seconds: 120,
             loop_threshold_similar_requests: threshold,
             loop_action,
+            min_burn_rate_observation_seconds: 30,
+            max_recorded_events: 5000,
+            session_state_retention_seconds: 3600,
+            max_sessions: 2048,
         }))
     }
 
@@ -2189,13 +2214,21 @@ action_on_soft = "warn"
             .map(ToOwned::to_owned)
             .expect("request id header");
 
-        let detail: String = sqlx::query_scalar(
-            "SELECT detail FROM events WHERE request_id = ?1 AND event_type = 'loop_detected' ORDER BY id DESC LIMIT 1",
-        )
-        .bind(&request_id)
-        .fetch_one(store.pool())
-        .await
-        .expect("detect event detail");
+        let mut detail = None;
+        for _ in 0..20 {
+            detail = sqlx::query_scalar(
+                "SELECT detail FROM events WHERE request_id = ?1 AND event_type = 'loop_detected' ORDER BY id DESC LIMIT 1",
+            )
+            .bind(&request_id)
+            .fetch_optional(store.pool())
+            .await
+            .expect("detect event detail query");
+            if detail.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let detail: String = detail.expect("detect event detail");
         let detail_json: Value = serde_json::from_str(&detail).expect("detail json");
         assert_eq!(detail_json["kind"], "content_similarity");
         assert!(

@@ -51,6 +51,10 @@ impl AdminState {
                 loop_window_seconds: 120,
                 loop_threshold_similar_requests: 8,
                 loop_action: LoopAction::Alert,
+                min_burn_rate_observation_seconds: 30,
+                max_recorded_events: 5000,
+                session_state_retention_seconds: 3600,
+                max_sessions: 2048,
             })),
             started_at: Instant::now(),
             event_poll_interval: Duration::from_millis(500),
@@ -1228,6 +1232,10 @@ mod tests {
             loop_window_seconds: 120,
             loop_threshold_similar_requests: 2,
             loop_action: LoopAction::Pause,
+            min_burn_rate_observation_seconds: 30,
+            max_recorded_events: 5000,
+            session_state_retention_seconds: 3600,
+            max_sessions: 2048,
         }));
         let now = Utc::now();
         let digest = |timestamp: DateTime<Utc>| RequestDigest {

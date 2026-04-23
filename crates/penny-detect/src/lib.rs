@@ -1,7 +1,7 @@
 //! Runaway loop and burn-rate detection.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const SESSION_PAUSED_LOOP_REASON: &str = "session_paused_loop_detected";
+const DEFAULT_MAX_SESSIONS: usize = 2048;
+const DEFAULT_MAX_RECORDED_EVENTS: usize = 5000;
+const DEFAULT_MIN_BURN_RATE_OBSERVATION_SECONDS: u64 = 30;
+const DEFAULT_SESSION_STATE_RETENTION_SECONDS: u64 = 3600;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetectorConfig {
@@ -20,6 +24,10 @@ pub struct DetectorConfig {
     pub loop_window_seconds: u64,
     pub loop_threshold_similar_requests: u32,
     pub loop_action: LoopAction,
+    pub min_burn_rate_observation_seconds: u64,
+    pub max_recorded_events: usize,
+    pub session_state_retention_seconds: u64,
+    pub max_sessions: usize,
 }
 
 impl From<&RuntimeDetectConfig> for DetectorConfig {
@@ -30,6 +38,10 @@ impl From<&RuntimeDetectConfig> for DetectorConfig {
             loop_window_seconds: value.loop_window_seconds,
             loop_threshold_similar_requests: value.loop_threshold_similar_requests,
             loop_action: value.loop_action.clone(),
+            min_burn_rate_observation_seconds: DEFAULT_MIN_BURN_RATE_OBSERVATION_SECONDS,
+            max_recorded_events: DEFAULT_MAX_RECORDED_EVENTS,
+            session_state_retention_seconds: DEFAULT_SESSION_STATE_RETENTION_SECONDS,
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 }
@@ -88,10 +100,16 @@ impl FeedResult {
 
 #[derive(Debug, Default)]
 struct DetectorState {
-    windows: HashMap<SessionId, Vec<RequestDigest>>,
+    windows: HashMap<SessionId, SessionWindow>,
     paused: HashMap<SessionId, PausedSession>,
     active_alerts: HashMap<SessionId, SessionAlert>,
     events: Vec<DetectEventRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionWindow {
+    digests: Vec<RequestDigest>,
+    last_seen: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -127,11 +145,30 @@ impl DetectEngine {
         }
 
         let mut state = self.write_state();
-        let window = state.windows.entry(session_id.to_string()).or_default();
-        window.push(digest.clone());
-        prune_window(window, digest.timestamp, self.config.loop_window_seconds);
+        prune_inactive_sessions(
+            &mut state,
+            digest.timestamp,
+            self.config.session_state_retention_seconds,
+        );
 
-        let alerts = self.detect_alerts(window, &digest);
+        let alerts = {
+            let window = state
+                .windows
+                .entry(session_id.to_string())
+                .or_insert_with(|| SessionWindow {
+                    digests: Vec::new(),
+                    last_seen: digest.timestamp,
+                });
+            window.last_seen = digest.timestamp;
+            window.digests.push(digest.clone());
+            prune_window(
+                &mut window.digests,
+                digest.timestamp,
+                self.config.loop_window_seconds,
+            );
+            self.detect_alerts(&window.digests, &digest)
+        };
+        cap_session_count(&mut state, self.config.max_sessions);
         if alerts.is_empty() {
             state.active_alerts.remove(session_id);
             return FeedResult::empty(session_id);
@@ -148,7 +185,11 @@ impl DetectEngine {
                 detail,
                 created_at: digest.timestamp,
             };
-            state.events.push(event.clone());
+            push_recorded_event(
+                &mut state.events,
+                event.clone(),
+                self.config.max_recorded_events,
+            );
             events.push(event);
         }
 
@@ -203,7 +244,11 @@ impl DetectEngine {
                 }),
                 created_at: digest.timestamp,
             };
-            state.events.push(pause_event.clone());
+            push_recorded_event(
+                &mut state.events,
+                pause_event.clone(),
+                self.config.max_recorded_events,
+            );
             events.push(pause_event);
             paused = true;
             pause_reason = Some(SESSION_PAUSED_LOOP_REASON.to_string());
@@ -236,6 +281,7 @@ impl DetectEngine {
     ) -> Option<DetectEventRecord> {
         let mut state = self.write_state();
         let paused = state.paused.remove(session_id)?;
+        state.windows.remove(session_id);
         let event = DetectEventRecord {
             session_id: session_id.to_string(),
             request_id: request_id.map(ToOwned::to_owned),
@@ -249,7 +295,11 @@ impl DetectEngine {
             created_at: Utc::now(),
         };
         state.active_alerts.remove(session_id);
-        state.events.push(event.clone());
+        push_recorded_event(
+            &mut state.events,
+            event.clone(),
+            self.config.max_recorded_events,
+        );
         Some(event)
     }
 
@@ -290,7 +340,11 @@ impl DetectEngine {
         ) {
             alerts.push(alert);
         }
-        if let Some(alert) = burn_rate_alert(window, self.config.burn_rate_alert_usd_per_hour) {
+        if let Some(alert) = burn_rate_alert(
+            window,
+            self.config.burn_rate_alert_usd_per_hour,
+            self.config.min_burn_rate_observation_seconds,
+        ) {
             alerts.push(alert);
         }
 
@@ -311,6 +365,55 @@ impl DetectEngine {
 fn prune_window(window: &mut Vec<RequestDigest>, now: DateTime<Utc>, window_seconds: u64) {
     let keep_after = now - Duration::seconds(window_seconds.max(1) as i64);
     window.retain(|entry| entry.timestamp >= keep_after);
+}
+
+fn push_recorded_event(events: &mut Vec<DetectEventRecord>, event: DetectEventRecord, max: usize) {
+    events.push(event);
+    if max == 0 {
+        events.clear();
+        return;
+    }
+    if events.len() > max {
+        let overflow = events.len() - max;
+        events.drain(0..overflow);
+    }
+}
+
+fn prune_inactive_sessions(state: &mut DetectorState, now: DateTime<Utc>, retention_seconds: u64) {
+    let keep_after = now - Duration::seconds(retention_seconds.max(1) as i64);
+    state
+        .windows
+        .retain(|_, window| window.last_seen >= keep_after);
+    let active_sessions: HashSet<_> = state.windows.keys().cloned().collect();
+    state.paused.retain(|session_id, paused| {
+        paused.paused_at >= keep_after && active_sessions.contains(session_id)
+    });
+    state.active_alerts.retain(|session_id, alert| {
+        alert.triggered_at >= keep_after && active_sessions.contains(session_id)
+    });
+}
+
+fn cap_session_count(state: &mut DetectorState, max_sessions: usize) {
+    if max_sessions == 0 {
+        state.windows.clear();
+        state.paused.clear();
+        state.active_alerts.clear();
+        return;
+    }
+
+    while state.windows.len() > max_sessions {
+        let Some(evict_session_id) = state
+            .windows
+            .iter()
+            .min_by_key(|(_, window)| window.last_seen)
+            .map(|(session_id, _)| session_id.clone())
+        else {
+            break;
+        };
+        state.windows.remove(&evict_session_id);
+        state.paused.remove(&evict_session_id);
+        state.active_alerts.remove(&evict_session_id);
+    }
 }
 
 fn tool_failure_repetition_alert(
@@ -363,14 +466,21 @@ fn content_similarity_alert(
     })
 }
 
-fn burn_rate_alert(window: &[RequestDigest], threshold: f64) -> Option<DetectAlert> {
+fn burn_rate_alert(
+    window: &[RequestDigest],
+    threshold: f64,
+    min_observation_seconds: u64,
+) -> Option<DetectAlert> {
     if threshold <= 0.0 || window.len() < 2 {
         return None;
     }
 
-    let first = window.iter().map(|entry| entry.timestamp).min()?;
-    let last = window.iter().map(|entry| entry.timestamp).max()?;
+    let first = window.first()?.timestamp;
+    let last = window.last()?.timestamp;
     let elapsed_seconds = (last - first).num_seconds().max(1) as f64;
+    if elapsed_seconds < min_observation_seconds.max(1) as f64 {
+        return None;
+    }
     let elapsed_hours = elapsed_seconds / 3600.0;
     let total_cost_usd: f64 = window.iter().map(|entry| entry.cost_usd.to_usd()).sum();
     let usd_per_hour = total_cost_usd / elapsed_hours;
@@ -463,6 +573,10 @@ mod tests {
             loop_window_seconds: 120,
             loop_threshold_similar_requests: 3,
             loop_action,
+            min_burn_rate_observation_seconds: DEFAULT_MIN_BURN_RATE_OBSERVATION_SECONDS,
+            max_recorded_events: DEFAULT_MAX_RECORDED_EVENTS,
+            session_state_retention_seconds: DEFAULT_SESSION_STATE_RETENTION_SECONDS,
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 
@@ -532,6 +646,7 @@ mod tests {
         let detector = DetectEngine::new(DetectorConfig {
             burn_rate_alert_usd_per_hour: 10.0,
             loop_threshold_similar_requests: 99,
+            min_burn_rate_observation_seconds: 1,
             ..config(LoopAction::Alert)
         });
         detector.feed("sess-c", Some("req-1"), digest(0, 1.0, None, true, 1));
@@ -568,9 +683,77 @@ mod tests {
             .expect("resume event");
         assert_eq!(resume.event_type, EventType::SessionResumed);
         assert!(!detector.is_session_paused("sess-d"));
+        let after_resume = detector.feed(
+            "sess-d",
+            Some("req-4"),
+            digest(3, 0.2, Some("tool"), false, 14),
+        );
+        assert!(
+            !after_resume.paused,
+            "session should not be immediately re-paused by stale history"
+        );
 
         let status = detector.status();
         assert!(status.paused_sessions.is_empty());
+    }
+
+    #[test]
+    fn burn_rate_alert_respects_minimum_observation_window() {
+        let detector = DetectEngine::new(DetectorConfig {
+            burn_rate_alert_usd_per_hour: 10.0,
+            loop_threshold_similar_requests: 99,
+            min_burn_rate_observation_seconds: 30,
+            ..config(LoopAction::Alert)
+        });
+        detector.feed("sess-f", Some("req-1"), digest(0, 10.0, None, true, 1));
+        let result = detector.feed("sess-f", Some("req-2"), digest(10, 10.0, None, true, 2));
+        assert!(
+            !result
+                .alerts
+                .iter()
+                .any(|alert| matches!(alert, DetectAlert::BurnRate { .. })),
+            "burn-rate should not trigger before minimum observation window elapses"
+        );
+    }
+
+    #[test]
+    fn recorded_events_are_capped_to_configured_capacity() {
+        let detector = DetectEngine::new(DetectorConfig {
+            max_recorded_events: 2,
+            loop_threshold_similar_requests: 1,
+            min_burn_rate_observation_seconds: 1,
+            ..config(LoopAction::Alert)
+        });
+
+        detector.feed("sess-g", Some("req-1"), digest(0, 0.1, None, true, 42));
+        detector.feed("sess-g", Some("req-2"), digest(1, 0.1, None, true, 42));
+        detector.feed("sess-g", Some("req-3"), digest(2, 0.1, None, true, 42));
+
+        let events = detector.recorded_events();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn stale_sessions_are_evicted_from_in_memory_state() {
+        let detector = DetectEngine::new(DetectorConfig {
+            session_state_retention_seconds: 5,
+            max_sessions: 128,
+            loop_threshold_similar_requests: 1,
+            ..config(LoopAction::Alert)
+        });
+
+        detector.feed("sess-old", Some("req-1"), digest(0, 0.1, None, true, 1));
+        detector.feed("sess-new", Some("req-2"), digest(20, 0.1, None, true, 2));
+
+        let status = detector.status();
+        assert!(status
+            .active_alerts
+            .iter()
+            .all(|alert| alert.session_id != "sess-old"));
+        assert!(status
+            .active_alerts
+            .iter()
+            .any(|alert| alert.session_id == "sess-new"));
     }
 
     #[test]
