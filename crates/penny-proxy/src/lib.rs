@@ -219,6 +219,12 @@ struct CleanupSettings {
     minify_json: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct CleanupMetrics {
+    input_bytes: u64,
+    output_bytes: u64,
+}
+
 impl Default for CleanupSettings {
     fn default() -> Self {
         Self {
@@ -231,6 +237,24 @@ impl Default for CleanupSettings {
 impl CleanupSettings {
     fn enabled(self) -> bool {
         self.strip_ansi || self.minify_json
+    }
+}
+
+impl CleanupMetrics {
+    fn from_lengths(input_bytes: usize, output_bytes: usize) -> Self {
+        Self {
+            input_bytes: input_bytes as u64,
+            output_bytes: output_bytes as u64,
+        }
+    }
+
+    fn bytes_saved(self) -> u64 {
+        self.input_bytes.saturating_sub(self.output_bytes)
+    }
+
+    fn merge(&mut self, other: CleanupMetrics) {
+        self.input_bytes = self.input_bytes.saturating_add(other.input_bytes);
+        self.output_bytes = self.output_bytes.saturating_add(other.output_bytes);
     }
 }
 
@@ -377,8 +401,10 @@ async fn post_chat_completions(
                 return (status, Json(value)).into_response();
             }
 
-            let usage = provider_usage_from_completion(&value)
+            let mut usage = provider_usage_from_completion(&value)
                 .unwrap_or_else(|| estimated_usage_from_request(&normalized));
+            let cleanup_metrics = apply_cleanup_to_json(&mut value, state.cleanup);
+            attach_cleanup_metrics(&mut usage, state.cleanup, cleanup_metrics);
             let usage_cost_usd =
                 compute_usage_cost_or_fallback(&state, &normalized, &usage, enforcement.as_ref())
                     .await;
@@ -415,7 +441,6 @@ async fn post_chat_completions(
                 usage.clone(),
                 usage_cost_usd,
             );
-            apply_cleanup_to_json(&mut value, state.cleanup);
 
             (status, Json(value)).into_response()
         }
@@ -591,25 +616,31 @@ fn provider_usage_from_completion(payload: &Value) -> Option<NormalizedUsage> {
     })
 }
 
-fn apply_cleanup_to_json(value: &mut Value, cleanup: CleanupSettings) {
+fn apply_cleanup_to_json(value: &mut Value, cleanup: CleanupSettings) -> CleanupMetrics {
     if !cleanup.enabled() {
-        return;
+        return CleanupMetrics::default();
     }
     match value {
         Value::String(text) => {
+            let before = text.len();
             *text = cleanup_text(text, cleanup);
+            CleanupMetrics::from_lengths(before, text.len())
         }
         Value::Array(items) => {
+            let mut total = CleanupMetrics::default();
             for item in items {
-                apply_cleanup_to_json(item, cleanup);
+                total.merge(apply_cleanup_to_json(item, cleanup));
             }
+            total
         }
         Value::Object(map) => {
+            let mut total = CleanupMetrics::default();
             for nested in map.values_mut() {
-                apply_cleanup_to_json(nested, cleanup);
+                total.merge(apply_cleanup_to_json(nested, cleanup));
             }
+            total
         }
-        _ => {}
+        _ => CleanupMetrics::default(),
     }
 }
 
@@ -648,36 +679,81 @@ fn minify_json_string(input: &str) -> Option<String> {
     serde_json::to_string(&parsed).ok()
 }
 
-fn cleanup_sse_line(line: &str, cleanup: CleanupSettings) -> String {
+fn cleanup_sse_line(line: &str, cleanup: CleanupSettings) -> (String, CleanupMetrics) {
     if !cleanup.enabled() {
-        return line.to_string();
+        return (line.to_string(), CleanupMetrics::default());
     }
 
     let trimmed = line.trim_end_matches(['\r', '\n']);
     let trailing_newline = &line[trimmed.len()..];
     let Some(data) = trimmed.strip_prefix("data:") else {
-        return if cleanup.strip_ansi {
+        let cleaned = if cleanup.strip_ansi {
             strip_ansi_sequences(line)
         } else {
             line.to_string()
         };
+        return (
+            cleaned.clone(),
+            CleanupMetrics::from_lengths(line.len(), cleaned.len()),
+        );
     };
     let payload = data.trim_start();
     if payload.eq_ignore_ascii_case("[DONE]") {
-        return line.to_string();
+        return (line.to_string(), CleanupMetrics::default());
     }
     let Ok(mut parsed) = serde_json::from_str::<Value>(payload) else {
-        return if cleanup.strip_ansi {
+        let cleaned = if cleanup.strip_ansi {
             strip_ansi_sequences(line)
         } else {
             line.to_string()
         };
+        return (
+            cleaned.clone(),
+            CleanupMetrics::from_lengths(line.len(), cleaned.len()),
+        );
     };
     apply_cleanup_to_json(&mut parsed, cleanup);
     match serde_json::to_string(&parsed) {
-        Ok(serialized) => format!("data: {serialized}{trailing_newline}"),
-        Err(_) => line.to_string(),
+        Ok(serialized) => {
+            let cleaned = format!("data: {serialized}{trailing_newline}");
+            (
+                cleaned.clone(),
+                CleanupMetrics::from_lengths(line.len(), cleaned.len()),
+            )
+        }
+        Err(_) => (line.to_string(), CleanupMetrics::default()),
     }
+}
+
+fn attach_cleanup_metrics(
+    usage: &mut NormalizedUsage,
+    cleanup: CleanupSettings,
+    metrics: CleanupMetrics,
+) {
+    if !cleanup.enabled() {
+        return;
+    }
+
+    let mut snapshot = usage
+        .pricing_snapshot
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    if usage.pricing_snapshot.as_object().is_none() {
+        snapshot.insert("raw_snapshot".to_string(), usage.pricing_snapshot.clone());
+    }
+    snapshot.insert(
+        "payload_cleanup".to_string(),
+        json!({
+            "enabled": true,
+            "strip_ansi": cleanup.strip_ansi,
+            "minify_json": cleanup.minify_json,
+            "bytes_in": metrics.input_bytes,
+            "bytes_out": metrics.output_bytes,
+            "bytes_saved": metrics.bytes_saved(),
+        }),
+    );
+    usage.pricing_snapshot = Value::Object(snapshot);
 }
 
 fn provider_usage_from_sse_lines(lines: &[String]) -> Option<NormalizedUsage> {
@@ -1078,9 +1154,11 @@ async fn stream_passthrough_response(
     let (client_tx, client_rx) = mpsc::channel::<Result<Bytes, Infallible>>(64);
     tokio::spawn(async move {
         let mut lines = Vec::new();
+        let mut cleanup_metrics = CleanupMetrics::default();
         let mut saw_done = false;
         while let Some(line) = upstream.recv().await {
-            let line = cleanup_sse_line(&line, state.cleanup);
+            let (line, line_metrics) = cleanup_sse_line(&line, state.cleanup);
+            cleanup_metrics.merge(line_metrics);
             if line.trim().eq_ignore_ascii_case("data: [done]") {
                 saw_done = true;
             }
@@ -1095,6 +1173,7 @@ async fn stream_passthrough_response(
 
         let mut usage = provider_usage_from_sse_lines(&lines)
             .unwrap_or_else(|| estimated_usage_from_request(&normalized));
+        attach_cleanup_metrics(&mut usage, state.cleanup, cleanup_metrics);
         if !saw_done {
             mark_stream_incomplete(&mut usage);
             log_provider_failure_event(
@@ -1714,6 +1793,17 @@ mod tests {
         build_router(state)
     }
 
+    async fn app_with_ansi_provider_and_store(cleanup: CleanupSettings) -> (Router, SqliteStore) {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        let provider: Arc<dyn ProviderAdapter> = Arc::new(AnsiContentProvider);
+        let state = ProxyState::with_provider(provider, vec!["claude-sonnet-4-6".to_string()])
+            .with_store(store.clone())
+            .with_cleanup(cleanup);
+        (build_router(state), store)
+    }
+
     async fn seed_pricebooks(store: &SqliteStore) {
         let prices_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../prices")
@@ -1995,6 +2085,96 @@ action_on_soft = "warn"
         assert!(text.contains("stream colored"));
         assert!(!text.contains('\u{1b}'));
         assert!(text.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_metrics_are_persisted_when_enabled() {
+        let (app, store) = app_with_ansi_provider_and_store(CleanupSettings::default()).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"metrics please"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+
+        let pricing_snapshot: String =
+            sqlx::query_scalar("SELECT pricing_snapshot FROM request_usage WHERE request_id = ?1")
+                .bind(&request_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("usage pricing snapshot");
+        let pricing_json: Value = serde_json::from_str(&pricing_snapshot).expect("pricing json");
+        let metrics = &pricing_json["payload_cleanup"];
+        assert_eq!(metrics["enabled"], true);
+        assert_eq!(metrics["strip_ansi"], true);
+        assert_eq!(metrics["minify_json"], false);
+        assert!(
+            metrics["bytes_saved"].as_u64().expect("bytes_saved as u64") > 0,
+            "expected ANSI cleanup to save bytes: {pricing_json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_cleanup_metrics_are_accumulated_in_usage_snapshot() {
+        let (app, store) = app_with_ansi_provider_and_store(CleanupSettings::default()).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"stream metrics"}],
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+
+        let _body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read stream body");
+        sleep(Duration::from_millis(50)).await;
+
+        let pricing_snapshot: String =
+            sqlx::query_scalar("SELECT pricing_snapshot FROM request_usage WHERE request_id = ?1")
+                .bind(&request_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("usage pricing snapshot");
+        let pricing_json: Value = serde_json::from_str(&pricing_snapshot).expect("pricing json");
+        let metrics = &pricing_json["payload_cleanup"];
+        let bytes_in = metrics["bytes_in"].as_u64().expect("bytes_in as u64");
+        let bytes_out = metrics["bytes_out"].as_u64().expect("bytes_out as u64");
+        assert!(bytes_in > 0, "expected non-zero bytes_in: {pricing_json}");
+        assert!(
+            bytes_in > bytes_out,
+            "expected cleanup savings: {pricing_json}"
+        );
     }
 
     #[test]
