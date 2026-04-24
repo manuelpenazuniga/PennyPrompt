@@ -25,6 +25,7 @@ Config is resolved in this order (later overrides earlier):
 - `[providers.openai]`
 - `[[budgets]]` (one or more)
 - `[detect]`
+- `[cleanup]`
 
 ## Section Reference
 
@@ -75,6 +76,11 @@ Validation rule:
 - `loop_threshold_similar_requests` (`u32`)
 - `loop_action` (`alert|pause`)
 
+## `[cleanup]`
+
+- `strip_ansi` (`bool`, default `true`): remove ANSI escape sequences from text payloads.
+- `minify_json` (`bool`, default `false`): attempts to minify string fields that contain valid JSON; treat as experimental opt-in.
+
 ## Presets
 
 Current preset files:
@@ -94,6 +100,8 @@ Preset budgets are tagged internally with `preset:<name>` when applied.
 - `PENNY_DEFAULTS_MODEL`
 - `PENNY_ATTRIBUTION_AUTO_DETECT_PROJECT` (`true|false|1|0|yes|no|on|off`)
 - `PENNY_ATTRIBUTION_SESSION_WINDOW_MINUTES` (integer)
+- `PENNY_CLEANUP_STRIP_ANSI` (`true|false|1|0|yes|no|on|off`)
+- `PENNY_CLEANUP_MINIFY_JSON` (`true|false|1|0|yes|no|on|off`)
 
 ## Example Minimal Config
 
@@ -138,4 +146,8 @@ burn_rate_alert_usd_per_hour = 10.0
 loop_window_seconds = 120
 loop_threshold_similar_requests = 8
 loop_action = "pause"
+
+[cleanup]
+strip_ansi = true
+minify_json = false
 ```

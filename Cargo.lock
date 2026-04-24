@@ -1459,6 +1459,7 @@ dependencies = [
  "penny-providers",
  "penny-store",
  "penny-types",
+ "regex",
  "serde",
  "serde_json",
  "sqlx",

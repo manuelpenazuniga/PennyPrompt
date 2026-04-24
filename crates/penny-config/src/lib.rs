@@ -100,6 +100,21 @@ pub struct DetectConfig {
     pub loop_action: LoopAction,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupConfig {
+    pub strip_ansi: bool,
+    pub minify_json: bool,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            strip_ansi: true,
+            minify_json: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub server: ServerConfig,
@@ -108,6 +123,8 @@ pub struct AppConfig {
     pub providers: ProvidersConfig,
     pub budgets: Vec<BudgetConfig>,
     pub detect: DetectConfig,
+    #[serde(default)]
+    pub cleanup: CleanupConfig,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -291,6 +308,18 @@ fn apply_env_overrides(cfg: &mut PartialAppConfig) -> Result<(), ConfigError> {
             .get_or_insert_with(Default::default)
             .session_window_minutes = Some(parsed);
     }
+    if let Ok(v) = env::var("PENNY_CLEANUP_STRIP_ANSI") {
+        let parsed = parse_bool(&v).ok_or_else(|| {
+            ConfigError::Validation("PENNY_CLEANUP_STRIP_ANSI must be boolean".to_string())
+        })?;
+        cfg.cleanup.get_or_insert_with(Default::default).strip_ansi = Some(parsed);
+    }
+    if let Ok(v) = env::var("PENNY_CLEANUP_MINIFY_JSON") {
+        let parsed = parse_bool(&v).ok_or_else(|| {
+            ConfigError::Validation("PENNY_CLEANUP_MINIFY_JSON must be boolean".to_string())
+        })?;
+        cfg.cleanup.get_or_insert_with(Default::default).minify_json = Some(parsed);
+    }
     Ok(())
 }
 
@@ -374,6 +403,7 @@ struct PartialAppConfig {
     providers: Option<PartialProvidersConfig>,
     budgets: Option<Vec<BudgetConfig>>,
     detect: Option<PartialDetectConfig>,
+    cleanup: Option<PartialCleanupConfig>,
 }
 
 impl PartialAppConfig {
@@ -385,6 +415,7 @@ impl PartialAppConfig {
         });
         merge_partial(&mut self.providers, other.providers, |a, b| a.merge_from(b));
         merge_partial(&mut self.detect, other.detect, |a, b| a.merge_from(b));
+        merge_partial(&mut self.cleanup, other.cleanup, |a, b| a.merge_from(b));
 
         if other.budgets.is_some() {
             self.budgets = other.budgets;
@@ -416,6 +447,10 @@ impl PartialAppConfig {
                 .detect
                 .ok_or_else(|| ConfigError::Validation("missing [detect]".to_string()))?
                 .require()?,
+            cleanup: self
+                .cleanup
+                .map(PartialCleanupConfig::require)
+                .unwrap_or_default(),
         })
     }
 }
@@ -615,6 +650,30 @@ struct PartialDetectConfig {
     loop_action: Option<LoopAction>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PartialCleanupConfig {
+    strip_ansi: Option<bool>,
+    minify_json: Option<bool>,
+}
+
+impl PartialCleanupConfig {
+    fn merge_from(&mut self, other: PartialCleanupConfig) {
+        if other.strip_ansi.is_some() {
+            self.strip_ansi = other.strip_ansi;
+        }
+        if other.minify_json.is_some() {
+            self.minify_json = other.minify_json;
+        }
+    }
+
+    fn require(self) -> CleanupConfig {
+        CleanupConfig {
+            strip_ansi: self.strip_ansi.unwrap_or(true),
+            minify_json: self.minify_json.unwrap_or(false),
+        }
+    }
+}
+
 impl PartialDetectConfig {
     fn merge_from(&mut self, other: PartialDetectConfig) {
         if other.enabled.is_some() {
@@ -721,6 +780,10 @@ burn_rate_alert_usd_per_hour = 10.0
 loop_window_seconds = 120
 loop_threshold_similar_requests = 8
 loop_action = "pause"
+
+[cleanup]
+strip_ansi = true
+minify_json = false
 "#,
         );
         write_file(
@@ -776,6 +839,8 @@ soft_limit_usd = 10.0
         env::remove_var("PENNY_DEFAULTS_MODEL");
         env::remove_var("PENNY_ATTRIBUTION_AUTO_DETECT_PROJECT");
         env::remove_var("PENNY_ATTRIBUTION_SESSION_WINDOW_MINUTES");
+        env::remove_var("PENNY_CLEANUP_STRIP_ANSI");
+        env::remove_var("PENNY_CLEANUP_MINIFY_JSON");
     }
 
     #[test]
@@ -793,6 +858,8 @@ soft_limit_usd = 10.0
         assert_eq!(cfg.server.bind, "127.0.0.1:8585");
         assert_eq!(cfg.defaults.model, "claude-sonnet-4-6");
         assert_eq!(cfg.budgets.len(), 1);
+        assert!(cfg.cleanup.strip_ansi);
+        assert!(!cfg.cleanup.minify_json);
     }
 
     #[test]
@@ -822,6 +889,8 @@ soft_limit_usd = 10.0
         env::set_var("PENNY_DEFAULTS_MODEL", "gpt-5.2");
         env::set_var("PENNY_SERVER_BIND", "0.0.0.0:8585");
         env::set_var("PENNY_ATTRIBUTION_SESSION_WINDOW_MINUTES", "45");
+        env::set_var("PENNY_CLEANUP_STRIP_ANSI", "false");
+        env::set_var("PENNY_CLEANUP_MINIFY_JSON", "true");
 
         let cfg = load_config(LoadOptions {
             repository_root: Some(repo.path().to_path_buf()),
@@ -832,6 +901,8 @@ soft_limit_usd = 10.0
         assert_eq!(cfg.defaults.model, "gpt-5.2");
         assert_eq!(cfg.server.bind, "0.0.0.0:8585");
         assert_eq!(cfg.attribution.session_window_minutes, 45);
+        assert!(!cfg.cleanup.strip_ansi);
+        assert!(cfg.cleanup.minify_json);
     }
 
     #[test]
