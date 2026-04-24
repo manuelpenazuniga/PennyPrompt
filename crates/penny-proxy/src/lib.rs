@@ -653,7 +653,7 @@ fn cleanup_sse_line(line: &str, cleanup: CleanupSettings) -> String {
         return line.to_string();
     }
 
-    let trimmed = line.trim_end_matches(|ch| ch == '\r' || ch == '\n');
+    let trimmed = line.trim_end_matches(['\r', '\n']);
     let trailing_newline = &line[trimmed.len()..];
     let Some(data) = trimmed.strip_prefix("data:") else {
         return if cleanup.strip_ansi {
