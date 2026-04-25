@@ -42,3 +42,21 @@ Decision:
 - This recommendation set remains documented and discoverable.
 - Blocking risks are not present in current implementation scope.
 - Future hardening can be tracked independently without stalling roadmap flow.
+
+## 2026-04: Detect Resume Consistency Policy (`#110`)
+
+Context:
+- Gemini review on PR #97 flagged ambiguity in resume semantics when event
+  persistence fails.
+
+Selected policy:
+- `detect resume` is **best-effort persist after in-memory resume**.
+- We prioritize unblocking the paused session in-memory first.
+- Event persistence is attempted immediately after and reported explicitly.
+
+API contract:
+- `resumed: true` means the in-memory pause state was cleared.
+- `persisted` indicates whether the `session_resumed` event was written.
+- `consistency.mode = best_effort_resume_then_persist`
+- `consistency.event_persistence_guarantee = best_effort`
+- `warning` is present when persistence fails.
