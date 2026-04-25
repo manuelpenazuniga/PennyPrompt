@@ -1,7 +1,7 @@
 //! Runaway loop and burn-rate detection.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, VecDeque},
     sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
@@ -103,7 +103,7 @@ struct DetectorState {
     windows: HashMap<SessionId, SessionWindow>,
     paused: HashMap<SessionId, PausedSession>,
     active_alerts: HashMap<SessionId, SessionAlert>,
-    events: Vec<DetectEventRecord>,
+    events: VecDeque<DetectEventRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -320,7 +320,7 @@ impl DetectEngine {
     }
 
     pub fn recorded_events(&self) -> Vec<DetectEventRecord> {
-        self.read_state().events.clone()
+        self.read_state().events.iter().cloned().collect()
     }
 
     fn detect_alerts(&self, window: &[RequestDigest], current: &RequestDigest) -> Vec<DetectAlert> {
@@ -367,15 +367,19 @@ fn prune_window(window: &mut Vec<RequestDigest>, now: DateTime<Utc>, window_seco
     window.retain(|entry| entry.timestamp >= keep_after);
 }
 
-fn push_recorded_event(events: &mut Vec<DetectEventRecord>, event: DetectEventRecord, max: usize) {
-    events.push(event);
+fn push_recorded_event(
+    events: &mut VecDeque<DetectEventRecord>,
+    event: DetectEventRecord,
+    max: usize,
+) {
     if max == 0 {
         events.clear();
         return;
     }
-    if events.len() > max {
-        let overflow = events.len() - max;
-        events.drain(0..overflow);
+
+    events.push_back(event);
+    while events.len() > max {
+        events.pop_front();
     }
 }
 
@@ -384,13 +388,26 @@ fn prune_inactive_sessions(state: &mut DetectorState, now: DateTime<Utc>, retent
     state
         .windows
         .retain(|_, window| window.last_seen >= keep_after);
-    let active_sessions: HashSet<_> = state.windows.keys().cloned().collect();
-    state.paused.retain(|session_id, paused| {
-        paused.paused_at >= keep_after && active_sessions.contains(session_id)
-    });
-    state.active_alerts.retain(|session_id, alert| {
-        alert.triggered_at >= keep_after && active_sessions.contains(session_id)
-    });
+
+    let mut stale_paused = Vec::new();
+    for (session_id, paused) in &state.paused {
+        if paused.paused_at < keep_after || !state.windows.contains_key(session_id) {
+            stale_paused.push(session_id.clone());
+        }
+    }
+    for session_id in stale_paused {
+        state.paused.remove(&session_id);
+    }
+
+    let mut stale_alerts = Vec::new();
+    for (session_id, alert) in &state.active_alerts {
+        if alert.triggered_at < keep_after || !state.windows.contains_key(session_id) {
+            stale_alerts.push(session_id.clone());
+        }
+    }
+    for session_id in stale_alerts {
+        state.active_alerts.remove(&session_id);
+    }
 }
 
 fn cap_session_count(state: &mut DetectorState, max_sessions: usize) {
@@ -401,15 +418,19 @@ fn cap_session_count(state: &mut DetectorState, max_sessions: usize) {
         return;
     }
 
-    while state.windows.len() > max_sessions {
-        let Some(evict_session_id) = state
-            .windows
-            .iter()
-            .min_by_key(|(_, window)| window.last_seen)
-            .map(|(session_id, _)| session_id.clone())
-        else {
-            break;
-        };
+    if state.windows.len() <= max_sessions {
+        return;
+    }
+
+    let overflow = state.windows.len() - max_sessions;
+    let mut candidates: Vec<_> = state
+        .windows
+        .iter()
+        .map(|(session_id, window)| (session_id.clone(), window.last_seen))
+        .collect();
+    candidates.sort_unstable_by_key(|(_, last_seen)| *last_seen);
+
+    for (evict_session_id, _) in candidates.into_iter().take(overflow) {
         state.windows.remove(&evict_session_id);
         state.paused.remove(&evict_session_id);
         state.active_alerts.remove(&evict_session_id);
