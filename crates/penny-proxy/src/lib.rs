@@ -679,6 +679,16 @@ fn minify_json_string(input: &str) -> Option<String> {
     serde_json::to_string(&parsed).ok()
 }
 
+fn payload_requires_json_roundtrip(payload: &str, cleanup: CleanupSettings) -> bool {
+    if cleanup.minify_json {
+        return true;
+    }
+    if !cleanup.strip_ansi {
+        return false;
+    }
+    payload.contains('\u{1b}') || payload.contains("\\u001b") || payload.contains("\\u001B")
+}
+
 fn cleanup_sse_line(line: &str, cleanup: CleanupSettings) -> (String, CleanupMetrics) {
     if !cleanup.enabled() {
         return (line.to_string(), CleanupMetrics::default());
@@ -692,34 +702,33 @@ fn cleanup_sse_line(line: &str, cleanup: CleanupSettings) -> (String, CleanupMet
         } else {
             line.to_string()
         };
-        return (
-            cleaned.clone(),
-            CleanupMetrics::from_lengths(line.len(), cleaned.len()),
-        );
+        let metrics = CleanupMetrics::from_lengths(line.len(), cleaned.len());
+        return (cleaned, metrics);
     };
     let payload = data.trim_start();
     if payload.eq_ignore_ascii_case("[DONE]") {
         return (line.to_string(), CleanupMetrics::default());
     }
+
+    if !payload_requires_json_roundtrip(payload, cleanup) {
+        return (line.to_string(), CleanupMetrics::default());
+    }
+
     let Ok(mut parsed) = serde_json::from_str::<Value>(payload) else {
         let cleaned = if cleanup.strip_ansi {
             strip_ansi_sequences(line)
         } else {
             line.to_string()
         };
-        return (
-            cleaned.clone(),
-            CleanupMetrics::from_lengths(line.len(), cleaned.len()),
-        );
+        let metrics = CleanupMetrics::from_lengths(line.len(), cleaned.len());
+        return (cleaned, metrics);
     };
     apply_cleanup_to_json(&mut parsed, cleanup);
     match serde_json::to_string(&parsed) {
         Ok(serialized) => {
             let cleaned = format!("data: {serialized}{trailing_newline}");
-            (
-                cleaned.clone(),
-                CleanupMetrics::from_lengths(line.len(), cleaned.len()),
-            )
+            let metrics = CleanupMetrics::from_lengths(line.len(), cleaned.len());
+            (cleaned, metrics)
         }
         Err(_) => (line.to_string(), CleanupMetrics::default()),
     }
@@ -2185,6 +2194,31 @@ action_on_soft = "warn"
         };
         let input = " { \"a\": 1, \"b\": [1, 2] } ";
         assert_eq!(cleanup_text(input, cleanup), "{\"a\":1,\"b\":[1,2]}");
+    }
+
+    #[test]
+    fn cleanup_sse_line_skips_json_roundtrip_when_unneeded() {
+        let cleanup = CleanupSettings {
+            strip_ansi: true,
+            minify_json: false,
+        };
+        let line = "data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"plain\"}}]}\n\n";
+        let (cleaned, metrics) = cleanup_sse_line(line, cleanup);
+        assert_eq!(cleaned, line);
+        assert_eq!(metrics.bytes_saved(), 0);
+    }
+
+    #[test]
+    fn cleanup_sse_line_strips_escaped_ansi_without_minify() {
+        let cleanup = CleanupSettings {
+            strip_ansi: true,
+            minify_json: false,
+        };
+        let line = "data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"\\u001b[31mhello\\u001b[0m\"}}]}\n\n";
+        let (cleaned, metrics) = cleanup_sse_line(line, cleanup);
+        assert!(cleaned.contains("hello"));
+        assert!(!cleaned.contains("\\u001b"));
+        assert!(metrics.bytes_saved() > 0);
     }
 
     #[tokio::test]
