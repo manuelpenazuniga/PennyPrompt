@@ -928,9 +928,8 @@ fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
 fn drain_sse_events(buffer: &mut Vec<u8>) -> Vec<String> {
     let mut events = Vec::new();
     while let Some((idx, delimiter_len)) = find_sse_delimiter(buffer) {
-        let raw = buffer.drain(..idx).collect::<Vec<u8>>();
-        buffer.drain(..delimiter_len);
-        let raw = String::from_utf8_lossy(&raw).into_owned();
+        let raw = String::from_utf8_lossy(&buffer[..idx]).into_owned();
+        buffer.drain(..(idx + delimiter_len));
         if raw.trim().is_empty() {
             continue;
         }

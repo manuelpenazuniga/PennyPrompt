@@ -514,10 +514,10 @@ async fn get_report_summary(
         }
     };
     let totals = SummaryTotals {
-        request_count: totals_row.get("request_count"),
-        input_tokens: totals_row.get("input_tokens"),
-        output_tokens: totals_row.get("output_tokens"),
-        cost_usd: Money::from_micros(totals_row.get("total_cost_micros")),
+        request_count: totals_row.get::<i64, _>("request_count"),
+        input_tokens: totals_row.get::<i64, _>("input_tokens"),
+        output_tokens: totals_row.get::<i64, _>("output_tokens"),
+        cost_usd: Money::from_micros(totals_row.get::<i64, _>("total_cost_micros")),
     };
     let total_groups = totals_row.get::<i64, _>("total_groups");
     let returned_groups = summary_rows.len() as i64;
