@@ -46,9 +46,17 @@ fn is_sqlite_lock(err: &LedgerError) -> bool {
         LedgerError::Sqlx(inner) => inner
             .as_database_error()
             .and_then(|db_err| db_err.code())
-            .is_some_and(|code| code == "5" || code == "6"),
+            .is_some_and(|code| is_sqlite_lock_code(code.as_ref())),
         _ => false,
     }
+}
+
+fn sqlite_primary_code(code: &str) -> Option<i32> {
+    code.parse::<i32>().ok().map(|raw| raw & 0xFF)
+}
+
+fn is_sqlite_lock_code(code: &str) -> bool {
+    matches!(sqlite_primary_code(code), Some(5 | 6))
 }
 
 async fn reserve_with_retry(
@@ -266,5 +274,33 @@ async fn mixed_concurrent_reserve_and_release_preserves_running_total_invariants
     assert!(
         max_total <= hard_limit.micros(),
         "running total must stay within hard limit"
+    );
+}
+
+#[test]
+fn sqlite_lock_code_classification_handles_primary_and_extended_values() {
+    assert!(
+        is_sqlite_lock_code("5"),
+        "SQLITE_BUSY should be treated as lock"
+    );
+    assert!(
+        is_sqlite_lock_code("6"),
+        "SQLITE_LOCKED should be treated as lock"
+    );
+    assert!(
+        is_sqlite_lock_code("261"),
+        "SQLITE_BUSY_RECOVERY should map to SQLITE_BUSY primary code"
+    );
+    assert!(
+        is_sqlite_lock_code("262"),
+        "SQLITE_LOCKED_SHAREDCACHE should map to SQLITE_LOCKED primary code"
+    );
+    assert!(
+        !is_sqlite_lock_code("2067"),
+        "UNIQUE constraint code must not be treated as lock"
+    );
+    assert!(
+        !is_sqlite_lock_code("not-a-number"),
+        "non numeric codes are not SQLite lock codes"
     );
 }
