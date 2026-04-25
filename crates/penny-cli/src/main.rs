@@ -273,6 +273,44 @@ struct SummaryRow {
     total_cost_usd: f64,
 }
 
+struct StagingDirGuard {
+    path: PathBuf,
+}
+
+impl StagingDirGuard {
+    fn new(path: PathBuf) -> Result<Self, CliError> {
+        fs::create_dir_all(&path).map_err(|error| {
+            CliError::Cost(format!(
+                "failed to create temp pricebook directory {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { path })
+    }
+
+    fn create_pricebook_staging_dir() -> Result<Self, CliError> {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "pennyprompt-pricebooks-{}-{seed}",
+            std::process::id()
+        ));
+        Self::new(path)
+    }
+
+    fn file(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+impl Drop for StagingDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct TopRow {
     request_id: String,
@@ -743,23 +781,9 @@ async fn run_prices_show(store: &SqliteStore, limit: u32) -> Result<(), CliError
 }
 
 async fn run_prices_update(store: &SqliteStore) -> Result<(), CliError> {
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let staging_dir = std::env::temp_dir().join(format!(
-        "pennyprompt-pricebooks-{}-{seed}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&staging_dir).map_err(|error| {
-        CliError::Cost(format!(
-            "failed to create temp pricebook directory {}: {error}",
-            staging_dir.display()
-        ))
-    })?;
-
-    let anthropic = staging_dir.join("anthropic.toml");
-    let openai = staging_dir.join("openai.toml");
+    let staging_dir = StagingDirGuard::create_pricebook_staging_dir()?;
+    let anthropic = staging_dir.file("anthropic.toml");
+    let openai = staging_dir.file("openai.toml");
     fs::write(&anthropic, PRICEBOOK_ANTHROPIC_TOML).map_err(|error| {
         CliError::Cost(format!(
             "failed to stage embedded pricebook {}: {error}",
@@ -776,7 +800,6 @@ async fn run_prices_update(store: &SqliteStore) -> Result<(), CliError> {
     let imported = import_pricebook_files(store, &[anthropic.clone(), openai.clone()])
         .await
         .map_err(|error| CliError::Cost(error.to_string()))?;
-    let _ = fs::remove_dir_all(&staging_dir);
     println!("Pricebook update completed");
     println!("  imported_entries: {imported}");
     Ok(())
@@ -2745,6 +2768,21 @@ mod tests {
         assert_eq!(
             rendered,
             "Run launcher plan\n  mode: dry_run\n  agent: codex\n  project_id: my-project\n  session_id: session-auto\n  cwd: /tmp/work\n  proxy_bind: 127.0.0.1:8585\n  admin_socket: 127.0.0.1:8586\n  database_path: ~/.config/pennyprompt/pennyprompt.db\n  config_path: ~/.config/pennyprompt/config.toml"
+        );
+    }
+
+    #[test]
+    fn staging_dir_guard_removes_directory_on_drop() {
+        let root = tempdir().expect("temp root");
+        let staging_path = root.path().join("pricebook-staging");
+        {
+            let guard = StagingDirGuard::new(staging_path.clone()).expect("create staging guard");
+            fs::write(guard.file("probe.toml"), "ok").expect("write probe file");
+            assert!(staging_path.exists());
+        }
+        assert!(
+            !staging_path.exists(),
+            "staging dir should be removed on drop"
         );
     }
 }
