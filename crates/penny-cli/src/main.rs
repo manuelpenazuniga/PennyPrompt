@@ -109,6 +109,12 @@ enum Commands {
         #[command(subcommand)]
         command: ReportCommands,
     },
+    Dashboard {
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        limit: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -268,6 +274,14 @@ impl SummaryBy {
 #[derive(Debug, Clone, PartialEq)]
 struct SummaryRow {
     group_key: String,
+    request_count: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DashboardTotals {
     request_count: i64,
     input_tokens: i64,
     output_tokens: i64,
@@ -649,20 +663,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         }
         Commands::Report { command } => match command {
             ReportCommands::Summary { since, by, format } => {
-                let cutoff = since
-                    .as_deref()
-                    .map(parse_since_duration)
-                    .transpose()?
-                    .map(|duration| {
-                        chrono::Duration::from_std(duration)
-                            .map(|chrono_duration| Utc::now() - chrono_duration)
-                            .map_err(|_| {
-                                CliError::InvalidSince(
-                                    since.clone().unwrap_or_else(|| "unknown".to_string()),
-                                )
-                            })
-                    })
-                    .transpose()?;
+                let cutoff = parse_since_cutoff(since.as_deref())?;
                 let rows = fetch_summary_rows(&store, by, cutoff).await?;
                 print_summary(by, since.as_deref(), &rows, format)?;
             }
@@ -670,6 +671,10 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 run_report_top(&store, limit).await?;
             }
         },
+        Commands::Dashboard { since, limit } => {
+            let cutoff = parse_since_cutoff(since.as_deref())?;
+            run_dashboard(&store, since.as_deref(), cutoff, limit).await?;
+        }
     }
     Ok(())
 }
@@ -2124,6 +2129,16 @@ fn parse_since_duration(raw: &str) -> Result<Duration, CliError> {
     Ok(Duration::from_secs(seconds))
 }
 
+fn parse_since_cutoff(since: Option<&str>) -> Result<Option<DateTime<Utc>>, CliError> {
+    let Some(raw) = since else {
+        return Ok(None);
+    };
+    let duration = parse_since_duration(raw)?;
+    let chrono_duration = chrono::Duration::from_std(duration)
+        .map_err(|_| CliError::InvalidSince(raw.to_string()))?;
+    Ok(Some(Utc::now() - chrono_duration))
+}
+
 async fn fetch_summary_rows(
     store: &SqliteStore,
     by: SummaryBy,
@@ -2194,6 +2209,121 @@ fn print_summary(
             Ok(())
         }
     }
+}
+
+async fn run_dashboard(
+    store: &SqliteStore,
+    since: Option<&str>,
+    cutoff: Option<DateTime<Utc>>,
+    limit: u32,
+) -> Result<(), CliError> {
+    let by_project = fetch_summary_rows(store, SummaryBy::Project, cutoff).await?;
+    let by_model = fetch_summary_rows(store, SummaryBy::Model, cutoff).await?;
+    let limit = limit.clamp(1, 50) as usize;
+    let totals = compute_dashboard_totals(&by_project);
+    let rendered = render_dashboard_snapshot(since, totals, &by_project, &by_model, limit);
+    println!("{rendered}");
+    Ok(())
+}
+
+fn compute_dashboard_totals(rows: &[SummaryRow]) -> DashboardTotals {
+    DashboardTotals {
+        request_count: rows.iter().map(|row| row.request_count).sum(),
+        input_tokens: rows.iter().map(|row| row.input_tokens).sum(),
+        output_tokens: rows.iter().map(|row| row.output_tokens).sum(),
+        total_cost_usd: rows.iter().map(|row| row.total_cost_usd).sum(),
+    }
+}
+
+fn render_dashboard_section(title: &str, rows: &[SummaryRow], limit: usize) -> String {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL).set_header([
+        Cell::new("group").add_attribute(Attribute::Bold),
+        Cell::new("requests").add_attribute(Attribute::Bold),
+        Cell::new("input_tokens").add_attribute(Attribute::Bold),
+        Cell::new("output_tokens").add_attribute(Attribute::Bold),
+        Cell::new("cost_usd").add_attribute(Attribute::Bold),
+    ]);
+
+    if rows.is_empty() {
+        table.add_row([
+            Cell::new("(no data)"),
+            Cell::new(0),
+            Cell::new(0),
+            Cell::new(0),
+            Cell::new(format!("{:.6}", 0.0)),
+        ]);
+    } else {
+        for row in rows.iter().take(limit) {
+            table.add_row([
+                Cell::new(&row.group_key),
+                Cell::new(row.request_count),
+                Cell::new(row.input_tokens),
+                Cell::new(row.output_tokens),
+                Cell::new(format!("{:.6}", row.total_cost_usd)),
+            ]);
+        }
+    }
+
+    format!("{title}\n{table}")
+}
+
+fn render_dashboard_snapshot(
+    since: Option<&str>,
+    totals: DashboardTotals,
+    by_project: &[SummaryRow],
+    by_model: &[SummaryRow],
+    limit: usize,
+) -> String {
+    if totals.request_count == 0 {
+        return match since {
+            Some(range) => format!("No usage rows found for dashboard (since {range})."),
+            None => "No usage rows found for dashboard.".to_string(),
+        };
+    }
+
+    let mut kpis = Table::new();
+    kpis.load_preset(UTF8_FULL).set_header([
+        Cell::new("metric").add_attribute(Attribute::Bold),
+        Cell::new("value").add_attribute(Attribute::Bold),
+    ]);
+    kpis.add_row([
+        Cell::new("requests"),
+        Cell::new(totals.request_count.to_string()),
+    ]);
+    kpis.add_row([
+        Cell::new("input_tokens"),
+        Cell::new(totals.input_tokens.to_string()),
+    ]);
+    kpis.add_row([
+        Cell::new("output_tokens"),
+        Cell::new(totals.output_tokens.to_string()),
+    ]);
+    kpis.add_row([
+        Cell::new("total_cost_usd"),
+        Cell::new(format!("{:.6}", totals.total_cost_usd)),
+    ]);
+
+    let mut output = String::new();
+    match since {
+        Some(range) => output.push_str(&format!(
+            "PennyPrompt dashboard snapshot (since {range}, top {limit})\n"
+        )),
+        None => output.push_str(&format!("PennyPrompt dashboard snapshot (top {limit})\n")),
+    }
+    output.push_str(&format!("{kpis}\n"));
+    output.push_str(&render_dashboard_section(
+        "Top projects by cost",
+        by_project,
+        limit,
+    ));
+    output.push('\n');
+    output.push_str(&render_dashboard_section(
+        "Top models by cost",
+        by_model,
+        limit,
+    ));
+    output
 }
 
 fn print_summary_table(by: SummaryBy, since: Option<&str>, rows: &[SummaryRow]) {
@@ -2718,6 +2848,71 @@ mod tests {
         );
         assert_eq!(lines.next(), Some("\"proj,\"\"a\"\"\",2,300,150,3.500000"));
         assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn render_dashboard_snapshot_returns_empty_message_when_no_rows_exist() {
+        let rendered = render_dashboard_snapshot(
+            Some("1d"),
+            DashboardTotals {
+                request_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                total_cost_usd: 0.0,
+            },
+            &[],
+            &[],
+            5,
+        );
+        assert_eq!(rendered, "No usage rows found for dashboard (since 1d).");
+    }
+
+    #[test]
+    fn render_dashboard_snapshot_includes_kpis_and_respects_limit() {
+        let by_project = vec![
+            SummaryRow {
+                group_key: "proj-a".to_string(),
+                request_count: 4,
+                input_tokens: 400,
+                output_tokens: 200,
+                total_cost_usd: 5.0,
+            },
+            SummaryRow {
+                group_key: "proj-b".to_string(),
+                request_count: 2,
+                input_tokens: 200,
+                output_tokens: 100,
+                total_cost_usd: 2.0,
+            },
+        ];
+        let by_model = vec![
+            SummaryRow {
+                group_key: "claude-sonnet-4-6".to_string(),
+                request_count: 5,
+                input_tokens: 500,
+                output_tokens: 250,
+                total_cost_usd: 6.0,
+            },
+            SummaryRow {
+                group_key: "gpt-5.2".to_string(),
+                request_count: 1,
+                input_tokens: 100,
+                output_tokens: 50,
+                total_cost_usd: 1.0,
+            },
+        ];
+        let totals = compute_dashboard_totals(&by_project);
+        let rendered = render_dashboard_snapshot(Some("7d"), totals, &by_project, &by_model, 1);
+
+        assert!(rendered.contains("PennyPrompt dashboard snapshot (since 7d, top 1)"));
+        assert!(rendered.contains("total_cost_usd"));
+        assert!(rendered.contains("7.000000"));
+        assert!(rendered.contains("Top projects by cost"));
+        assert!(rendered.contains("proj-a"));
+        assert!(!rendered.contains("proj-b"));
+        assert!(rendered.contains("Top models by cost"));
+        assert!(rendered.contains("claude-sonnet-4-6"));
+        assert!(!rendered.contains("gpt-5.2"));
     }
 
     #[test]
