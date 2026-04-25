@@ -117,6 +117,8 @@ enum ReportCommands {
         since: Option<String>,
         #[arg(long, value_enum, default_value_t = SummaryBy::Project)]
         by: SummaryBy,
+        #[arg(long, value_enum, default_value_t = SummaryFormat::Table)]
+        format: SummaryFormat,
     },
     Top {
         #[arg(long, default_value_t = 20)]
@@ -182,6 +184,13 @@ enum SummaryBy {
     Project,
     Model,
     Session,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SummaryFormat {
+    Table,
+    Json,
+    Csv,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -598,7 +607,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             .await?;
         }
         Commands::Report { command } => match command {
-            ReportCommands::Summary { since, by } => {
+            ReportCommands::Summary { since, by, format } => {
                 let cutoff = since
                     .as_deref()
                     .map(parse_since_duration)
@@ -614,7 +623,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     })
                     .transpose()?;
                 let rows = fetch_summary_rows(&store, by, cutoff).await?;
-                print_summary_table(by, since.as_deref(), &rows);
+                print_summary(by, since.as_deref(), &rows, format)?;
             }
             ReportCommands::Top { limit } => {
                 run_report_top(&store, limit).await?;
@@ -2127,6 +2136,28 @@ async fn fetch_summary_rows(
         .collect())
 }
 
+fn print_summary(
+    by: SummaryBy,
+    since: Option<&str>,
+    rows: &[SummaryRow],
+    format: SummaryFormat,
+) -> Result<(), CliError> {
+    match format {
+        SummaryFormat::Table => {
+            print_summary_table(by, since, rows);
+            Ok(())
+        }
+        SummaryFormat::Json => {
+            print_summary_json(rows)?;
+            Ok(())
+        }
+        SummaryFormat::Csv => {
+            print_summary_csv(rows);
+            Ok(())
+        }
+    }
+}
+
 fn print_summary_table(by: SummaryBy, since: Option<&str>, rows: &[SummaryRow]) {
     if rows.is_empty() {
         match since {
@@ -2179,6 +2210,58 @@ fn print_summary_table(by: SummaryBy, since: Option<&str>, rows: &[SummaryRow]) 
         None => println!("Report summary by {}", by.as_str()),
     }
     println!("{table}");
+}
+
+fn print_summary_json(rows: &[SummaryRow]) -> Result<(), CliError> {
+    let rendered = render_summary_json(rows)?;
+    println!("{rendered}");
+    Ok(())
+}
+
+fn print_summary_csv(rows: &[SummaryRow]) {
+    println!("{}", render_summary_csv(rows));
+}
+
+fn render_summary_json(rows: &[SummaryRow]) -> Result<String, CliError> {
+    let payload = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "group_key": row.group_key,
+                "request_count": row.request_count,
+                "input_tokens": row.input_tokens,
+                "output_tokens": row.output_tokens,
+                "total_cost_usd": row.total_cost_usd,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&payload)
+        .map_err(|error| CliError::Store(format!("failed to render summary json: {error}")))
+}
+
+fn render_summary_csv(rows: &[SummaryRow]) -> String {
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    lines.push("group_key,request_count,input_tokens,output_tokens,total_cost_usd".to_string());
+    for row in rows {
+        lines.push(format!(
+            "{},{},{},{},{:.6}",
+            csv_escape(&row.group_key),
+            row.request_count,
+            row.input_tokens,
+            row.output_tokens,
+            row.total_cost_usd
+        ));
+    }
+    lines.join("\n")
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        let escaped = value.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        value.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -2551,6 +2634,52 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!((rows[0].total_cost_usd - 2.0).abs() < 1e-9);
         assert_eq!(rows[0].request_count, 1);
+    }
+
+    #[test]
+    fn render_summary_json_outputs_valid_rows_array() {
+        let rows = vec![
+            SummaryRow {
+                group_key: "proj-a".to_string(),
+                request_count: 2,
+                input_tokens: 300,
+                output_tokens: 150,
+                total_cost_usd: 3.5,
+            },
+            SummaryRow {
+                group_key: "proj-b".to_string(),
+                request_count: 1,
+                input_tokens: 100,
+                output_tokens: 50,
+                total_cost_usd: 1.0,
+            },
+        ];
+        let rendered = render_summary_json(&rows).expect("render summary json");
+        let parsed: Value = serde_json::from_str(&rendered).expect("parse rendered json");
+        let items = parsed.as_array().expect("json array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["group_key"], "proj-a");
+        assert_eq!(items[0]["request_count"], 2);
+        assert_eq!(items[1]["total_cost_usd"], 1.0);
+    }
+
+    #[test]
+    fn render_summary_csv_includes_header_and_escapes_group_key() {
+        let rows = vec![SummaryRow {
+            group_key: "proj,\"a\"".to_string(),
+            request_count: 2,
+            input_tokens: 300,
+            output_tokens: 150,
+            total_cost_usd: 3.5,
+        }];
+        let rendered = render_summary_csv(&rows);
+        let mut lines = rendered.lines();
+        assert_eq!(
+            lines.next(),
+            Some("group_key,request_count,input_tokens,output_tokens,total_cost_usd")
+        );
+        assert_eq!(lines.next(), Some("\"proj,\"\"a\"\"\",2,300,150,3.500000"));
+        assert_eq!(lines.next(), None);
     }
 
     #[test]
