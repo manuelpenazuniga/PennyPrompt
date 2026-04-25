@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
@@ -508,6 +509,8 @@ enum CliError {
     Run(String),
     #[error("init error: {0}")]
     Init(String),
+    #[error("render error: {0}")]
+    Render(String),
 }
 
 #[tokio::main]
@@ -2271,7 +2274,7 @@ fn render_summary_json(rows: &[SummaryRow]) -> Result<String, CliError> {
         })
         .collect::<Vec<_>>();
     serde_json::to_string_pretty(&payload)
-        .map_err(|error| CliError::Store(format!("failed to render summary json: {error}")))
+        .map_err(|error| CliError::Render(format!("failed to render summary json: {error}")))
 }
 
 fn render_summary_csv(rows: &[SummaryRow]) -> String {
@@ -2290,12 +2293,12 @@ fn render_summary_csv(rows: &[SummaryRow]) -> String {
     lines.join("\n")
 }
 
-fn csv_escape(value: &str) -> String {
+fn csv_escape(value: &str) -> Cow<'_, str> {
     if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
         let escaped = value.replace('"', "\"\"");
-        format!("\"{escaped}\"")
+        Cow::Owned(format!("\"{escaped}\""))
     } else {
-        value.to_string()
+        Cow::Borrowed(value)
     }
 }
 
