@@ -218,6 +218,30 @@ struct DetectResumePayload {
 }
 
 #[derive(Debug, Serialize)]
+struct DetectResumeResponse {
+    resumed: bool,
+    session_id: String,
+    event: penny_detect::DetectEventRecord,
+    persisted: bool,
+    consistency: DetectResumeConsistency,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<DetectResumeWarning>,
+}
+
+#[derive(Debug, Serialize)]
+struct DetectResumeConsistency {
+    mode: &'static str,
+    event_persistence_guarantee: &'static str,
+    event_persisted: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DetectResumeWarning {
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
 struct AdminHealth {
     status: &'static str,
     uptime_seconds: u64,
@@ -795,6 +819,9 @@ async fn post_detect_resume(
         );
     };
 
+    // Consistency policy: best-effort persistence.
+    // The resume action is applied in-memory first to unblock the session; event persistence
+    // is attempted afterwards and reported explicitly in the response contract.
     let mut persisted = true;
     if let Err(error) = EventRepo::insert(
         &state.store,
@@ -812,12 +839,23 @@ async fn post_detect_resume(
         log_internal_error("detect_resume_persist_failed", error.to_string());
     }
 
-    Json(json!({
-        "resumed": true,
-        "session_id": session_id,
-        "event": event,
-        "persisted": persisted
-    }))
+    let warning = (!persisted).then(|| DetectResumeWarning {
+        code: "detect_resume_event_not_persisted",
+        message: "session resumed in-memory but resume event could not be persisted".to_string(),
+    });
+
+    Json(DetectResumeResponse {
+        resumed: true,
+        session_id: session_id.to_string(),
+        event,
+        persisted,
+        consistency: DetectResumeConsistency {
+            mode: "best_effort_resume_then_persist",
+            event_persistence_guarantee: "best_effort",
+            event_persisted: persisted,
+        },
+        warning,
+    })
     .into_response()
 }
 
@@ -1647,6 +1685,16 @@ mod tests {
         assert_eq!(resume_json["resumed"], true);
         assert_eq!(resume_json["session_id"], "sess-detect-b");
         assert_eq!(resume_json["persisted"], true);
+        assert_eq!(
+            resume_json["consistency"]["mode"],
+            "best_effort_resume_then_persist"
+        );
+        assert_eq!(
+            resume_json["consistency"]["event_persistence_guarantee"],
+            "best_effort"
+        );
+        assert_eq!(resume_json["consistency"]["event_persisted"], true);
+        assert!(resume_json["warning"].is_null());
 
         let status_response = app
             .oneshot(
@@ -1675,6 +1723,77 @@ mod tests {
         .await
         .expect("event rows");
         assert!(rows.iter().any(|row| row == "session_resumed"));
+    }
+
+    #[tokio::test]
+    async fn detect_resume_reports_partial_success_when_event_persistence_fails() {
+        let store = setup_store().await;
+        let detector = detector_with_paused_session("sess-detect-c");
+        let app = build_router(AdminState::new(store.clone()).with_detector(detector));
+
+        sqlx::query("DROP TABLE events")
+            .execute(store.pool())
+            .await
+            .expect("drop events table");
+
+        let resume_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/detect/resume")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_id": "sess-detect-c",
+                            "request_id": "req-resume-cli"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(resume_response.status(), StatusCode::OK);
+        let body = to_bytes(resume_response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let resume_json: Value = serde_json::from_slice(&body).expect("resume json");
+        assert_eq!(resume_json["resumed"], true);
+        assert_eq!(resume_json["persisted"], false);
+        assert_eq!(
+            resume_json["consistency"]["mode"],
+            "best_effort_resume_then_persist"
+        );
+        assert_eq!(resume_json["consistency"]["event_persisted"], false);
+        assert_eq!(
+            resume_json["warning"]["code"],
+            "detect_resume_event_not_persisted"
+        );
+        assert!(resume_json["warning"]["message"]
+            .as_str()
+            .expect("warning message")
+            .contains("resumed in-memory"));
+
+        let status_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/detect/status")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("response");
+        let body = to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let status_json: Value = serde_json::from_slice(&body).expect("status json");
+        assert!(status_json["paused_sessions"]
+            .as_array()
+            .expect("array")
+            .is_empty());
     }
 
     #[tokio::test]

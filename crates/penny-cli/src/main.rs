@@ -1286,12 +1286,24 @@ async fn run_detect_resume(
         .get("resumed")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let persisted = parsed
+        .get("persisted")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     if resumed {
         println!(
             "Detect resume succeeded: session={} request_id={}",
             session_id,
             request_id.unwrap_or("(none)")
         );
+        if !persisted {
+            let warning = parsed
+                .get("warning")
+                .and_then(|value| value.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("resume event persistence failed");
+            println!("  warning: {warning}");
+        }
     } else {
         println!("Detect resume response: {parsed}");
     }
