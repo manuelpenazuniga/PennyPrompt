@@ -32,7 +32,7 @@ Your AI agent just burned $47 debugging a typo. You didn't know until Tuesday.
 **PennyPrompt is a local reverse proxy (~15MB, single binary, zero dependencies) that sits between your AI agent and your LLM provider.** It estimates costs before execution, enforces budgets with hard stops, detects runaway loops, and generates forensic reports — all without changing a single line in your existing workflow.
 
 ```
-Your Agent ──→ PennyPrompt (:8585) ──→ Anthropic / OpenAI / Ollama
+Your Agent ──→ PennyPrompt (:8585) ──→ Anthropic / OpenAI
                     │
                     ├── Budget check (atomic, with reservations)
                     ├── Loop detection (burn-rate, repeated failures)
@@ -69,7 +69,7 @@ $ pennyprompt report summary --since 1d
 
   By Model:
     claude-sonnet-4-6    $3.41  (80.7%)  48 reqs
-    gpt-5.2              $0.82  (19.3%)  19 reqs
+    gpt-4.1              $0.82  (19.3%)  19 reqs
 
   By Project:
     webapp               $3.89  (92.0%)
@@ -131,11 +131,11 @@ Configurable actions: `alert` (log + show in `tail`) or `pause` (block session u
 ### Pre-Execution Cost Estimation
 
 ```bash
-$ pennyprompt estimate --model sonnet --context-files src/auth/
+$ pennyprompt estimate --model claude-sonnet-4-6 --context-files src/auth/
 
-  Sonnet 4.6:  $0.12 – $0.45 (single pass) | $0.60 – $2.25 (agent task)
-  Opus 4.6:    $0.35 – $1.25 (single pass) | $1.75 – $6.25 (agent task)
-  Haiku 4.5:   $0.04 – $0.15 (single pass) | $0.20 – $0.75 (agent task)
+  claude-sonnet-4-6:  $0.12 – $0.45 (single pass) | $0.60 – $2.25 (agent task)
+  claude-opus-4-1:    $0.35 – $1.25 (single pass) | $1.75 – $6.25 (agent task)
+  claude-haiku-4:     $0.04 – $0.15 (single pass) | $0.20 – $0.75 (agent task)
 
   Budget: OK (day: $6.59 remaining of $10.00)
 ```
@@ -254,7 +254,7 @@ All config values can be overridden via environment variables with the `PENNY_` 
 
 ```bash
 PENNY_SERVER_BIND=0.0.0.0:8585
-PENNY_DEFAULTS_MODEL=claude-opus-4-6
+PENNY_DEFAULTS_MODEL=claude-opus-4-1
 ```
 
 `pennyprompt serve` bind behavior:
@@ -271,7 +271,7 @@ Pricing is stored locally in versioned TOML files (`prices/anthropic.toml`, `pri
 
 ```bash
 pennyprompt prices show            # Current prices
-pennyprompt prices update          # Download latest from PennyPrompt repo
+pennyprompt prices update          # Import bundled local pricebook files
 ```
 
 ## CLI Reference
@@ -281,9 +281,9 @@ pennyprompt
 ├── init [--preset indie|team|explore]     Setup wizard
 ├── serve [--mock] [--proxy-bind] [--admin-bind]  Start proxy + admin
 ├── estimate [--model M] [--context-files]  Pre-execution cost estimate
+├── run <agent> [--json]                    Launcher dry-run plan
 ├── report
 │   ├── summary [--since] [--by project|model|session]
-│   ├── session <id>                        Session detail
 │   └── top [--limit N]                     Most expensive requests
 ├── budget
 │   ├── list                                Active budgets + status
@@ -296,9 +296,9 @@ pennyprompt
 ├── doctor                                  System diagnostics
 ├── prices
 │   ├── show                                Current pricebook
-│   └── update                              Download latest prices
+│   └── update                              Import bundled local pricebook files
 ├── config                                  Show effective config
-└── version
+└── dashboard [--since] [--limit]           Snapshot KPIs by project/model
 ```
 
 ## Architecture

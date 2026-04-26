@@ -32,9 +32,16 @@ Config is resolved in this order (later overrides earlier):
 ## `[server]`
 
 - `bind` (`string`): proxy bind address (example `127.0.0.1:8585`)
-- `admin_socket` (`string`): admin socket path
+- `admin_socket` (`string`): admin bind target
+  - if value is `host:port`, admin binds TCP
+  - otherwise admin binds a Unix socket path
 - `database_path` (`string`): SQLite database path
 - `mode` (`observe|guard`)
+
+Operational note:
+
+- `tail` / `detect` CLI commands use HTTP URLs and default to `http://127.0.0.1:8586`.
+- If you keep `admin_socket` as a Unix path, start serve with `--admin-bind 127.0.0.1:8586` for those commands, or pass an explicit reachable admin URL.
 
 ## `[defaults]`
 
