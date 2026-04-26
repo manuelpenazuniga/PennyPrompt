@@ -679,6 +679,28 @@ fn minify_json_string(input: &str) -> Option<String> {
     serde_json::to_string(&parsed).ok()
 }
 
+fn payload_contains_ansi_marker(payload: &str) -> bool {
+    let bytes = payload.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] == 0x1b {
+            return true;
+        }
+        if idx + 5 < bytes.len()
+            && bytes[idx] == b'\\'
+            && bytes[idx + 1] == b'u'
+            && bytes[idx + 2] == b'0'
+            && bytes[idx + 3] == b'0'
+            && bytes[idx + 4] == b'1'
+            && (bytes[idx + 5] == b'b' || bytes[idx + 5] == b'B')
+        {
+            return true;
+        }
+        idx += 1;
+    }
+    false
+}
+
 fn payload_requires_json_roundtrip(payload: &str, cleanup: CleanupSettings) -> bool {
     if cleanup.minify_json {
         return true;
@@ -686,13 +708,14 @@ fn payload_requires_json_roundtrip(payload: &str, cleanup: CleanupSettings) -> b
     if !cleanup.strip_ansi {
         return false;
     }
-    payload.contains('\u{1b}') || payload.contains("\\u001b") || payload.contains("\\u001B")
+    payload_contains_ansi_marker(payload)
 }
 
 fn cleanup_sse_line(line: &str, cleanup: CleanupSettings) -> (String, CleanupMetrics) {
     if !cleanup.enabled() {
         return (line.to_string(), CleanupMetrics::default());
     }
+    let passthrough_metrics = CleanupMetrics::from_lengths(line.len(), line.len());
 
     let trimmed = line.trim_end_matches(['\r', '\n']);
     let trailing_newline = &line[trimmed.len()..];
@@ -707,11 +730,11 @@ fn cleanup_sse_line(line: &str, cleanup: CleanupSettings) -> (String, CleanupMet
     };
     let payload = data.trim_start();
     if payload.eq_ignore_ascii_case("[DONE]") {
-        return (line.to_string(), CleanupMetrics::default());
+        return (line.to_string(), passthrough_metrics);
     }
 
     if !payload_requires_json_roundtrip(payload, cleanup) {
-        return (line.to_string(), CleanupMetrics::default());
+        return (line.to_string(), passthrough_metrics);
     }
 
     let Ok(mut parsed) = serde_json::from_str::<Value>(payload) else {
@@ -730,7 +753,7 @@ fn cleanup_sse_line(line: &str, cleanup: CleanupSettings) -> (String, CleanupMet
             let metrics = CleanupMetrics::from_lengths(line.len(), cleaned.len());
             (cleaned, metrics)
         }
-        Err(_) => (line.to_string(), CleanupMetrics::default()),
+        Err(_) => (line.to_string(), passthrough_metrics),
     }
 }
 
@@ -2206,6 +2229,8 @@ action_on_soft = "warn"
         let (cleaned, metrics) = cleanup_sse_line(line, cleanup);
         assert_eq!(cleaned, line);
         assert_eq!(metrics.bytes_saved(), 0);
+        assert_eq!(metrics.input_bytes, line.len() as u64);
+        assert_eq!(metrics.output_bytes, line.len() as u64);
     }
 
     #[test]
@@ -2219,6 +2244,41 @@ action_on_soft = "warn"
         assert!(cleaned.contains("hello"));
         assert!(!cleaned.contains("\\u001b"));
         assert!(metrics.bytes_saved() > 0);
+    }
+
+    #[test]
+    fn cleanup_sse_line_done_marker_reports_passthrough_metrics() {
+        let cleanup = CleanupSettings {
+            strip_ansi: true,
+            minify_json: false,
+        };
+        let line = "data: [DONE]\n\n";
+        let (cleaned, metrics) = cleanup_sse_line(line, cleanup);
+        assert_eq!(cleaned, line);
+        assert_eq!(metrics.bytes_saved(), 0);
+        assert_eq!(metrics.input_bytes, line.len() as u64);
+        assert_eq!(metrics.output_bytes, line.len() as u64);
+    }
+
+    #[test]
+    fn payload_requires_json_roundtrip_detects_ansi_markers() {
+        let cleanup = CleanupSettings {
+            strip_ansi: true,
+            minify_json: false,
+        };
+        assert!(payload_requires_json_roundtrip(
+            "{\"x\":\"\\u001b[31m\"}",
+            cleanup
+        ));
+        assert!(payload_requires_json_roundtrip(
+            "{\"x\":\"\\u001B[31m\"}",
+            cleanup
+        ));
+        assert!(payload_requires_json_roundtrip("prefix\u{1b}[31m", cleanup));
+        assert!(!payload_requires_json_roundtrip(
+            "{\"x\":\"plain\"}",
+            cleanup
+        ));
     }
 
     #[tokio::test]
