@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -21,6 +21,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{query, Row};
+use tempfile::Builder;
 use thiserror::Error;
 
 const PRESET_INDIE_TOML: &str = include_str!("../../../presets/indie.toml");
@@ -286,44 +287,6 @@ struct DashboardTotals {
     input_tokens: i64,
     output_tokens: i64,
     total_cost_usd: f64,
-}
-
-struct StagingDirGuard {
-    path: PathBuf,
-}
-
-impl StagingDirGuard {
-    fn new(path: PathBuf) -> Result<Self, CliError> {
-        fs::create_dir_all(&path).map_err(|error| {
-            CliError::Cost(format!(
-                "failed to create temp pricebook directory {}: {error}",
-                path.display()
-            ))
-        })?;
-        Ok(Self { path })
-    }
-
-    fn create_pricebook_staging_dir() -> Result<Self, CliError> {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let path = std::env::temp_dir().join(format!(
-            "pennyprompt-pricebooks-{}-{seed}",
-            std::process::id()
-        ));
-        Self::new(path)
-    }
-
-    fn file(&self, name: &str) -> PathBuf {
-        self.path.join(name)
-    }
-}
-
-impl Drop for StagingDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -788,10 +751,21 @@ async fn run_prices_show(store: &SqliteStore, limit: u32) -> Result<(), CliError
     Ok(())
 }
 
+fn create_pricebook_staging_dir() -> Result<tempfile::TempDir, CliError> {
+    Builder::new()
+        .prefix(&format!("pennyprompt-pricebooks-{}-", std::process::id()))
+        .tempdir()
+        .map_err(|error| {
+            CliError::Cost(format!(
+                "failed to create temp pricebook directory: {error}"
+            ))
+        })
+}
+
 async fn run_prices_update(store: &SqliteStore) -> Result<(), CliError> {
-    let staging_dir = StagingDirGuard::create_pricebook_staging_dir()?;
-    let anthropic = staging_dir.file("anthropic.toml");
-    let openai = staging_dir.file("openai.toml");
+    let staging_dir = create_pricebook_staging_dir()?;
+    let anthropic = staging_dir.path().join("anthropic.toml");
+    let openai = staging_dir.path().join("openai.toml");
     fs::write(&anthropic, PRICEBOOK_ANTHROPIC_TOML).map_err(|error| {
         CliError::Cost(format!(
             "failed to stage embedded pricebook {}: {error}",
@@ -2982,14 +2956,23 @@ mod tests {
     }
 
     #[test]
-    fn staging_dir_guard_removes_directory_on_drop() {
-        let root = tempdir().expect("temp root");
-        let staging_path = root.path().join("pricebook-staging");
-        {
-            let guard = StagingDirGuard::new(staging_path.clone()).expect("create staging guard");
-            fs::write(guard.file("probe.toml"), "ok").expect("write probe file");
+    fn create_pricebook_staging_dir_removes_directory_on_drop() {
+        let staging_path = {
+            let staging_dir =
+                create_pricebook_staging_dir().expect("create secure staging directory");
+            let staging_path = staging_dir.path().to_path_buf();
+            assert!(
+                staging_path
+                    .file_name()
+                    .expect("staging path filename")
+                    .to_string_lossy()
+                    .starts_with("pennyprompt-pricebooks-"),
+                "staging directory should use expected prefix"
+            );
+            fs::write(staging_path.join("probe.toml"), "ok").expect("write probe file");
             assert!(staging_path.exists());
-        }
+            staging_path
+        };
         assert!(
             !staging_path.exists(),
             "staging dir should be removed on drop"
