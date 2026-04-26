@@ -2398,11 +2398,34 @@ fn render_summary_csv(rows: &[SummaryRow]) -> String {
 }
 
 fn csv_escape(value: &str) -> Cow<'_, str> {
-    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
-        let escaped = value.replace('"', "\"\"");
-        Cow::Owned(format!("\"{escaped}\""))
-    } else {
+    let mut requires_escape = false;
+    let mut quote_count = 0usize;
+    for byte in value.bytes() {
+        match byte {
+            b',' | b'\n' | b'\r' => requires_escape = true,
+            b'"' => {
+                requires_escape = true;
+                quote_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    if !requires_escape {
         Cow::Borrowed(value)
+    } else {
+        let mut escaped = String::with_capacity(value.len() + 2 + quote_count);
+        escaped.push('"');
+        for ch in value.chars() {
+            if ch == '"' {
+                escaped.push('"');
+                escaped.push('"');
+            } else {
+                escaped.push(ch);
+            }
+        }
+        escaped.push('"');
+        Cow::Owned(escaped)
     }
 }
 
@@ -2822,6 +2845,11 @@ mod tests {
         );
         assert_eq!(lines.next(), Some("\"proj,\"\"a\"\"\",2,300,150,3.500000"));
         assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn csv_escape_leaves_plain_values_unquoted() {
+        assert_eq!(csv_escape("plain-value"), "plain-value");
     }
 
     #[test]
