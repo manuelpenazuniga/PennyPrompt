@@ -386,6 +386,62 @@ mod tests {
         assert_eq!(snapshot["source"], "local");
     }
 
+    #[tokio::test]
+    async fn calculate_prefers_latest_effective_entry_for_model() {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create store");
+        sqlx::query(
+            "INSERT INTO providers (id, name, base_url, api_format, enabled) VALUES ('test-provider', 'Test Provider', 'https://example.invalid', 'openai', 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("insert provider");
+        sqlx::query(
+            "INSERT INTO models (id, provider_id, external_name, display_name, class) VALUES ('test-model', 'test-provider', 'test-model', 'Test Model', 'balanced')",
+        )
+        .execute(store.pool())
+        .await
+        .expect("insert model");
+
+        PricebookRepo::import(
+            &store,
+            &[
+                NewPricebookEntry {
+                    model_id: "test-model".to_string(),
+                    input_per_mtok: Money::from_usd(1.0).expect("money"),
+                    output_per_mtok: Money::from_usd(2.0).expect("money"),
+                    effective_from: parse_datetime("2026-04-10T00:00:00Z", "effective_from")
+                        .expect("datetime"),
+                    effective_until: Some(
+                        parse_datetime("2026-04-25T00:00:00Z", "effective_until")
+                            .expect("datetime"),
+                    ),
+                    source: "local".to_string(),
+                },
+                NewPricebookEntry {
+                    model_id: "test-model".to_string(),
+                    input_per_mtok: Money::from_usd(3.0).expect("money"),
+                    output_per_mtok: Money::from_usd(4.0).expect("money"),
+                    effective_from: parse_datetime("2026-04-25T00:00:00Z", "effective_from")
+                        .expect("datetime"),
+                    effective_until: None,
+                    source: "local".to_string(),
+                },
+            ],
+        )
+        .await
+        .expect("import versioned entries");
+
+        let engine = PricingEngine::new(&store);
+        let cost = engine
+            .calculate("test-model", 1_000_000, 1_000_000)
+            .await
+            .expect("calculate cost");
+
+        assert_eq!(cost, Money::from_usd(7.0).expect("money"));
+    }
+
     #[test]
     fn token_estimation_uses_cl100k_when_text_exists() {
         let payload = serde_json::json!([
