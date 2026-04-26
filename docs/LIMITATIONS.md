@@ -4,7 +4,7 @@ This list documents current constraints as of April 18, 2026.
 
 ## CLI / Product Surface
 
-- `serve` lifecycle orchestration is not fully consolidated in `penny-cli` yet.
+- `serve` is available in `penny-cli`, but daemon/background mode is not implemented yet.
 - `run <agent>` currently emits deterministic dry-run launch plans; full process orchestration remains a follow-up.
 - Some outputs are operator-focused and intentionally minimal (not final UX polish).
 
@@ -20,7 +20,8 @@ This list documents current constraints as of April 18, 2026.
 
 ## API/Control Plane Assumptions
 
-- `tail` and `detect` control commands assume admin API availability (default `http://127.0.0.1:8586` in CLI commands).
+- `tail` and `detect` control commands assume admin API availability over HTTP (default `http://127.0.0.1:8586` in CLI commands).
+- If `serve` runs admin on a Unix socket path, use `--admin-bind 127.0.0.1:8586` (or equivalent TCP bind) for those commands.
 - If admin plane is unavailable, related commands fail as expected.
 
 ## Data and Reporting

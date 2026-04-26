@@ -54,7 +54,21 @@ export OPENAI_API_KEY=...
 ./target/release/penny-cli config --json
 ```
 
-## 6. Try Core Operator Commands
+## 6. Start Proxy + Admin Planes
+
+Run `serve` in terminal A and keep it running:
+
+```bash
+./target/release/penny-cli serve --admin-bind 127.0.0.1:8586
+```
+
+If you want a fully local smoke test without provider keys:
+
+```bash
+./target/release/penny-cli serve --mock --admin-bind 127.0.0.1:8586
+```
+
+## 7. Try Core Operator Commands (terminal B)
 
 Estimate:
 
@@ -84,10 +98,10 @@ Reports:
 ./target/release/penny-cli report top --limit 20
 ```
 
-## 7. Optional Live Monitoring (if admin plane is running)
+Live monitoring:
 
 ```bash
-./target/release/penny-cli tail --admin-url http://127.0.0.1:8586
+./target/release/penny-cli tail
 ```
 
 Resume a paused session:
@@ -114,6 +128,7 @@ Notes:
 
 - `doctor` shows config and DB status.
 - `prices show` lists active models and rates.
+- `serve` starts both proxy and admin without missing-command errors.
 - `estimate` returns min/max range and budget impact.
 - `report` commands return either data or explicit "no usage rows" output.
 
