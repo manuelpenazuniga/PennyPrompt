@@ -257,6 +257,14 @@ PENNY_SERVER_BIND=0.0.0.0:8585
 PENNY_DEFAULTS_MODEL=claude-opus-4-6
 ```
 
+`pennyprompt serve` bind behavior:
+
+- Proxy plane binds to `server.bind` (default `127.0.0.1:8585`).
+- Admin plane reads `server.admin_socket`.
+- If `admin_socket` is `host:port`, admin binds TCP.
+- Otherwise admin binds a Unix socket path (supports `~` expansion).
+- You can override at runtime with `--proxy-bind` and `--admin-bind`.
+
 ### Pricebook
 
 Pricing is stored locally in versioned TOML files (`prices/anthropic.toml`, `prices/openai.toml`). No scraping. No external API calls. Works offline.
@@ -271,7 +279,7 @@ pennyprompt prices update          # Download latest from PennyPrompt repo
 ```
 pennyprompt
 ├── init [--preset indie|team|explore]     Setup wizard
-├── serve [--daemon]                        Start proxy + admin
+├── serve [--mock] [--proxy-bind] [--admin-bind]  Start proxy + admin
 ├── estimate [--model M] [--context-files]  Pre-execution cost estimate
 ├── report
 │   ├── summary [--since] [--by project|model|session]

@@ -3,7 +3,9 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
+    future::Future,
     net::SocketAddr,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -79,6 +81,8 @@ pub enum AdminError {
     AddressParse(#[from] std::net::AddrParseError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("invalid bind target `{0}`")]
+    InvalidBind(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -327,11 +331,71 @@ pub fn build_router(state: AdminState) -> Router {
 }
 
 pub async fn serve(bind: &str, state: AdminState) -> Result<(), AdminError> {
-    let addr: SocketAddr = bind.parse()?;
-    let listener = TcpListener::bind(addr).await?;
-    let app = build_router(state);
-    axum::serve(listener, app).await?;
-    Ok(())
+    serve_with_shutdown(bind, state, std::future::pending::<()>()).await
+}
+
+pub async fn serve_with_shutdown<F>(
+    bind: &str,
+    state: AdminState,
+    shutdown: F,
+) -> Result<(), AdminError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if let Ok(addr) = bind.parse::<SocketAddr>() {
+        let listener = TcpListener::bind(addr).await?;
+        let app = build_router(state);
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await?;
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        let socket_path = normalize_unix_socket_path(bind)?;
+        let listener = bind_unix_listener(&socket_path)?;
+        let app = build_router(state);
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await;
+        cleanup_unix_socket(&socket_path)?;
+        result?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (state, shutdown);
+        Err(AdminError::InvalidBind(bind.to_string()))
+    }
+}
+
+#[cfg(unix)]
+fn normalize_unix_socket_path(raw: &str) -> Result<PathBuf, AdminError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AdminError::InvalidBind(raw.to_string()));
+    }
+    Ok(PathBuf::from(trimmed))
+}
+
+#[cfg(unix)]
+fn bind_unix_listener(path: &Path) -> Result<tokio::net::UnixListener, AdminError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    cleanup_unix_socket(path)?;
+    Ok(tokio::net::UnixListener::bind(path)?)
+}
+
+#[cfg(unix)]
+fn cleanup_unix_socket(path: &Path) -> Result<(), AdminError> {
+    match std::fs::remove_file(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AdminError::Io(error)),
+    }
 }
 
 async fn get_health(State(state): State<AdminState>) -> Response {

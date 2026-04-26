@@ -2,6 +2,7 @@
 
 use std::{
     convert::Infallible,
+    future::Future,
     hash::Hasher,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -281,10 +282,27 @@ pub async fn serve_default() -> Result<(), ProxyError> {
 }
 
 pub async fn serve(bind: &str) -> Result<(), ProxyError> {
+    serve_with_state(bind, ProxyState::mock_default()).await
+}
+
+pub async fn serve_with_state(bind: &str, state: ProxyState) -> Result<(), ProxyError> {
+    serve_with_state_and_shutdown(bind, state, std::future::pending::<()>()).await
+}
+
+pub async fn serve_with_state_and_shutdown<F>(
+    bind: &str,
+    state: ProxyState,
+    shutdown: F,
+) -> Result<(), ProxyError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let addr: SocketAddr = bind.parse()?;
     let listener = TcpListener::bind(addr).await?;
-    let app = build_router(ProxyState::mock_default());
-    axum::serve(listener, app).await?;
+    let app = build_router(state);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 

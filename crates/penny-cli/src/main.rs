@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -10,11 +11,18 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use glob::glob;
+use penny_admin::{self, AdminState};
 use penny_config::{
-    load_config, resolve_user_config_path, ConfigError, LoadOptions, PRESET_EXPLORE, PRESET_INDIE,
-    PRESET_TEAM,
+    load_config, resolve_user_config_path, AppConfig, ConfigError, LoadOptions, PRESET_EXPLORE,
+    PRESET_INDIE, PRESET_TEAM,
 };
 use penny_cost::{estimate_tokens, import_pricebook_files, PricingEngine};
+use penny_detect::DetectEngine;
+use penny_providers::{
+    AnthropicProvider, AnthropicProviderConfig, MockProvider, MockProviderConfig, OpenAiProvider,
+    OpenAiProviderConfig, ProviderAdapter,
+};
+use penny_proxy::{self, build_state_from_config};
 use penny_store::{BudgetRepo, ProjectRepo, SessionRepo, SqliteStore};
 use penny_types::{Budget, Confidence, Event, EventType, Money, ScopeType, TaskType, WindowType};
 use reqwest::Client;
@@ -93,6 +101,14 @@ enum Commands {
         cwd: Option<PathBuf>,
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+    Serve {
+        #[arg(long, default_value_t = false)]
+        mock: bool,
+        #[arg(long)]
+        proxy_bind: Option<String>,
+        #[arg(long)]
+        admin_bind: Option<String>,
     },
     Tail {
         #[arg(long, default_value = "http://127.0.0.1:8586")]
@@ -389,6 +405,18 @@ struct RunCommand {
     as_json: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ServeCommand {
+    mock: bool,
+    proxy_bind: Option<String>,
+    admin_bind: Option<String>,
+}
+
+struct RuntimeProvider {
+    provider: Arc<dyn ProviderAdapter>,
+    models: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct LaunchPlan {
     mode: String,
@@ -592,6 +620,21 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     session_id,
                     cwd,
                     as_json: json,
+                },
+            )
+            .await?;
+        }
+        Commands::Serve {
+            mock,
+            proxy_bind,
+            admin_bind,
+        } => {
+            run_serve(
+                &store,
+                ServeCommand {
+                    mock,
+                    proxy_bind,
+                    admin_bind,
                 },
             )
             .await?;
@@ -1049,6 +1092,279 @@ async fn run_launcher(store: &SqliteStore, command: RunCommand) -> Result<(), Cl
         println!("{}", render_launch_plan(&plan));
     }
     Ok(())
+}
+
+async fn run_serve(store: &SqliteStore, command: ServeCommand) -> Result<(), CliError> {
+    run_serve_with_shutdown(store, command, shutdown_signal()).await
+}
+
+async fn run_serve_with_shutdown<F>(
+    store: &SqliteStore,
+    command: ServeCommand,
+    shutdown: F,
+) -> Result<(), CliError>
+where
+    F: std::future::Future<Output = Result<&'static str, CliError>>,
+{
+    let config = load_runtime_config()?;
+    let proxy_bind = command
+        .proxy_bind
+        .unwrap_or_else(|| config.server.bind.clone());
+    let admin_bind = command
+        .admin_bind
+        .map(|value| expand_tilde(PathBuf::from(value)))
+        .unwrap_or_else(|| expand_tilde(PathBuf::from(config.server.admin_socket.clone())));
+    let runtime = build_runtime_provider(&config, command.mock)?;
+    let proxy_state =
+        build_state_from_config(runtime.provider, runtime.models, store.clone(), &config)
+            .await
+            .map_err(CliError::Run)?;
+    let admin_state = AdminState::new(store.clone())
+        .with_detector(Arc::new(DetectEngine::from_runtime_config(&config.detect)));
+
+    println!("Starting PennyPrompt serve");
+    println!("  mode: {}", if command.mock { "mock" } else { "runtime" });
+    println!("  proxy_bind: {proxy_bind}");
+    println!("  admin_bind: {}", admin_bind_display(&admin_bind));
+    println!("Press Ctrl+C to stop.");
+
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(4);
+
+    let proxy_bind_for_task = proxy_bind.clone();
+    let mut proxy_task = tokio::spawn({
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        async move {
+            penny_proxy::serve_with_state_and_shutdown(
+                &proxy_bind_for_task,
+                proxy_state,
+                async move {
+                    let _ = shutdown_rx.recv().await;
+                },
+            )
+            .await
+        }
+    });
+
+    let admin_bind_for_task = admin_bind.clone();
+    let mut admin_task = tokio::spawn({
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        async move {
+            penny_admin::serve_with_shutdown(&admin_bind_for_task, admin_state, async move {
+                let _ = shutdown_rx.recv().await;
+            })
+            .await
+        }
+    });
+
+    enum ServeExit {
+        Signal(&'static str),
+        Proxy(Result<Result<(), penny_proxy::ProxyError>, tokio::task::JoinError>),
+        Admin(Result<Result<(), penny_admin::AdminError>, tokio::task::JoinError>),
+    }
+
+    let mut shutdown = std::pin::pin!(shutdown);
+    let exit = tokio::select! {
+        signal = &mut shutdown => ServeExit::Signal(signal?),
+        proxy = &mut proxy_task => ServeExit::Proxy(proxy),
+        admin = &mut admin_task => ServeExit::Admin(admin),
+    };
+
+    match exit {
+        ServeExit::Signal(signal_name) => {
+            println!("Received {signal_name}, shutting down...");
+            let _ = shutdown_tx.send(());
+            map_proxy_task(proxy_task.await)?;
+            map_admin_task(admin_task.await)?;
+            println!("Serve shutdown complete.");
+            Ok(())
+        }
+        ServeExit::Proxy(result) => {
+            let _ = shutdown_tx.send(());
+            let _ = admin_task.await;
+            map_proxy_task(result)?;
+            Err(CliError::Run(
+                "proxy server stopped unexpectedly".to_string(),
+            ))
+        }
+        ServeExit::Admin(result) => {
+            let _ = shutdown_tx.send(());
+            let _ = proxy_task.await;
+            map_admin_task(result)?;
+            Err(CliError::Run(
+                "admin server stopped unexpectedly".to_string(),
+            ))
+        }
+    }
+}
+
+fn map_proxy_task(
+    result: Result<Result<(), penny_proxy::ProxyError>, tokio::task::JoinError>,
+) -> Result<(), CliError> {
+    let result =
+        result.map_err(|error| CliError::Run(format!("proxy task join error: {error}")))?;
+    result.map_err(|error| CliError::Run(format!("proxy server error: {error}")))
+}
+
+fn map_admin_task(
+    result: Result<Result<(), penny_admin::AdminError>, tokio::task::JoinError>,
+) -> Result<(), CliError> {
+    let result =
+        result.map_err(|error| CliError::Run(format!("admin task join error: {error}")))?;
+    result.map_err(|error| CliError::Run(format!("admin server error: {error}")))
+}
+
+fn admin_bind_display(bind: &str) -> String {
+    if bind.parse::<std::net::SocketAddr>().is_ok() {
+        format!("http://{bind}")
+    } else {
+        format!("unix://{bind}")
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<&'static str, CliError> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut term =
+        signal(SignalKind::terminate()).map_err(|error| CliError::Run(error.to_string()))?;
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(|error| CliError::Run(error.to_string()))?;
+            Ok("SIGINT")
+        }
+        _ = term.recv() => Ok("SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<&'static str, CliError> {
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|error| CliError::Run(error.to_string()))?;
+    Ok("CTRL_C")
+}
+
+fn build_runtime_provider(
+    config: &AppConfig,
+    mock_mode: bool,
+) -> Result<RuntimeProvider, CliError> {
+    if mock_mode {
+        let mock = MockProvider::new(MockProviderConfig::default());
+        let models = mock.config().supported_models.clone();
+        return Ok(RuntimeProvider {
+            provider: Arc::new(mock),
+            models,
+        });
+    }
+
+    let default_model = config.defaults.model.trim();
+    if default_model.is_empty() {
+        return Err(CliError::Run(
+            "defaults.model must not be empty".to_string(),
+        ));
+    }
+
+    match config.defaults.provider.trim() {
+        "anthropic" => {
+            if !config.providers.anthropic.enabled {
+                return Err(CliError::Run(
+                    "providers.anthropic is disabled but defaults.provider=anthropic".to_string(),
+                ));
+            }
+            let api_key = read_required_env(&config.providers.anthropic.api_key_env)?;
+            let models = build_supported_models(default_model, &["claude-sonnet-4-6"]);
+            let provider = AnthropicProvider::new(AnthropicProviderConfig {
+                provider_id: "anthropic".to_string(),
+                base_url: config.providers.anthropic.base_url.clone(),
+                api_key,
+                supported_models: models.clone(),
+                ..AnthropicProviderConfig::default()
+            })
+            .map_err(CliError::Run)?;
+            Ok(RuntimeProvider {
+                provider: Arc::new(provider),
+                models,
+            })
+        }
+        "openai" => {
+            if !config.providers.openai.enabled {
+                return Err(CliError::Run(
+                    "providers.openai is disabled but defaults.provider=openai".to_string(),
+                ));
+            }
+            let api_key = read_required_env(&config.providers.openai.api_key_env)?;
+            let models = build_supported_models(default_model, &["gpt-4.1"]);
+            let provider = OpenAiProvider::new(OpenAiProviderConfig {
+                provider_id: "openai".to_string(),
+                base_url: config.providers.openai.base_url.clone(),
+                api_key,
+                supported_models: models.clone(),
+                ..OpenAiProviderConfig::default()
+            })
+            .map_err(CliError::Run)?;
+            Ok(RuntimeProvider {
+                provider: Arc::new(provider),
+                models,
+            })
+        }
+        provider => Err(CliError::Run(format!(
+            "unsupported defaults.provider `{provider}` (expected anthropic|openai)"
+        ))),
+    }
+}
+
+fn load_runtime_config() -> Result<AppConfig, CliError> {
+    #[cfg(test)]
+    {
+        load_config(LoadOptions::default())
+            .or_else(|error| match error {
+                ConfigError::MissingDefaultConfig(_) => load_config(LoadOptions {
+                    repository_root: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")),
+                    ..Default::default()
+                }),
+                other => Err(other),
+            })
+            .map_err(|error| CliError::Config(error.to_string()))
+    }
+
+    #[cfg(not(test))]
+    {
+        load_config(LoadOptions::default()).map_err(|error| CliError::Config(error.to_string()))
+    }
+}
+
+fn read_required_env(var_name: &str) -> Result<String, CliError> {
+    let key = var_name.trim();
+    if key.is_empty() {
+        return Err(CliError::Run(
+            "provider api_key_env must not be empty".to_string(),
+        ));
+    }
+    let value = std::env::var(key).map_err(|_| {
+        CliError::Run(format!(
+            "missing required environment variable `{key}` for runtime provider auth"
+        ))
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(CliError::Run(format!(
+            "environment variable `{key}` is empty"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn build_supported_models(default_model: &str, baseline: &[&str]) -> Vec<String> {
+    let mut models = BTreeSet::new();
+    if !default_model.trim().is_empty() {
+        models.insert(default_model.trim().to_string());
+    }
+    for model in baseline {
+        if !model.trim().is_empty() {
+            models.insert(model.trim().to_string());
+        }
+    }
+    models.into_iter().collect()
 }
 
 async fn resolve_launch_project_id(
@@ -2432,6 +2748,7 @@ fn csv_escape(value: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::net::TcpListener as StdTcpListener;
     use std::path::Path;
 
     use chrono::{Duration as ChronoDuration, TimeZone};
@@ -2445,6 +2762,27 @@ mod tests {
         SqliteStore::connect("sqlite::memory:")
             .await
             .expect("create in-memory store")
+    }
+
+    fn find_free_port() -> u16 {
+        StdTcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral port")
+            .local_addr()
+            .expect("resolve local addr")
+            .port()
+    }
+
+    async fn wait_for_http_ready(url: &str) {
+        let client = Client::new();
+        for _ in 0..80 {
+            if let Ok(response) = client.get(url).send().await {
+                if response.status().is_success() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("endpoint did not become ready: {url}");
     }
 
     struct RequestUsageFixture<'a> {
@@ -2799,6 +3137,77 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!((rows[0].total_cost_usd - 2.0).abs() < 1e-9);
         assert_eq!(rows[0].request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn serve_mock_starts_proxy_and_admin_and_shuts_down_cleanly() {
+        let store = setup_store().await;
+        let proxy_port = find_free_port();
+        let admin_port = find_free_port();
+        let proxy_bind = format!("127.0.0.1:{proxy_port}");
+        let admin_bind = format!("127.0.0.1:{admin_port}");
+        let proxy_url = format!("http://{proxy_bind}");
+        let admin_health_url = format!("http://{admin_bind}/admin/health");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let serve_task = tokio::spawn({
+            let store = store.clone();
+            let proxy_bind = proxy_bind.clone();
+            let admin_bind = admin_bind.clone();
+            async move {
+                run_serve_with_shutdown(
+                    &store,
+                    ServeCommand {
+                        mock: true,
+                        proxy_bind: Some(proxy_bind),
+                        admin_bind: Some(admin_bind),
+                    },
+                    async move {
+                        let _ = shutdown_rx.await;
+                        Ok("TEST_SHUTDOWN")
+                    },
+                )
+                .await
+            }
+        });
+
+        wait_for_http_ready(&admin_health_url).await;
+
+        let client = Client::new();
+        let health_response = client
+            .get(&admin_health_url)
+            .send()
+            .await
+            .expect("admin health request");
+        assert_eq!(health_response.status(), 200);
+
+        let proxy_response = client
+            .post(format!("{proxy_url}/v1/chat/completions"))
+            .json(&json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "ping"}]
+            }))
+            .send()
+            .await
+            .expect("proxy completion request");
+        assert!(
+            proxy_response.status() == 200 || proxy_response.status() == 402,
+            "unexpected proxy status: {}",
+            proxy_response.status()
+        );
+        let payload: Value = proxy_response
+            .json()
+            .await
+            .expect("parse proxy completion payload");
+        if payload.get("choices").is_some() {
+            assert_eq!(payload["choices"][0]["message"]["role"], "assistant");
+        } else {
+            assert_eq!(payload["error"]["retryable"], false);
+        }
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let serve_result = serve_task.await.expect("join serve task");
+        assert!(serve_result.is_ok(), "serve task failed: {serve_result:?}");
     }
 
     #[test]
