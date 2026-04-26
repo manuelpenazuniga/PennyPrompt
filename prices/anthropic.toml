@@ -10,7 +10,7 @@ display_name = "Claude Opus 4.1"
 class = "premium"
 input_per_mtok = 15.0
 output_per_mtok = 75.0
-effective_from = "2026-04-10T00:00:00Z"
+effective_from = "2026-04-25T00:00:00Z"
 
 [[entries]]
 model_id = "claude-sonnet-4-6"
@@ -19,7 +19,7 @@ display_name = "Claude Sonnet 4.6"
 class = "balanced"
 input_per_mtok = 3.0
 output_per_mtok = 15.0
-effective_from = "2026-04-10T00:00:00Z"
+effective_from = "2026-04-25T00:00:00Z"
 
 [[entries]]
 model_id = "claude-haiku-4"
@@ -28,4 +28,4 @@ display_name = "Claude Haiku 4"
 class = "fast"
 input_per_mtok = 0.8
 output_per_mtok = 4.0
-effective_from = "2026-04-10T00:00:00Z"
+effective_from = "2026-04-25T00:00:00Z"

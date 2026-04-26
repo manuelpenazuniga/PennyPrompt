@@ -3,7 +3,7 @@ mode = "observe"
 
 [defaults]
 provider = "anthropic"
-model = "claude-haiku-4-5"
+model = "claude-haiku-4"
 
 [[budgets]]
 scope_type = "global"

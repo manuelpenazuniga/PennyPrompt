@@ -23,7 +23,7 @@ use penny_providers::{
     OpenAiProviderConfig, ProviderAdapter,
 };
 use penny_proxy::{self, build_state_from_config};
-use penny_store::{BudgetRepo, ProjectRepo, SessionRepo, SqliteStore};
+use penny_store::{BudgetRepo, PricebookRepo, ProjectRepo, SessionRepo, SqliteStore};
 use penny_types::{Budget, Confidence, Event, EventType, Money, ScopeType, TaskType, WindowType};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -825,9 +825,76 @@ async fn run_prices_update(store: &SqliteStore) -> Result<(), CliError> {
     let imported = import_pricebook_files(store, &[anthropic.clone(), openai.clone()])
         .await
         .map_err(|error| CliError::Cost(error.to_string()))?;
+    let mut guardrail_models = preset_default_models()?;
+    if let Ok(config) = load_config(LoadOptions::default()) {
+        guardrail_models.push(config.defaults.model);
+    }
+    guardrail_models.sort();
+    guardrail_models.dedup();
+    validate_pricebook_models_resolvable(store, &guardrail_models).await?;
     println!("Pricebook update completed");
     println!("  imported_entries: {imported}");
+    println!("  validated_default_models: {}", guardrail_models.len());
     Ok(())
+}
+
+fn preset_default_models() -> Result<Vec<String>, CliError> {
+    let preset_sources = [
+        (PRESET_INDIE, PRESET_INDIE_TOML),
+        (PRESET_TEAM, PRESET_TEAM_TOML),
+        (PRESET_EXPLORE, PRESET_EXPLORE_TOML),
+    ];
+    let mut models = Vec::with_capacity(preset_sources.len());
+
+    for (preset_name, raw) in preset_sources {
+        let parsed: toml::Value = toml::from_str(raw).map_err(|error| {
+            CliError::Cost(format!(
+                "failed to parse embedded preset `{preset_name}` while validating pricebook models: {error}"
+            ))
+        })?;
+        let model = parsed
+            .get("defaults")
+            .and_then(|defaults| defaults.get("model"))
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Cost(format!(
+                    "embedded preset `{preset_name}` has missing defaults.model"
+                ))
+            })?;
+        models.push(model.to_string());
+    }
+
+    Ok(models)
+}
+
+async fn validate_pricebook_models_resolvable(
+    store: &SqliteStore,
+    model_ids: &[String],
+) -> Result<(), CliError> {
+    let now = Utc::now();
+    let mut unresolved = Vec::new();
+    for model_id in model_ids {
+        let maybe_entry = store
+            .get_price(model_id, now)
+            .await
+            .map_err(|error| CliError::Cost(error.to_string()))?;
+        if maybe_entry.is_none() {
+            unresolved.push(model_id.clone());
+        }
+    }
+
+    if unresolved.is_empty() {
+        Ok(())
+    } else {
+        unresolved.sort();
+        unresolved.dedup();
+        Err(CliError::Cost(format!(
+            "pricebook update guardrail: unresolved defaults.model entries: {}",
+            unresolved.join(", ")
+        )))
+    }
 }
 
 async fn run_budget_list(store: &SqliteStore) -> Result<(), CliError> {
@@ -3137,6 +3204,31 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!((rows[0].total_cost_usd - 2.0).abs() < 1e-9);
         assert_eq!(rows[0].request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn prices_update_guardrail_validates_preset_models() {
+        let store = setup_store().await;
+        run_prices_update(&store).await.expect("prices update");
+        let preset_models = preset_default_models().expect("preset models");
+        validate_pricebook_models_resolvable(&store, &preset_models)
+            .await
+            .expect("preset models must resolve");
+    }
+
+    #[tokio::test]
+    async fn prices_update_guardrail_rejects_unresolved_defaults() {
+        let store = setup_store().await;
+        let error = validate_pricebook_models_resolvable(
+            &store,
+            &[String::from("missing-model-id-for-test")],
+        )
+        .await
+        .expect_err("missing model must fail guardrail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("unresolved defaults.model entries"));
+        assert!(rendered.contains("missing-model-id-for-test"));
     }
 
     #[tokio::test]
