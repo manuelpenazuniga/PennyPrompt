@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap},
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -13,8 +14,8 @@ use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use glob::glob;
 use penny_admin::{self, AdminState};
 use penny_config::{
-    load_config, resolve_user_config_path, AppConfig, ConfigError, LoadOptions, PRESET_EXPLORE,
-    PRESET_INDIE, PRESET_TEAM,
+    load_config, resolve_user_config_path, AppConfig, ConfigError, LoadOptions, ProviderConfig,
+    PRESET_EXPLORE, PRESET_INDIE, PRESET_TEAM,
 };
 use penny_cost::{estimate_tokens, import_pricebook_files, PricingEngine};
 use penny_detect::DetectEngine;
@@ -335,7 +336,34 @@ struct DoctorReport {
     anthropic_key_present: bool,
     openai_key_present: bool,
     active_pricebook_models: i64,
+    latest_pricebook_effective_from: Option<String>,
+    pricebook_freshness: PricebookFreshness,
     budgets_configured: i64,
+    db_path_readiness: PathReadiness,
+    admin_bind_readiness: PathReadiness,
+    provider_reachability: Vec<ProviderReachability>,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderReachability {
+    provider_id: &'static str,
+    enabled: bool,
+    reachable: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone)]
+struct PathReadiness {
+    ok: bool,
+    target: String,
+    detail: String,
+}
+
+#[derive(Debug, Clone)]
+struct PricebookFreshness {
+    stale: bool,
+    age_days: Option<i64>,
+    threshold_days: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -721,6 +749,11 @@ async fn run_doctor(store: &SqliteStore) -> Result<(), CliError> {
     )
     .await
     .unwrap_or(0);
+    let latest_pricebook_effective_from = query_scalar_string(
+        store,
+        "SELECT MAX(effective_from) FROM pricebook_entries WHERE datetime(effective_from) <= datetime('now') AND (effective_until IS NULL OR datetime(effective_until) > datetime('now'))",
+    )
+    .await;
     let budgets_configured = query_scalar_i64(store, "SELECT COUNT(*) FROM budgets")
         .await
         .unwrap_or(0);
@@ -733,6 +766,15 @@ async fn run_doctor(store: &SqliteStore) -> Result<(), CliError> {
         && std::env::var(&config.providers.openai.api_key_env)
             .ok()
             .is_some_and(|value| !value.trim().is_empty());
+    let provider_reachability = check_provider_reachability(&config).await;
+    let db_path_readiness = check_database_path_readiness(&config.server.database_path);
+    let admin_bind_readiness = check_admin_bind_readiness(&config.server.admin_socket);
+    let threshold_days = doctor_pricebook_stale_threshold_days();
+    let pricebook_freshness = compute_pricebook_freshness(
+        latest_pricebook_effective_from.as_deref(),
+        Utc::now(),
+        threshold_days,
+    );
 
     let report = DoctorReport {
         config_ok: true,
@@ -740,9 +782,14 @@ async fn run_doctor(store: &SqliteStore) -> Result<(), CliError> {
         anthropic_key_present,
         openai_key_present,
         active_pricebook_models,
+        latest_pricebook_effective_from,
+        pricebook_freshness,
         budgets_configured,
+        db_path_readiness,
+        admin_bind_readiness,
+        provider_reachability,
     };
-    print_doctor_report(&report, &config.server.database_path);
+    print_doctor_report(&report);
     Ok(())
 }
 
@@ -1713,11 +1760,29 @@ fn resolve_launcher_cwd(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
         .map_err(|error| CliError::Run(format!("invalid --cwd path {}: {error}", raw.display())))
 }
 
-fn print_doctor_report(report: &DoctorReport, database_path: &str) {
+fn print_doctor_report(report: &DoctorReport) {
     println!("Doctor");
     println!("  config: {}", if report.config_ok { "ok" } else { "fail" });
     println!("  database: {}", if report.db_ok { "ok" } else { "fail" });
-    println!("  database_path: {database_path}");
+    println!("  database_path: {}", report.db_path_readiness.target);
+    println!(
+        "  database_path_writable: {} ({})",
+        if report.db_path_readiness.ok {
+            "ok"
+        } else {
+            "fail"
+        },
+        report.db_path_readiness.detail
+    );
+    println!(
+        "  admin_bind_readiness: {} ({})",
+        if report.admin_bind_readiness.ok {
+            "ok"
+        } else {
+            "fail"
+        },
+        report.admin_bind_readiness.detail
+    );
     println!(
         "  anthropic_api_key: {}",
         if report.anthropic_key_present {
@@ -1738,7 +1803,218 @@ fn print_doctor_report(report: &DoctorReport, database_path: &str) {
         "  active_pricebook_models: {}",
         report.active_pricebook_models
     );
+    match report.latest_pricebook_effective_from.as_deref() {
+        Some(value) => println!("  latest_pricebook_effective_from: {value}"),
+        None => println!("  latest_pricebook_effective_from: unavailable"),
+    }
+    let freshness_status = match (
+        report.pricebook_freshness.stale,
+        report.pricebook_freshness.age_days,
+    ) {
+        (true, Some(_)) => "stale",
+        (false, Some(_)) => "fresh",
+        (_, None) => "unknown",
+    };
+    println!(
+        "  pricebook_freshness: {} (age_days={}, threshold_days={})",
+        freshness_status,
+        report
+            .pricebook_freshness
+            .age_days
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        report.pricebook_freshness.threshold_days
+    );
+    println!("  provider_reachability:");
+    for provider in &report.provider_reachability {
+        let state = if !provider.enabled {
+            "disabled"
+        } else if provider.reachable {
+            "reachable"
+        } else {
+            "unreachable"
+        };
+        println!(
+            "    - {}: {} ({})",
+            provider.provider_id, state, provider.detail
+        );
+    }
     println!("  budgets_configured: {}", report.budgets_configured);
+}
+
+async fn check_provider_reachability(config: &AppConfig) -> Vec<ProviderReachability> {
+    let mut checks = Vec::with_capacity(2);
+    checks.push(check_single_provider_reachability("anthropic", &config.providers.anthropic).await);
+    checks.push(check_single_provider_reachability("openai", &config.providers.openai).await);
+    checks
+}
+
+async fn check_single_provider_reachability(
+    provider_id: &'static str,
+    config: &ProviderConfig,
+) -> ProviderReachability {
+    if !config.enabled {
+        return ProviderReachability {
+            provider_id,
+            enabled: false,
+            reachable: false,
+            detail: "disabled".to_string(),
+        };
+    }
+    let base_url = config.base_url.trim();
+    if base_url.is_empty() {
+        return ProviderReachability {
+            provider_id,
+            enabled: true,
+            reachable: false,
+            detail: "missing base_url".to_string(),
+        };
+    }
+
+    let client = match Client::builder()
+        .connect_timeout(Duration::from_millis(800))
+        .timeout(Duration::from_millis(1200))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return ProviderReachability {
+                provider_id,
+                enabled: true,
+                reachable: false,
+                detail: format!("client_init_error: {error}"),
+            };
+        }
+    };
+
+    match client.head(base_url).send().await {
+        Ok(response) => ProviderReachability {
+            provider_id,
+            enabled: true,
+            reachable: true,
+            detail: format!("http_status={}", response.status().as_u16()),
+        },
+        Err(error) => ProviderReachability {
+            provider_id,
+            enabled: true,
+            reachable: false,
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn check_database_path_readiness(database_path: &str) -> PathReadiness {
+    let expanded = expand_tilde(PathBuf::from(database_path));
+    if expanded == "sqlite::memory:" {
+        return PathReadiness {
+            ok: true,
+            target: expanded,
+            detail: "in-memory database".to_string(),
+        };
+    }
+
+    let filesystem_path = if expanded.starts_with("sqlite://") {
+        PathBuf::from(expanded.trim_start_matches("sqlite://"))
+    } else if expanded.starts_with("sqlite:") {
+        PathBuf::from(expanded.trim_start_matches("sqlite:"))
+    } else {
+        PathBuf::from(&expanded)
+    };
+    check_writable_parent(
+        &filesystem_path,
+        &format!("database path parent writable ({expanded})"),
+    )
+}
+
+fn check_admin_bind_readiness(admin_bind: &str) -> PathReadiness {
+    let expanded = expand_tilde(PathBuf::from(admin_bind));
+    if expanded.parse::<SocketAddr>().is_ok() || (expanded.contains(':') && !expanded.contains('/'))
+    {
+        return match std::net::TcpListener::bind(&expanded) {
+            Ok(listener) => {
+                drop(listener);
+                PathReadiness {
+                    ok: true,
+                    target: expanded,
+                    detail: "tcp bind available".to_string(),
+                }
+            }
+            Err(error) => PathReadiness {
+                ok: false,
+                target: expanded,
+                detail: format!("tcp bind failed: {error}"),
+            },
+        };
+    }
+
+    check_writable_parent(
+        Path::new(&expanded),
+        &format!("unix socket parent writable ({expanded})"),
+    )
+}
+
+fn check_writable_parent(path: &Path, context: &str) -> PathReadiness {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    if let Err(error) = fs::create_dir_all(parent) {
+        return PathReadiness {
+            ok: false,
+            target: path.display().to_string(),
+            detail: format!("{context}: create_dir_all failed: {error}"),
+        };
+    }
+
+    let probe = parent.join(format!(
+        ".pennyprompt-doctor-write-probe-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let open = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe);
+    match open {
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            PathReadiness {
+                ok: true,
+                target: path.display().to_string(),
+                detail: context.to_string(),
+            }
+        }
+        Err(error) => PathReadiness {
+            ok: false,
+            target: path.display().to_string(),
+            detail: format!("{context}: {error}"),
+        },
+    }
+}
+
+fn doctor_pricebook_stale_threshold_days() -> i64 {
+    std::env::var("PENNY_DOCTOR_PRICEBOOK_STALE_DAYS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30)
+}
+
+fn compute_pricebook_freshness(
+    latest_effective_from: Option<&str>,
+    now: DateTime<Utc>,
+    threshold_days: i64,
+) -> PricebookFreshness {
+    let age_days = latest_effective_from
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| {
+            let delta = now.signed_duration_since(value.with_timezone(&Utc));
+            delta.num_days().max(0)
+        });
+    let stale = age_days.is_some_and(|days| days > threshold_days);
+    PricebookFreshness {
+        stale,
+        age_days,
+        threshold_days,
+    }
 }
 
 async fn fetch_pricebook_rows(
@@ -1820,6 +2096,14 @@ async fn query_scalar_i64(store: &SqliteStore, sql: &str) -> Result<i64, CliErro
         .await
         .map(|row| row.get::<i64, _>(0))
         .map_err(|error| CliError::Store(error.to_string()))
+}
+
+async fn query_scalar_string(store: &SqliteStore, sql: &str) -> Option<String> {
+    query(sql)
+        .fetch_one(store.pool())
+        .await
+        .ok()
+        .and_then(|row| row.get::<Option<String>, _>(0))
 }
 
 async fn query_scalar_one(store: &SqliteStore, sql: &str) -> Result<i64, CliError> {
@@ -3416,6 +3700,39 @@ mod tests {
         assert!(rendered.contains("Top models by cost"));
         assert!(rendered.contains("claude-sonnet-4-6"));
         assert!(!rendered.contains("gpt-5.2"));
+    }
+
+    #[test]
+    fn compute_pricebook_freshness_flags_stale_and_fresh() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 29, 12, 0, 0)
+            .single()
+            .expect("timestamp");
+        let fresh = compute_pricebook_freshness(Some("2026-04-25T00:00:00Z"), now, 30);
+        assert!(!fresh.stale);
+        assert_eq!(fresh.age_days, Some(4));
+
+        let stale = compute_pricebook_freshness(Some("2026-03-01T00:00:00Z"), now, 30);
+        assert!(stale.stale);
+        assert!(stale.age_days.is_some_and(|days| days > 30));
+
+        let unknown = compute_pricebook_freshness(None, now, 30);
+        assert!(!unknown.stale);
+        assert_eq!(unknown.age_days, None);
+    }
+
+    #[test]
+    fn check_database_path_readiness_accepts_writable_parent() {
+        let dir = tempdir().expect("temp dir");
+        let db_path = dir.path().join("db/penny.db");
+        let readiness = check_database_path_readiness(&db_path.to_string_lossy());
+        assert!(readiness.ok, "readiness detail: {}", readiness.detail);
+    }
+
+    #[test]
+    fn check_admin_bind_readiness_accepts_ephemeral_tcp_bind() {
+        let readiness = check_admin_bind_readiness("127.0.0.1:0");
+        assert!(readiness.ok, "readiness detail: {}", readiness.detail);
     }
 
     #[test]
