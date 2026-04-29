@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - Upcoming changes are tracked via issue-first workflow and merged through PRs.
+- Alpha.2 release gate artifacts: targeted checklist, linked release process gate, and draft release notes template.
 
 ## [v0.1.0-alpha.1] - 2026-04-18
 
@@ -17,4 +18,3 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Integration and golden coverage for admin, proxy, ledger, and CLI event formatting.
 - Release automation workflow for macOS/Linux on x86_64 and arm64 with per-artifact SHA-256 checksums.
 - `scripts/install.sh` bootstrap installer for `curl | sh` installs from GitHub Releases.
-
