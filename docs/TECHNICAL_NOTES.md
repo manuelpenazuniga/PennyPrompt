@@ -60,3 +60,34 @@ API contract:
 - `consistency.mode = best_effort_resume_then_persist`
 - `consistency.event_persistence_guarantee = best_effort`
 - `warning` is present when persistence fails.
+
+## 2026-04: Gemini Perf/Readability Follow-ups (`#128`)
+
+Source reviews:
+- PR #125: https://github.com/manuelpenazuniga/PennyPrompt/pull/125#discussion_r3142804023
+- PR #127: https://github.com/manuelpenazuniga/PennyPrompt/pull/127#discussion_r3142857157
+
+### 1. Proxy SSE ANSI marker scan style (PR #125)
+
+Status: tracked, non-blocking.
+
+Decision:
+- Current implementation is functionally correct and does not expose a
+  correctness or security defect.
+- Treat iterator/slice-style rewrite as readability/micro-perf polish.
+- Apply opportunistically when touching nearby proxy cleanup code.
+
+### 2. CLI `csv_escape` quoted wrapping path (PR #127)
+
+Status: tracked, non-blocking.
+
+Decision:
+- Current implementation is functionally correct and covered by tests.
+- `push_str` fast-path when `quote_count == 0` is a micro-optimization only.
+- Apply opportunistically in a future CLI perf/readability touch.
+
+### Close Criteria for `#128`
+
+- Recommendation set remains documented and discoverable.
+- No urgent correctness, security, or data-integrity risk is pending from these
+  comments.
