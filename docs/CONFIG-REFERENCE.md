@@ -110,6 +110,11 @@ Preset budgets are tagged internally with `preset:<name>` when applied.
 - `PENNY_CLEANUP_STRIP_ANSI` (`true|false|1|0|yes|no|on|off`)
 - `PENNY_CLEANUP_MINIFY_JSON` (`true|false|1|0|yes|no|on|off`)
 
+Observability runtime controls (applied by `penny-observe` at process startup):
+
+- `PENNY_LOG` (RUST_LOG filter syntax, fallback to `RUST_LOG`)
+- `PENNY_OBSERVE_JSON` (`true|false|1|0|yes|no|on|off`)
+
 ## Example Minimal Config
 
 ```toml

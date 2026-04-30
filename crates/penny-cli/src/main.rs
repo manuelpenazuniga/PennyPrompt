@@ -19,6 +19,7 @@ use penny_config::{
 };
 use penny_cost::{estimate_tokens, import_pricebook_files, PricingEngine};
 use penny_detect::DetectEngine;
+use penny_observe::ObserveConfig;
 use penny_providers::{
     AnthropicProvider, AnthropicProviderConfig, MockProvider, MockProviderConfig, OpenAiProvider,
     OpenAiProviderConfig, ProviderAdapter,
@@ -45,6 +46,10 @@ const PRICEBOOK_OPENAI_TOML: &str = include_str!("../../../prices/openai.toml");
 struct Cli {
     #[arg(long)]
     database: Option<PathBuf>,
+    #[arg(long, global = true)]
+    log_filter: Option<String>,
+    #[arg(long, global = true, default_value_t = false)]
+    json_log: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -512,6 +517,8 @@ struct DetectSessionAlert {
 enum CliError {
     #[error("config error: {0}")]
     Config(String),
+    #[error("observe error: {0}")]
+    Observe(String),
     #[error("store error: {0}")]
     Store(String),
     #[error("cost error: {0}")]
@@ -556,6 +563,7 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), CliError> {
+    init_runtime_tracing(&cli)?;
     let store = open_store(cli.database).await?;
     match cli.command {
         Commands::Init { preset, force } => {
@@ -711,6 +719,17 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn init_runtime_tracing(cli: &Cli) -> Result<(), CliError> {
+    let mut observe = ObserveConfig::default();
+    if let Some(filter) = cli.log_filter.as_ref() {
+        observe.log_filter = filter.clone();
+    }
+    if cli.json_log {
+        observe.json = true;
+    }
+    penny_observe::init_tracing(&observe).map_err(|error| CliError::Observe(error.to_string()))
 }
 
 fn run_init(preset: &str, force: bool) -> Result<(), CliError> {

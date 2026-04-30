@@ -255,7 +255,17 @@ All config values can be overridden via environment variables with the `PENNY_` 
 ```bash
 PENNY_SERVER_BIND=0.0.0.0:8585
 PENNY_DEFAULTS_MODEL=claude-opus-4-1
+PENNY_LOG=info,penny_proxy=debug
+PENNY_OBSERVE_JSON=true
 ```
+
+Observability defaults:
+
+- log filter: `info,sqlx=warn,hyper=warn,reqwest=warn`
+- JSON logs: disabled by default
+- override filter with `PENNY_LOG` (or `RUST_LOG`)
+- override JSON mode with `PENNY_OBSERVE_JSON=true|false|1|0|yes|no|on|off`
+- runtime flags: `--log-filter <RUST_LOG syntax>` and `--json-log`
 
 `pennyprompt serve` bind behavior:
 
@@ -277,7 +287,7 @@ pennyprompt prices update          # Import bundled local pricebook files
 ## CLI Reference
 
 ```
-pennyprompt
+pennyprompt [--log-filter <filter>] [--json-log]
 ├── init [--preset indie|team|explore]     Setup wizard
 ├── serve [--mock] [--proxy-bind] [--admin-bind]  Start proxy + admin
 ├── estimate [--model M] [--context-files]  Pre-execution cost estimate
