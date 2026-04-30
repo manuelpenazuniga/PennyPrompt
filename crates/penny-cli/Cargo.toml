@@ -11,6 +11,7 @@ comfy-table = "7"
 glob = "0.3"
 penny-cost = { path = "../penny-cost" }
 penny-config = { path = "../penny-config" }
+penny-observe = { path = "../penny-observe" }
 penny-store = { path = "../penny-store" }
 penny-types = { path = "../penny-types" }
 penny-admin = { path = "../penny-admin" }
