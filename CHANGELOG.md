@@ -8,7 +8,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - Upcoming changes are tracked via issue-first workflow and merged through PRs.
-- Alpha.2 release gate artifacts: targeted checklist, linked release process gate, and draft release notes template.
+- Alpha.2 release gate artifacts: targeted checklist, linked release process gate, and release notes document.
+
+## [v0.1.0-alpha.2] - 2026-04-30 (release publication pending under #144)
+
+### Added
+- `penny-cli serve` runtime lifecycle with proxy/admin startup and graceful shutdown flow (`#129`).
+- Operator/docs command-surface alignment for serve/admin/tail/detect semantics (`#130`).
+- Refreshed local pricebooks with default-model resolvability guardrail (`#131`).
+- Tracing bootstrap via `penny-observe` integrated into CLI startup path (`#134`).
+- Release gate and notes artifacts for auditable alpha.2 publication workflow (`#132`).
+
+### Changed
+- Release/install documentation now avoids unverifiable artifact publication claims and links to explicit reconciliation notes (`#143`).
 
 ## [v0.1.0-alpha.1] - 2026-04-18 (internal milestone cut; public GitHub Release artifacts not yet reconciled)
 
