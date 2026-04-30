@@ -10,7 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Upcoming changes are tracked via issue-first workflow and merged through PRs.
 - Alpha.2 release gate artifacts: targeted checklist, linked release process gate, and draft release notes template.
 
-## [v0.1.0-alpha.1] - 2026-04-18
+## [v0.1.0-alpha.1] - 2026-04-18 (internal milestone cut; public GitHub Release artifacts not yet reconciled)
 
 ### Added
 - Core M1-M5 foundation: config loading, store/migrations, pricing engine, proxy plane, atomic budget/ledger flow, detect heuristics, and operator CLI commands.

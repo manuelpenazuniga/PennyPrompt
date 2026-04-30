@@ -10,16 +10,16 @@ This document describes alpha installation paths for PennyPrompt.
 
 ## 2. Quick Install from GitHub Release (`curl | sh`)
 
-Install latest alpha release:
+Install from the latest published GitHub Release (when available):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/PennyPrompt/main/scripts/install.sh | sh
 ```
 
-Install specific version:
+Install specific published tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/PennyPrompt/main/scripts/install.sh | PENNY_VERSION=v0.1.0-alpha.1 sh
+curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/PennyPrompt/main/scripts/install.sh | PENNY_VERSION=<published-tag> sh
 ```
 
 By default the binary is installed to:

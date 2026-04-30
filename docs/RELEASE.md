@@ -7,6 +7,7 @@ This document defines the repeatable process for alpha releases.
 - Generic alpha manual checklist: [`docs/ALPHA-MANUAL-CHECKLIST.md`](./ALPHA-MANUAL-CHECKLIST.md)
 - Targeted gate for current cut: [`docs/RELEASE_GATE_v0.1.0-alpha.2.md`](./RELEASE_GATE_v0.1.0-alpha.2.md)
 - Release notes draft for current cut: [`docs/release-notes/v0.1.0-alpha.2.md`](./release-notes/v0.1.0-alpha.2.md)
+- Release history reconciliation note: [`docs/release-audit/2026-04-30-release-history-reconciliation.md`](./release-audit/2026-04-30-release-history-reconciliation.md)
 
 ## Scope
 
@@ -17,7 +18,7 @@ Current release automation builds and publishes `penny-cli` binaries for:
 - macOS `x86_64-apple-darwin`
 - macOS `aarch64-apple-darwin`
 
-All artifacts are published as `.tar.gz` plus SHA-256 checksums.
+When a release tag is pushed and the workflow succeeds, artifacts are published as `.tar.gz` plus SHA-256 checksums.
 
 ## Workflow Trigger
 
@@ -29,7 +30,7 @@ Release workflow file:
 
 Trigger condition:
 
-- push a tag that starts with `v` (example: `v0.1.0-alpha.1`)
+- push a tag that starts with `v` (example: `v0.1.0-alpha.2`)
 
 Manual trigger is also available via `workflow_dispatch`.
 
@@ -76,7 +77,7 @@ scripts/install.sh
 
 Supported env vars:
 
-- `PENNY_VERSION` (example: `v0.1.0-alpha.1`)
+- `PENNY_VERSION` (example: `v0.1.0-alpha.2`)
 - `PENNY_INSTALL_DIR` (default: `~/.local/bin`)
 - `PENNY_REPO` (default: `manuelpenazuniga/PennyPrompt`)
 
