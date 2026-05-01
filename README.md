@@ -271,7 +271,7 @@ Observability defaults:
 
 - Proxy plane binds to `server.bind` (default `127.0.0.1:8585`).
 - Admin plane reads `server.admin_socket`.
-- If `admin_socket` is `host:port`, admin binds TCP.
+- If `admin_socket` is `host:port` (for example `localhost:8586` or `127.0.0.1:8586`), admin binds TCP.
 - Otherwise admin binds a Unix socket path (supports `~` expansion).
 - You can override at runtime with `--proxy-bind` and `--admin-bind`.
 
