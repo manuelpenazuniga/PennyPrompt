@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use glob::glob;
@@ -1978,9 +1978,12 @@ async fn check_single_provider_reachability(
         };
     }
 
+    // Rationale: provider roots can be slow on DNS/TLS in CI/corporate networks.
+    // We keep this bounded for CLI responsiveness while avoiding aggressive false negatives.
+    let (connect_timeout, request_timeout) = doctor_provider_timeout_policy();
     let client = match Client::builder()
-        .connect_timeout(Duration::from_millis(800))
-        .timeout(Duration::from_millis(1200))
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
         .build()
     {
         Ok(client) => client,
@@ -2012,7 +2015,7 @@ async fn check_single_provider_reachability(
 
 fn check_database_path_readiness(database_path: &str) -> PathReadiness {
     let expanded = expand_tilde(PathBuf::from(database_path));
-    if expanded == "sqlite::memory:" {
+    if is_in_memory_sqlite_dsn(&expanded) {
         return PathReadiness {
             ok: true,
             target: expanded,
@@ -2105,13 +2108,56 @@ fn doctor_pricebook_stale_threshold_days() -> i64 {
         .unwrap_or(30)
 }
 
+fn doctor_provider_timeout_policy() -> (Duration, Duration) {
+    (Duration::from_secs(2), Duration::from_secs(5))
+}
+
+fn is_in_memory_sqlite_dsn(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == ":memory:" || normalized == "sqlite::memory:" {
+        return true;
+    }
+    let sqlite_prefixed = normalized.strip_prefix("sqlite:").unwrap_or(&normalized);
+    if sqlite_prefixed == ":memory:"
+        || sqlite_prefixed == "//:memory:"
+        || sqlite_prefixed.starts_with(":memory:?")
+        || sqlite_prefixed.starts_with("//:memory:?")
+        || sqlite_prefixed == "file::memory:"
+        || sqlite_prefixed.starts_with("file::memory:?")
+    {
+        return true;
+    }
+
+    if let Some(file_uri) = sqlite_prefixed.strip_prefix("file:") {
+        return file_uri
+            .split_once('?')
+            .is_some_and(|(_, query)| query.contains("mode=memory"));
+    }
+
+    false
+}
+
+fn parse_persisted_datetime(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(value, format) {
+            return Some(DateTime::from_naive_utc_and_offset(dt, Utc));
+        }
+    }
+
+    None
+}
+
 fn compute_pricebook_freshness(
     latest_effective_from: Option<&str>,
     now: DateTime<Utc>,
     threshold_days: i64,
 ) -> PricebookFreshness {
     let age_days = latest_effective_from
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .and_then(parse_persisted_datetime)
         .map(|value| {
             let delta = now.signed_duration_since(value.with_timezone(&Utc));
             delta.num_days().max(0)
@@ -3957,11 +4003,48 @@ mod tests {
     }
 
     #[test]
+    fn compute_pricebook_freshness_parses_sqlite_datetime_formats() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 29, 12, 0, 0)
+            .single()
+            .expect("timestamp");
+        let second_precision = compute_pricebook_freshness(Some("2026-04-25 00:00:00"), now, 30);
+        assert_eq!(second_precision.age_days, Some(4));
+
+        let fractional = compute_pricebook_freshness(Some("2026-04-25 00:00:00.500"), now, 30);
+        assert_eq!(fractional.age_days, Some(4));
+    }
+
+    #[test]
+    fn doctor_provider_timeout_policy_uses_conservative_thresholds() {
+        let (connect_timeout, request_timeout) = doctor_provider_timeout_policy();
+        assert_eq!(connect_timeout, Duration::from_secs(2));
+        assert_eq!(request_timeout, Duration::from_secs(5));
+        assert!(request_timeout > connect_timeout);
+    }
+
+    #[test]
     fn check_database_path_readiness_accepts_writable_parent() {
         let dir = tempdir().expect("temp dir");
         let db_path = dir.path().join("db/penny.db");
         let readiness = check_database_path_readiness(&db_path.to_string_lossy());
         assert!(readiness.ok, "readiness detail: {}", readiness.detail);
+    }
+
+    #[test]
+    fn check_database_path_readiness_accepts_common_in_memory_dsns() {
+        for dsn in [
+            "sqlite::memory:",
+            ":memory:",
+            "sqlite://:memory:",
+            "sqlite://:memory:?cache=shared",
+            "sqlite:file::memory:?cache=shared",
+            "sqlite:file:memdb1?mode=memory&cache=shared",
+        ] {
+            let readiness = check_database_path_readiness(dsn);
+            assert!(readiness.ok, "dsn {dsn} should be in-memory");
+            assert_eq!(readiness.detail, "in-memory database");
+        }
     }
 
     #[test]
