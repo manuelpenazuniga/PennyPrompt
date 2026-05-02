@@ -1344,7 +1344,9 @@ mod tests {
     #[test]
     fn classify_bind_target_accepts_unix_socket_path() {
         let target = classify_bind_target("/tmp/pennyprompt-admin.sock").expect("bind target");
-        assert!(matches!(target, BindTarget::Unix(path) if path.as_path() == std::path::Path::new("/tmp/pennyprompt-admin.sock")));
+        assert!(
+            matches!(target, BindTarget::Unix(path) if path.as_path() == std::path::Path::new("/tmp/pennyprompt-admin.sock"))
+        );
     }
 
     #[test]
