@@ -33,7 +33,7 @@ Config is resolved in this order (later overrides earlier):
 
 - `bind` (`string`): proxy bind address (example `127.0.0.1:8585`)
 - `admin_socket` (`string`): admin bind target
-  - if value is `host:port`, admin binds TCP
+  - if value is `host:port` (for example `localhost:8586` or `127.0.0.1:8586`), admin binds TCP
   - otherwise admin binds a Unix socket path
 - `database_path` (`string`): SQLite database path
 - `mode` (`observe|guard`)

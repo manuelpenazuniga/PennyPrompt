@@ -342,42 +342,82 @@ pub async fn serve_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    if let Ok(addr) = bind.parse::<SocketAddr>() {
-        let listener = TcpListener::bind(addr).await?;
-        let app = build_router(state);
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await?;
-        return Ok(());
-    }
+    let bind_target = classify_bind_target(bind)?;
 
-    #[cfg(unix)]
-    {
-        let socket_path = normalize_unix_socket_path(bind)?;
-        let listener = bind_unix_listener(&socket_path)?;
-        let app = build_router(state);
-        let result = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await;
-        cleanup_unix_socket(&socket_path)?;
-        result?;
-        Ok(())
-    }
+    match bind_target {
+        BindTarget::Tcp(bind_addr) => {
+            let listener = TcpListener::bind(&bind_addr).await?;
+            let app = build_router(state);
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await?;
+            Ok(())
+        }
 
-    #[cfg(not(unix))]
-    {
-        let _ = (state, shutdown);
-        Err(AdminError::InvalidBind(bind.to_string()))
+        #[cfg(unix)]
+        BindTarget::Unix(socket_path) => {
+            let listener = bind_unix_listener(&socket_path)?;
+            let app = build_router(state);
+            let result = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await;
+            cleanup_unix_socket(&socket_path)?;
+            result?;
+            Ok(())
+        }
     }
 }
 
-#[cfg(unix)]
-fn normalize_unix_socket_path(raw: &str) -> Result<PathBuf, AdminError> {
+enum BindTarget {
+    Tcp(String),
+    #[cfg(unix)]
+    Unix(PathBuf),
+}
+
+fn classify_bind_target(raw: &str) -> Result<BindTarget, AdminError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(AdminError::InvalidBind(raw.to_string()));
     }
-    Ok(PathBuf::from(trimmed))
+    if trimmed.parse::<SocketAddr>().is_ok() || is_host_port_candidate(trimmed) {
+        return Ok(BindTarget::Tcp(trimmed.to_string()));
+    }
+
+    #[cfg(unix)]
+    {
+        // Reject colon-delimited non-path values (for example, localhost:notaport)
+        // so they do not silently fall through to Unix socket binding.
+        if trimmed.contains(':') && !trimmed.contains('/') {
+            return Err(AdminError::InvalidBind(raw.to_string()));
+        }
+        Ok(BindTarget::Unix(PathBuf::from(trimmed)))
+    }
+
+    #[cfg(not(unix))]
+    {
+        return Err(AdminError::InvalidBind(raw.to_string()));
+    }
+}
+
+fn is_host_port_candidate(value: &str) -> bool {
+    if value.contains('/') {
+        return false;
+    }
+    if value.starts_with('[') {
+        let Some(bracket_end) = value.find(']') else {
+            return false;
+        };
+        if value.get(bracket_end + 1..bracket_end + 2) != Some(":") {
+            return false;
+        }
+        return value[bracket_end + 2..].parse::<u16>().is_ok();
+    }
+    let Some(separator) = value.rfind(':') else {
+        return false;
+    };
+    let host = &value[..separator];
+    let port = &value[separator + 1..];
+    !host.is_empty() && port.parse::<u16>().is_ok()
 }
 
 #[cfg(unix)]
@@ -1286,6 +1326,41 @@ mod tests {
         SqliteStore::connect("sqlite::memory:")
             .await
             .expect("create in-memory store")
+    }
+
+    #[test]
+    fn classify_bind_target_accepts_ip_port() {
+        let target = classify_bind_target("127.0.0.1:8586").expect("bind target");
+        assert!(matches!(target, BindTarget::Tcp(addr) if addr == "127.0.0.1:8586"));
+    }
+
+    #[test]
+    fn classify_bind_target_accepts_hostname_port() {
+        let target = classify_bind_target("localhost:8586").expect("bind target");
+        assert!(matches!(target, BindTarget::Tcp(addr) if addr == "localhost:8586"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_bind_target_accepts_unix_socket_path() {
+        let target = classify_bind_target("/tmp/pennyprompt-admin.sock").expect("bind target");
+        assert!(
+            matches!(target, BindTarget::Unix(path) if path.as_path() == std::path::Path::new("/tmp/pennyprompt-admin.sock"))
+        );
+    }
+
+    #[test]
+    fn classify_bind_target_rejects_invalid_colon_bind() {
+        let result = classify_bind_target("localhost:notaport");
+        assert!(matches!(result, Err(AdminError::InvalidBind(_))));
+    }
+
+    #[tokio::test]
+    async fn serve_with_shutdown_rejects_invalid_colon_bind() {
+        let store = setup_store().await;
+        let state = AdminState::new(store);
+        let result = serve_with_shutdown("localhost:notaport", state, async {}).await;
+        assert!(matches!(result, Err(AdminError::InvalidBind(_))));
     }
 
     async fn seed_minimal_data(store: &SqliteStore) {

@@ -1347,11 +1347,32 @@ fn map_admin_task(
 }
 
 fn admin_bind_display(bind: &str) -> String {
-    if bind.parse::<std::net::SocketAddr>().is_ok() {
+    if bind.parse::<std::net::SocketAddr>().is_ok() || is_host_port_candidate(bind) {
         format!("http://{bind}")
     } else {
         format!("unix://{bind}")
     }
+}
+
+fn is_host_port_candidate(value: &str) -> bool {
+    if value.contains('/') {
+        return false;
+    }
+    if value.starts_with('[') {
+        let Some(bracket_end) = value.find(']') else {
+            return false;
+        };
+        if value.get(bracket_end + 1..bracket_end + 2) != Some(":") {
+            return false;
+        }
+        return value[bracket_end + 2..].parse::<u16>().is_ok();
+    }
+    let Some(separator) = value.rfind(':') else {
+        return false;
+    };
+    let host = &value[..separator];
+    let port = &value[separator + 1..];
+    !host.is_empty() && port.parse::<u16>().is_ok()
 }
 
 #[cfg(unix)]
@@ -3752,6 +3773,25 @@ mod tests {
     fn check_admin_bind_readiness_accepts_ephemeral_tcp_bind() {
         let readiness = check_admin_bind_readiness("127.0.0.1:0");
         assert!(readiness.ok, "readiness detail: {}", readiness.detail);
+    }
+
+    #[test]
+    fn admin_bind_display_supports_hostname_tcp_targets() {
+        assert_eq!(
+            admin_bind_display("localhost:8586"),
+            "http://localhost:8586"
+        );
+        assert_eq!(
+            admin_bind_display("127.0.0.1:8586"),
+            "http://127.0.0.1:8586"
+        );
+    }
+
+    #[test]
+    fn host_port_candidate_rejects_unix_paths_and_invalid_ports() {
+        assert!(is_host_port_candidate("localhost:8586"));
+        assert!(!is_host_port_candidate("/tmp/penny-admin.sock"));
+        assert!(!is_host_port_candidate("localhost:notaport"));
     }
 
     #[test]
