@@ -1306,8 +1306,9 @@ where
         ServeExit::Signal(signal_name) => {
             println!("Received {signal_name}, shutting down...");
             let _ = shutdown_tx.send(());
-            map_proxy_task(proxy_task.await)?;
-            map_admin_task(admin_task.await)?;
+            let proxy_result = map_proxy_task(proxy_task.await);
+            let admin_result = map_admin_task(admin_task.await);
+            merge_serve_shutdown_results(proxy_result, admin_result)?;
             println!("Serve shutdown complete.");
             Ok(())
         }
@@ -1344,6 +1345,20 @@ fn map_admin_task(
     let result =
         result.map_err(|error| CliError::Run(format!("admin task join error: {error}")))?;
     result.map_err(|error| CliError::Run(format!("admin server error: {error}")))
+}
+
+fn merge_serve_shutdown_results(
+    proxy_result: Result<(), CliError>,
+    admin_result: Result<(), CliError>,
+) -> Result<(), CliError> {
+    match (proxy_result, admin_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(proxy_error), Ok(())) => Err(proxy_error),
+        (Ok(()), Err(admin_error)) => Err(admin_error),
+        (Err(proxy_error), Err(admin_error)) => Err(CliError::Run(format!(
+            "serve shutdown reported multiple failures: proxy={proxy_error}; admin={admin_error}"
+        ))),
+    }
 }
 
 fn admin_bind_display(bind: &str) -> String {
@@ -3624,6 +3639,47 @@ mod tests {
         shutdown_tx.send(()).expect("send shutdown");
         let serve_result = serve_task.await.expect("join serve task");
         assert!(serve_result.is_ok(), "serve task failed: {serve_result:?}");
+    }
+
+    #[test]
+    fn merge_serve_shutdown_results_succeeds_when_both_tasks_succeed() {
+        let result = merge_serve_shutdown_results(Ok(()), Ok(()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn merge_serve_shutdown_results_returns_proxy_error_when_proxy_fails() {
+        let result =
+            merge_serve_shutdown_results(Err(CliError::Run("proxy failure".to_string())), Ok(()))
+                .expect_err("proxy failure must bubble up");
+
+        assert!(matches!(result, CliError::Run(message) if message == "proxy failure"));
+    }
+
+    #[test]
+    fn merge_serve_shutdown_results_returns_admin_error_when_admin_fails() {
+        let result =
+            merge_serve_shutdown_results(Ok(()), Err(CliError::Run("admin failure".to_string())))
+                .expect_err("admin failure must bubble up");
+
+        assert!(matches!(result, CliError::Run(message) if message == "admin failure"));
+    }
+
+    #[test]
+    fn merge_serve_shutdown_results_reports_both_errors_when_both_tasks_fail() {
+        let result = merge_serve_shutdown_results(
+            Err(CliError::Run("proxy failure".to_string())),
+            Err(CliError::Run("admin failure".to_string())),
+        )
+        .expect_err("both failures must be reported deterministically");
+
+        let message = match result {
+            CliError::Run(message) => message,
+            other => panic!("expected run error, got {other:?}"),
+        };
+        assert!(message.contains("serve shutdown reported multiple failures"));
+        assert!(message.contains("proxy=run command error: proxy failure"));
+        assert!(message.contains("admin=run command error: admin failure"));
     }
 
     #[test]
