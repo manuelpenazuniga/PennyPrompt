@@ -25,7 +25,7 @@ use penny_providers::{
     OpenAiProviderConfig, ProviderAdapter,
 };
 use penny_proxy::{self, build_state_from_config};
-use penny_store::{BudgetRepo, PricebookRepo, ProjectRepo, SessionRepo, SqliteStore};
+use penny_store::{BudgetRepo, ProjectRepo, SessionRepo, SqliteStore};
 use penny_types::{Budget, Confidence, Event, EventType, Money, ScopeType, TaskType, WindowType};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -888,16 +888,21 @@ async fn run_prices_update(store: &SqliteStore) -> Result<(), CliError> {
         ))
     })?;
 
-    let imported = import_pricebook_files(store, &[anthropic.clone(), openai.clone()])
-        .await
-        .map_err(|error| CliError::Cost(error.to_string()))?;
+    let staged_models = staged_pricebook_model_ids(&[anthropic.clone(), openai.clone()])?;
     let mut guardrail_models = preset_default_models()?;
     if let Ok(config) = load_config(LoadOptions::default()) {
         guardrail_models.push(config.defaults.model);
     }
     guardrail_models.sort();
     guardrail_models.dedup();
-    validate_pricebook_models_resolvable(store, &guardrail_models).await?;
+
+    // Validate before import so a guardrail failure leaves the live pricebook untouched.
+    validate_pricebook_models_resolvable_with_staged(store, &guardrail_models, &staged_models)
+        .await?;
+
+    let imported = import_pricebook_files(store, &[anthropic.clone(), openai.clone()])
+        .await
+        .map_err(|error| CliError::Cost(error.to_string()))?;
     println!("Pricebook update completed");
     println!("  imported_entries: {imported}");
     println!("  validated_default_models: {}", guardrail_models.len());
@@ -935,18 +940,65 @@ fn preset_default_models() -> Result<Vec<String>, CliError> {
     Ok(models)
 }
 
-async fn validate_pricebook_models_resolvable(
+fn staged_pricebook_model_ids(paths: &[PathBuf]) -> Result<BTreeSet<String>, CliError> {
+    let mut models = BTreeSet::new();
+    for path in paths {
+        let raw = fs::read_to_string(path).map_err(|error| {
+            CliError::Cost(format!(
+                "failed to read staged pricebook {}: {error}",
+                path.display()
+            ))
+        })?;
+        let parsed: toml::Value = toml::from_str(&raw).map_err(|error| {
+            CliError::Cost(format!(
+                "failed to parse staged pricebook {}: {error}",
+                path.display()
+            ))
+        })?;
+        let entries = parsed
+            .get("entries")
+            .and_then(toml::Value::as_array)
+            .ok_or_else(|| {
+                CliError::Cost(format!(
+                    "staged pricebook {} is missing entries array",
+                    path.display()
+                ))
+            })?;
+        for entry in entries {
+            let model_id = entry
+                .get("model_id")
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CliError::Cost(format!(
+                        "staged pricebook {} contains an entry with missing model_id",
+                        path.display()
+                    ))
+                })?;
+            models.insert(model_id.to_string());
+        }
+    }
+    Ok(models)
+}
+
+async fn validate_pricebook_models_resolvable_with_staged(
     store: &SqliteStore,
     model_ids: &[String],
+    staged_models: &BTreeSet<String>,
 ) -> Result<(), CliError> {
-    let now = Utc::now();
     let mut unresolved = Vec::new();
     for model_id in model_ids {
-        let maybe_entry = store
-            .get_price(model_id, now)
-            .await
-            .map_err(|error| CliError::Cost(error.to_string()))?;
-        if maybe_entry.is_none() {
+        if staged_models.contains(model_id) {
+            continue;
+        }
+        let exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(1) FROM pricebook_entries WHERE model_id = ?1")
+                .bind(model_id)
+                .fetch_one(store.pool())
+                .await
+                .map_err(|error| CliError::Cost(error.to_string()))?;
+        if exists == 0 {
             unresolved.push(model_id.clone());
         }
     }
@@ -3158,7 +3210,9 @@ mod tests {
     use std::path::Path;
 
     use chrono::{Duration as ChronoDuration, TimeZone};
-    use penny_store::{NewRequest, ProjectRepo, RequestRepo, UsageRecord};
+    use penny_store::{
+        NewPricebookEntry, NewRequest, PricebookRepo, ProjectRepo, RequestRepo, UsageRecord,
+    };
     use penny_types::{EventType, Money, Severity, UsageSource};
     use tempfile::tempdir;
 
@@ -3233,6 +3287,58 @@ mod tests {
         )
         .await
         .expect("insert usage");
+    }
+
+    async fn insert_pricebook_entry(
+        store: &SqliteStore,
+        model_id: &str,
+        effective_from: DateTime<Utc>,
+        effective_until: Option<DateTime<Utc>>,
+    ) {
+        query(
+            r#"
+            INSERT INTO providers (id, name, base_url, api_format, enabled)
+            VALUES (?1, ?2, ?3, ?4, 1)
+            ON CONFLICT(id) DO NOTHING
+            "#,
+        )
+        .bind("test-provider")
+        .bind("Test Provider")
+        .bind("https://placeholder.local")
+        .bind("openai")
+        .execute(store.pool())
+        .await
+        .expect("insert provider");
+
+        query(
+            r#"
+            INSERT INTO models (id, provider_id, external_name, display_name, class)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO NOTHING
+            "#,
+        )
+        .bind(model_id)
+        .bind("test-provider")
+        .bind(model_id)
+        .bind(model_id)
+        .bind("balanced")
+        .execute(store.pool())
+        .await
+        .expect("insert model");
+
+        PricebookRepo::import(
+            store,
+            &[NewPricebookEntry {
+                model_id: model_id.to_string(),
+                input_per_mtok: Money::from_usd(1.0).expect("money"),
+                output_per_mtok: Money::from_usd(2.0).expect("money"),
+                effective_from,
+                effective_until,
+                source: "test".to_string(),
+            }],
+        )
+        .await
+        .expect("import pricebook entry");
     }
 
     #[test]
@@ -3550,7 +3656,7 @@ mod tests {
         let store = setup_store().await;
         run_prices_update(&store).await.expect("prices update");
         let preset_models = preset_default_models().expect("preset models");
-        validate_pricebook_models_resolvable(&store, &preset_models)
+        validate_pricebook_models_resolvable_with_staged(&store, &preset_models, &BTreeSet::new())
             .await
             .expect("preset models must resolve");
     }
@@ -3558,9 +3664,10 @@ mod tests {
     #[tokio::test]
     async fn prices_update_guardrail_rejects_unresolved_defaults() {
         let store = setup_store().await;
-        let error = validate_pricebook_models_resolvable(
+        let error = validate_pricebook_models_resolvable_with_staged(
             &store,
             &[String::from("missing-model-id-for-test")],
+            &BTreeSet::new(),
         )
         .await
         .expect_err("missing model must fail guardrail");
@@ -3568,6 +3675,38 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("unresolved defaults.model entries"));
         assert!(rendered.contains("missing-model-id-for-test"));
+    }
+
+    #[tokio::test]
+    async fn prices_update_guardrail_accepts_staged_model_without_live_row() {
+        let store = setup_store().await;
+        let model_id = "future-model-from-staging";
+        let staged = BTreeSet::from([model_id.to_string()]);
+        validate_pricebook_models_resolvable_with_staged(&store, &[model_id.to_string()], &staged)
+            .await
+            .expect("staged model should satisfy guardrail before import");
+    }
+
+    #[tokio::test]
+    async fn prices_update_guardrail_accepts_existing_store_model_without_staging() {
+        let store = setup_store().await;
+        insert_pricebook_entry(
+            &store,
+            "model-already-in-store",
+            Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0)
+                .single()
+                .expect("effective_from"),
+            None,
+        )
+        .await;
+
+        validate_pricebook_models_resolvable_with_staged(
+            &store,
+            &[String::from("model-already-in-store")],
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("existing store model should satisfy guardrail");
     }
 
     #[tokio::test]

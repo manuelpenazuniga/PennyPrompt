@@ -25,6 +25,12 @@ penny-cli prices show --limit 20
 
 (`cargo run -p penny-cli -- prices update` works too.)
 
+During `prices update`, guardrail validation is performed before any database writes:
+
+- Every default model (`presets/*` + optional user `defaults.model`) must be resolvable.
+- A model is considered resolvable if it is present in the staged pricebook files being imported, or already exists in `pricebook_entries`.
+- Validation is deterministic and does not depend on wall-clock time, so future-dated entries in staged files do not cause spurious failures.
+
 ## File Format
 
 Top-level fields:
