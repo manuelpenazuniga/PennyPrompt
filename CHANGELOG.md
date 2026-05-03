@@ -10,6 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Upcoming changes are tracked via issue-first workflow and merged through PRs.
 - Alpha.2 release gate artifacts: targeted checklist, linked release process gate, and release notes document.
 
+### Changed
+- Observability startup precedence is now explicit: CLI flags (`--log-filter`, `--json-log`) override environment (`PENNY_LOG`/`RUST_LOG`, `PENNY_OBSERVE_JSON`), which still override built-in defaults. Backward-compatibility note: workflows relying on env vars to force logging behavior should stop passing conflicting CLI flags.
+
 ## [v0.1.0-alpha.2] - 2026-04-30 (release publication pending under #144)
 
 ### Added

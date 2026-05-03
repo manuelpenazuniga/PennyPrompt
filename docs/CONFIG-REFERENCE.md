@@ -112,6 +112,7 @@ Preset budgets are tagged internally with `preset:<name>` when applied.
 
 Observability runtime controls (applied by `penny-observe` at process startup):
 
+- precedence: explicit CLI flags (`--log-filter`, `--json-log`) > environment > defaults
 - `PENNY_LOG` (RUST_LOG filter syntax, fallback to `RUST_LOG`)
 - `PENNY_OBSERVE_JSON` (`true|false|1|0|yes|no|on|off`)
 

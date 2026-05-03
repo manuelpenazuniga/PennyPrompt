@@ -19,7 +19,7 @@ use penny_config::{
 };
 use penny_cost::{estimate_tokens, import_pricebook_files, PricingEngine};
 use penny_detect::DetectEngine;
-use penny_observe::ObserveConfig;
+use penny_observe::{ObserveConfig, ObserveRuntimeOverrides};
 use penny_providers::{
     AnthropicProvider, AnthropicProviderConfig, MockProvider, MockProviderConfig, OpenAiProvider,
     OpenAiProviderConfig, ProviderAdapter,
@@ -722,14 +722,21 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 }
 
 fn init_runtime_tracing(cli: &Cli) -> Result<(), CliError> {
-    let mut observe = ObserveConfig::default();
-    if let Some(filter) = cli.log_filter.as_ref() {
-        observe.log_filter = filter.clone();
+    let observe = ObserveConfig::default();
+    let overrides = observe_runtime_overrides_from_cli(cli);
+    penny_observe::init_tracing_with_overrides(&observe, &overrides)
+        .map_err(|error| CliError::Observe(error.to_string()))
+}
+
+fn observe_runtime_overrides_from_cli(cli: &Cli) -> ObserveRuntimeOverrides {
+    ObserveRuntimeOverrides {
+        log_filter: cli
+            .log_filter
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        json: cli.json_log.then_some(true),
     }
-    if cli.json_log {
-        observe.json = true;
-    }
-    penny_observe::init_tracing(&observe).map_err(|error| CliError::Observe(error.to_string()))
 }
 
 fn run_init(preset: &str, force: bool) -> Result<(), CliError> {
@@ -3254,6 +3261,7 @@ mod tests {
     use std::fs;
     use std::net::TcpListener as StdTcpListener;
     use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
 
     use chrono::{Duration as ChronoDuration, TimeZone};
     use penny_store::{
@@ -3268,6 +3276,20 @@ mod tests {
         SqliteStore::connect("sqlite::memory:")
             .await
             .expect("create in-memory store")
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn test_cli(log_filter: Option<&str>, json_log: bool) -> Cli {
+        Cli {
+            database: None,
+            log_filter: log_filter.map(str::to_string),
+            json_log,
+            command: Commands::Doctor,
+        }
     }
 
     fn find_free_port() -> u16 {
@@ -3408,6 +3430,36 @@ mod tests {
         assert!(parse_since_duration("xyz").is_err());
         assert!(parse_since_duration("10").is_err());
         assert!(parse_since_duration("3w").is_err());
+    }
+
+    #[test]
+    fn observe_runtime_overrides_cli_log_filter_beats_env() {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::set_var("PENNY_LOG", "warn");
+        std::env::remove_var("RUST_LOG");
+        std::env::remove_var("PENNY_OBSERVE_JSON");
+
+        let cli = test_cli(Some("trace,penny_proxy=debug"), false);
+        let resolved = penny_observe::resolve_observe_config(
+            &ObserveConfig::default(),
+            &observe_runtime_overrides_from_cli(&cli),
+        );
+        assert_eq!(resolved.log_filter, "trace,penny_proxy=debug");
+    }
+
+    #[test]
+    fn observe_runtime_overrides_cli_json_flag_beats_env_false() {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::set_var("PENNY_OBSERVE_JSON", "false");
+        std::env::remove_var("PENNY_LOG");
+        std::env::remove_var("RUST_LOG");
+
+        let cli = test_cli(None, true);
+        let resolved = penny_observe::resolve_observe_config(
+            &ObserveConfig::default(),
+            &observe_runtime_overrides_from_cli(&cli),
+        );
+        assert!(resolved.json);
     }
 
     #[test]
