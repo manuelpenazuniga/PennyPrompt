@@ -1,0 +1,36 @@
+name: PR Issue Linkage
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled]
+
+jobs:
+  enforce-linkage:
+    name: Enforce Closes #N Discipline
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Validate issue linkage in PR body
+        env:
+          EVENT_PATH: ${{ github.event_path }}
+        run: |
+          set -euo pipefail
+
+          BODY="$(jq -r '.pull_request.body // ""' "$EVENT_PATH")"
+          HAS_SKIP_LABEL="$(jq -r '[.pull_request.labels[]?.name] | any(. == "skip-issue-linkage")' "$EVENT_PATH")"
+
+          if [ "$HAS_SKIP_LABEL" = "true" ]; then
+            echo "skip-issue-linkage label present; bypassing issue linkage enforcement."
+            exit 0
+          fi
+
+          if echo "$BODY" | grep -Eiq '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+\b'; then
+            echo "Issue linkage check passed."
+            exit 0
+          fi
+
+          echo "PR body must include issue linkage (for example: 'Closes #151')."
+          echo "If this PR intentionally has no issue to close, add label 'skip-issue-linkage' and explain why in PR body."
+          exit 1
