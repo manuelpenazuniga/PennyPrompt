@@ -22,7 +22,8 @@ This is the working protocol we use to keep delivery, traceability, and review q
 2. Create a new branch per issue.
 3. Keep scope strict to that issue only.
 4. Open one PR per branch.
-5. Merge PR, then sync `main` before starting the next issue.
+5. PR body must include an issue-closing keyword (`Closes #N`, `Fixes #N`, or `Resolves #N`).
+6. Merge PR, then sync `main` before starting the next issue.
 
 Recommended branch naming:
 
@@ -50,12 +51,13 @@ cargo check --workspace
 ```
 5. Stage only intended files and commit with issue reference.
 6. Push and open PR.
-7. Review bot/human comments and classify:
+7. Ensure PR body includes issue linkage (`Closes #N` discipline). If a PR intentionally has no linked issue, add label `skip-issue-linkage` and explain why in the PR body.
+8. Review bot/human comments and classify:
 - Must-fix now (functional correctness/security/data integrity).
 - Covered by existing backlog issue.
 - New technical debt issue.
-8. Merge PR.
-9. Sync main again before next issue.
+9. Merge PR.
+10. Sync main again before next issue.
 
 ## Commit Message Pattern
 
