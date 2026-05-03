@@ -263,8 +263,9 @@ Observability defaults:
 
 - log filter: `info,sqlx=warn,hyper=warn,reqwest=warn`
 - JSON logs: disabled by default
-- override filter with `PENNY_LOG` (or `RUST_LOG`)
-- override JSON mode with `PENNY_OBSERVE_JSON=true|false|1|0|yes|no|on|off`
+- precedence: explicit CLI flags > environment > built-in defaults
+- filter env override: `PENNY_LOG` (fallback `RUST_LOG`)
+- JSON env override: `PENNY_OBSERVE_JSON=true|false|1|0|yes|no|on|off`
 - runtime flags: `--log-filter <RUST_LOG syntax>` and `--json-log`
 
 `pennyprompt serve` bind behavior:

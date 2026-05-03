@@ -18,6 +18,12 @@ pub struct ObserveConfig {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObserveRuntimeOverrides {
+    pub log_filter: Option<String>,
+    pub json: Option<bool>,
+}
+
 impl Default for ObserveConfig {
     fn default() -> Self {
         Self {
@@ -52,13 +58,23 @@ pub fn default_log_filter() -> String {
 ///
 /// Structured mode can be toggled with `PENNY_OBSERVE_JSON=true|false|1|0|yes|no|on|off`.
 pub fn init_tracing(cfg: &ObserveConfig) -> Result<(), InitError> {
-    let filter_spec = env_filter_override().unwrap_or_else(|| cfg.log_filter.clone());
+    init_tracing_with_overrides(cfg, &ObserveRuntimeOverrides::default())
+}
+
+/// Initializes global tracing exactly once for the process, allowing explicit
+/// runtime overrides (for example, CLI flags) to take precedence over env vars.
+pub fn init_tracing_with_overrides(
+    cfg: &ObserveConfig,
+    overrides: &ObserveRuntimeOverrides,
+) -> Result<(), InitError> {
+    let resolved = resolve_observe_config(cfg, overrides);
+    let filter_spec = resolved.log_filter;
     let env_filter =
         EnvFilter::try_new(filter_spec.clone()).map_err(|source| InitError::InvalidFilter {
             filter: filter_spec,
             source,
         })?;
-    let json = env_json_override().unwrap_or(cfg.json);
+    let json = resolved.json;
     let registry = tracing_subscriber::registry().with(env_filter);
 
     if json {
@@ -67,6 +83,30 @@ pub fn init_tracing(cfg: &ObserveConfig) -> Result<(), InitError> {
         registry.with(fmt::layer().with_target(false)).try_init()?;
     }
     Ok(())
+}
+
+/// Resolves effective observe config without initializing tracing.
+///
+/// Resolution order:
+/// 1. explicit runtime overrides
+/// 2. environment (`PENNY_LOG`/`RUST_LOG`, `PENNY_OBSERVE_JSON`)
+/// 3. base config values
+pub fn resolve_observe_config(
+    cfg: &ObserveConfig,
+    overrides: &ObserveRuntimeOverrides,
+) -> ObserveConfig {
+    let log_filter = overrides
+        .log_filter
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(env_filter_override)
+        .unwrap_or_else(|| cfg.log_filter.clone());
+    let json = overrides
+        .json
+        .or_else(env_json_override)
+        .unwrap_or(cfg.json);
+    ObserveConfig { log_filter, json }
 }
 
 fn env_filter_override() -> Option<String> {
@@ -138,5 +178,43 @@ mod tests {
             matches!(second, Err(InitError::AlreadyInitialized(_))),
             "expected AlreadyInitialized, got {second:?}"
         );
+    }
+
+    #[test]
+    fn resolve_observe_config_prefers_runtime_overrides_over_env() {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::set_var("PENNY_LOG", "warn");
+        std::env::set_var("PENNY_OBSERVE_JSON", "false");
+
+        let base = ObserveConfig {
+            log_filter: "info".to_string(),
+            json: false,
+        };
+        let resolved = resolve_observe_config(
+            &base,
+            &ObserveRuntimeOverrides {
+                log_filter: Some("trace,penny_proxy=debug".to_string()),
+                json: Some(true),
+            },
+        );
+
+        assert_eq!(resolved.log_filter, "trace,penny_proxy=debug");
+        assert!(resolved.json);
+    }
+
+    #[test]
+    fn resolve_observe_config_uses_env_when_runtime_overrides_absent() {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::set_var("PENNY_LOG", "error");
+        std::env::set_var("PENNY_OBSERVE_JSON", "true");
+
+        let base = ObserveConfig {
+            log_filter: "info".to_string(),
+            json: false,
+        };
+        let resolved = resolve_observe_config(&base, &ObserveRuntimeOverrides::default());
+
+        assert_eq!(resolved.log_filter, "error");
+        assert!(resolved.json);
     }
 }
