@@ -151,6 +151,12 @@ Your reports are useful from the first request, zero configuration.
 
 ### Real-Time Monitoring
 
+Start `serve` with admin on loopback TCP (terminal A), then run `tail`/`detect` from terminal B:
+
+```bash
+$ pennyprompt serve --admin-bind 127.0.0.1:8586
+```
+
 ```bash
 $ pennyprompt tail
 
@@ -205,7 +211,8 @@ pennyprompt init --preset explore   # $10/mo soft limit only, observe mode
 
 [server]
 bind = "127.0.0.1:8585"               # Proxy plane
-admin_socket = "~/.local/share/pennyprompt/admin.sock"
+admin_socket = "127.0.0.1:8586"       # Recommended for tail/detect defaults
+# admin_socket = "~/.local/share/pennyprompt/admin.sock"  # Optional unix socket mode
 database_path = "~/.local/share/pennyprompt/penny.db"
 mode = "guard"                          # observe | guard
 
@@ -273,7 +280,8 @@ Observability defaults:
 - Proxy plane binds to `server.bind` (default `127.0.0.1:8585`).
 - Admin plane reads `server.admin_socket`.
 - If `admin_socket` is `host:port` (for example `localhost:8586` or `127.0.0.1:8586`), admin binds TCP.
-- Otherwise admin binds a Unix socket path (supports `~` expansion).
+- `tail` and `detect` defaults expect admin HTTP at `http://127.0.0.1:8586`, so use `--admin-bind 127.0.0.1:8586` or set `server.admin_socket = "127.0.0.1:8586"`.
+- If admin runs on a Unix socket path, `tail`/`detect` require an explicit reachable TCP admin bind.
 - You can override at runtime with `--proxy-bind` and `--admin-bind`.
 
 ### Pricebook
@@ -301,9 +309,9 @@ pennyprompt [--log-filter <filter>] [--json-log]
 │   ├── set <scope> <window> <limit>        Create/update budget
 │   └── reset <scope> <window>              Reset a budget window
 ├── detect
-│   ├── status                              Active alerts, paused sessions
-│   └── resume <session_id>                 Resume paused session
-├── tail                                    Live request + cost stream
+│   ├── status [--admin-url]                Active alerts, paused sessions
+│   └── resume <session_id> [--admin-url]   Resume paused session
+├── tail [--admin-url]                      Live request + cost stream
 ├── doctor                                  System diagnostics
 ├── prices
 │   ├── show                                Current pricebook

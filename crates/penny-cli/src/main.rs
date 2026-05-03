@@ -113,11 +113,18 @@ enum Commands {
         mock: bool,
         #[arg(long)]
         proxy_bind: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Admin bind target. Use 127.0.0.1:8586 for tail/detect defaults; otherwise a unix socket path is used."
+        )]
         admin_bind: Option<String>,
     },
     Tail {
-        #[arg(long, default_value = "http://127.0.0.1:8586")]
+        #[arg(
+            long,
+            default_value = "http://127.0.0.1:8586",
+            help = "Admin HTTP base URL. Defaults to loopback TCP; requires serve --admin-bind 127.0.0.1:8586 (or equivalent)."
+        )]
         admin_url: String,
         #[arg(long)]
         since_id: Option<i64>,
@@ -159,14 +166,22 @@ enum ReportCommands {
 #[derive(Debug, Subcommand)]
 enum DetectCommands {
     Status {
-        #[arg(long, default_value = "http://127.0.0.1:8586")]
+        #[arg(
+            long,
+            default_value = "http://127.0.0.1:8586",
+            help = "Admin HTTP base URL. Defaults to loopback TCP; requires serve --admin-bind 127.0.0.1:8586 (or equivalent)."
+        )]
         admin_url: String,
     },
     Resume {
         session_id: String,
         #[arg(long)]
         request_id: Option<String>,
-        #[arg(long, default_value = "http://127.0.0.1:8586")]
+        #[arg(
+            long,
+            default_value = "http://127.0.0.1:8586",
+            help = "Admin HTTP base URL. Defaults to loopback TCP; requires serve --admin-bind 127.0.0.1:8586 (or equivalent)."
+        )]
         admin_url: String,
     },
 }

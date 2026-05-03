@@ -62,6 +62,8 @@ Run `serve` in terminal A and keep it running:
 ./target/release/penny-cli serve --admin-bind 127.0.0.1:8586
 ```
 
+This is the recommended default topology for local operator workflows because `tail` and `detect` commands default to `http://127.0.0.1:8586`.
+
 If you want a fully local smoke test without provider keys:
 
 ```bash
