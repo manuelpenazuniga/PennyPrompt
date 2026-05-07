@@ -91,3 +91,106 @@ Decision:
 - Recommendation set remains documented and discoverable.
 - No urgent correctness, security, or data-integrity risk is pending from these
   comments.
+
+## 2026-05: Gemini Triage for PRs `#135`-`#140` (`#155`)
+
+Source PRs:
+- https://github.com/manuelpenazuniga/PennyPrompt/pull/135
+- https://github.com/manuelpenazuniga/PennyPrompt/pull/136
+- https://github.com/manuelpenazuniga/PennyPrompt/pull/137
+- https://github.com/manuelpenazuniga/PennyPrompt/pull/138
+- https://github.com/manuelpenazuniga/PennyPrompt/pull/139
+- https://github.com/manuelpenazuniga/PennyPrompt/pull/140
+
+This section is the canonical disposition log for recommendations raised during
+that review wave.
+
+### Disposition Ledger
+
+1. Admin bind hostname/IP contract ambiguity (PRs #135/#136)
+- Disposition: **Accepted / Fixed**
+- Tracking: `#146` -> merged in [PR #159](https://github.com/manuelpenazuniga/PennyPrompt/pull/159)
+- Notes: Contract is now explicit and tested for hostname, ip:port, unix path,
+  and invalid bind strings.
+
+2. Serve signal-shutdown short-circuit risk (PR #135)
+- Disposition: **Accepted / Fixed**
+- Tracking: `#147` -> merged in [PR #160](https://github.com/manuelpenazuniga/PennyPrompt/pull/160)
+- Notes: Both plane outcomes are always awaited/evaluated with deterministic
+  multi-failure reporting.
+
+3. Pricebook guardrail timing/atomicity concerns (PR #137)
+- Disposition: **Accepted / Fixed**
+- Tracking: `#148` -> merged in [PR #161](https://github.com/manuelpenazuniga/PennyPrompt/pull/161)
+- Notes: Guardrail moved pre-import, validation made deterministic and
+  independent from incidental wall-clock behavior.
+
+4. Doctor robustness gaps (timeouts, in-memory DSNs, datetime parsing) (PR #139)
+- Disposition: **Accepted / Fixed**
+- Tracking: `#149` -> merged in [PR #162](https://github.com/manuelpenazuniga/PennyPrompt/pull/162)
+- Notes: Added tests and explicit timeout policy rationale.
+
+5. Observe precedence surprise (env overriding explicit CLI flags) (PR #140)
+- Disposition: **Accepted / Fixed**
+- Tracking: `#150` -> merged in [PR #163](https://github.com/manuelpenazuniga/PennyPrompt/pull/163)
+- Notes: Runtime precedence is now explicit and documented as
+  `CLI explicit > env > defaults`.
+
+6. PR/issue traceability should be policy, not convention (cross-cutting)
+- Disposition: **Accepted / Fixed**
+- Tracking: `#151` -> merged in [PR #164](https://github.com/manuelpenazuniga/PennyPrompt/pull/164)
+- Notes: Added workflow doc rule, PR template, and CI linkage check with an
+  explicit exception label.
+
+7. Tail/detect topology defaults unclear for operators (cross-cutting docs)
+- Disposition: **Accepted / Fixed**
+- Tracking: `#152` -> merged in [PR #165](https://github.com/manuelpenazuniga/PennyPrompt/pull/165)
+- Notes: Local default path is now clearly documented around loopback TCP admin
+  connectivity.
+
+8. Status snapshot drift after hardening sequence (cross-cutting docs)
+- Disposition: **Accepted / Fixed**
+- Tracking: `#153` -> merged in [PR #166](https://github.com/manuelpenazuniga/PennyPrompt/pull/166)
+- Notes: New dated status snapshot with evidence-backed resolved/pending map.
+
+9. Release-gate checklist command ambiguity (PR #138)
+- Disposition: **Accepted / Fixed**
+- Tracking: `#154` -> merged in [PR #167](https://github.com/manuelpenazuniga/PennyPrompt/pull/167)
+- Notes: Runtime and checksum verification commands are now concrete and
+  reproducible.
+
+10. Release publication and artifact evidence completeness (post-gate execution)
+- Disposition: **Deferred (Operational dependency)**
+- Tracking: `#144` (open)
+- Rationale: This is bounded by release workflow execution/publication state,
+  not by unresolved code-level correctness in reviewed PRs.
+- Revisit trigger: Close immediately once release artifacts + checksums are
+  published and evidence-linked in the gate doc.
+
+### Rejected / Not-a-Defect Clarifications
+
+1. Model-ID validity false alarms in docs/pricebook review thread
+- Disposition: **Rejected as defect**
+- Rationale: PennyPrompt maintains canonical local model IDs in versioned
+  pricebooks; IDs are validated through the guardrail/import pipeline and not
+  by matching marketing naming conventions verbatim.
+- Supporting fixes: [PR #137](https://github.com/manuelpenazuniga/PennyPrompt/pull/137),
+  [PR #161](https://github.com/manuelpenazuniga/PennyPrompt/pull/161)
+- Revisit trigger: open a blocker only if a canonical ID cannot be resolved at
+  import/runtime or provider mapping fails in integration.
+
+2. Mandatory no-exception linkage enforcement
+- Disposition: **Rejected as policy default**
+- Rationale: Strict issue-linkage enforcement is required, but a documented
+  emergency/doc-only exception path is operationally necessary (`skip-issue-linkage`).
+- Supporting fix: [PR #164](https://github.com/manuelpenazuniga/PennyPrompt/pull/164)
+- Revisit trigger: if exception label misuse appears, tighten policy with
+  additional CI constraints (e.g., maintainer-only label application).
+
+### Close Criteria for `#155`
+
+- Every recommendation cluster from PRs `#135`-`#140` is mapped to one of:
+  fixed, deferred, or rejected.
+- Deferred/rejected entries contain rationale and explicit revisit triggers.
+- This section remains the single source for avoiding repeated triage churn on
+  already-dispositioned Gemini recommendations.
