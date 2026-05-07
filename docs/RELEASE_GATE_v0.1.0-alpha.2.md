@@ -29,6 +29,21 @@ Evidence:
 
 Use a fresh shell and clean local config where possible.
 
+Reference command sequence (copy/paste):
+
+```bash
+# terminal A
+penny-cli serve --mock --admin-bind 127.0.0.1:8586
+
+# terminal B
+curl -fsS http://127.0.0.1:8586/admin/health
+penny-cli tail --admin-url http://127.0.0.1:8586 --once --limit 20
+```
+
+Non-default scenario:
+- If admin is started on a different TCP bind (for example `--admin-bind 127.0.0.1:9595`),
+  every `tail` / `detect` command must pass the matching URL (`--admin-url http://127.0.0.1:9595`).
+
 - [x] `penny-cli init --preset indie` succeeds.
 - [x] `penny-cli prices update` succeeds and reports validated default models.
 - [x] `penny-cli prices show --limit 20` shows active entries with expected models (`claude-sonnet-4-6`, `claude-haiku-4`, `gpt-4.1` at minimum).
@@ -81,7 +96,21 @@ Evidence:
 
 - [ ] Release has 4 `.tar.gz` artifacts and 4 `.sha256` files.
 - [ ] `CHECKSUMS.txt` present and complete.
-- [ ] At least one target checksum verified locally (`shasum -a 256 -c ...`).
+- [ ] At least one target checksum verified locally with a concrete command.
+
+Reference checksum commands (macOS/Linux):
+
+```bash
+# from a clean temp dir
+gh release download v0.1.0-alpha.2 \
+  --repo manuelpenazuniga/PennyPrompt \
+  --pattern 'penny-cli-v0.1.0-alpha.2-x86_64-unknown-linux-gnu.tar.gz' \
+  --pattern 'penny-cli-v0.1.0-alpha.2-x86_64-unknown-linux-gnu.sha256'
+
+shasum -a 256 -c penny-cli-v0.1.0-alpha.2-x86_64-unknown-linux-gnu.sha256
+# fallback when shasum is unavailable:
+# sha256sum -c penny-cli-v0.1.0-alpha.2-x86_64-unknown-linux-gnu.sha256
+```
 
 Status:
 - Blocked until release workflow fully completes and publishes release assets.
