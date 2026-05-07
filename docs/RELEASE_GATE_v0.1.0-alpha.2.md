@@ -2,9 +2,13 @@
 
 Objective gate for publishing `v0.1.0-alpha.2` after P0 onboarding/contract fixes.
 
-Execution note (2026-04-30):
+Execution note (updated 2026-05-07):
 - Release run: https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142
-- Current blocker: `Build x86_64-apple-darwin` is still `queued`; remaining targets completed successfully.
+- Current blocker remains `Build x86_64-apple-darwin`:
+  - latest rerun attempt: `run_attempt=3`
+  - job link: https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/74928756062
+  - queue metadata: `labels=[macos-13]`, `runner_id=null`, `status=queued`
+  - other three targets complete successfully in the same attempt.
 
 ## 1. Scope Lock (P0 Closure)
 
@@ -82,15 +86,15 @@ Evidence:
   - [x] `aarch64-apple-darwin`
 
 Evidence:
-- PR CI (latest merged PR #157):
-  - https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25172036308/job/73793828345
-  - https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25172021516/job/73793778027
+- PR CI (latest merged PR #168):
+  - https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25528067731/job/74928101251
+  - https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25528055962/job/74928067956
 - Release run:
   - https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142
-  - job `aarch64-apple-darwin`: https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/73802809753
-  - job `aarch64-unknown-linux-gnu`: https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/73802809839
-  - job `x86_64-unknown-linux-gnu`: https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/73802809900
-  - job `x86_64-apple-darwin` (queued): https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/73802809807
+  - attempt-3 job `aarch64-apple-darwin` (success): https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/74928756279
+  - attempt-3 job `aarch64-unknown-linux-gnu` (success): https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/74928756259
+  - attempt-3 job `x86_64-unknown-linux-gnu` (success): https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/74928756014
+  - attempt-3 job `x86_64-apple-darwin` (queued): https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/74928756062
 
 ## 6. Artifact Verification Gate
 
@@ -114,6 +118,7 @@ shasum -a 256 -c penny-cli-v0.1.0-alpha.2-x86_64-unknown-linux-gnu.sha256
 
 Status:
 - Blocked until release workflow fully completes and publishes release assets.
+- `gh release view v0.1.0-alpha.2` currently returns `release not found` (2026-05-07), which is expected while publish job remains gated by the queued macOS x86 target.
 
 ## 7. Release Notes Gate
 
@@ -134,4 +139,4 @@ Evidence:
 - [x] Tag pushed as `v0.1.0-alpha.2`.
 
 Status:
-- Gate execution is in progress. Final completion depends on `x86_64-apple-darwin` release job leaving queued state and successful publish of release assets.
+- Gate execution is in progress. Final completion still depends on `x86_64-apple-darwin` obtaining a `macos-13` runner and successful publish of release assets/checksums.
