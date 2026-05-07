@@ -40,8 +40,11 @@ Config is resolved in this order (later overrides earlier):
 
 Operational note:
 
+- Recommended local operator path for `tail`/`detect`:
+  - run serve with admin on loopback TCP (`--admin-bind 127.0.0.1:8586`) or set `server.admin_socket = "127.0.0.1:8586"`.
+  - then use `tail` / `detect` defaults (no `--admin-url` required).
 - `tail` / `detect` CLI commands use HTTP URLs and default to `http://127.0.0.1:8586`.
-- If you keep `admin_socket` as a Unix path, start serve with `--admin-bind 127.0.0.1:8586` for those commands, or pass an explicit reachable admin URL.
+- If you keep `admin_socket` as a Unix path, `tail` / `detect` need an explicit reachable TCP admin bind.
 
 ## `[defaults]`
 
@@ -121,7 +124,7 @@ Observability runtime controls (applied by `penny-observe` at process startup):
 ```toml
 [server]
 bind = "127.0.0.1:8585"
-admin_socket = "~/.local/share/pennyprompt/admin.sock"
+admin_socket = "127.0.0.1:8586"
 database_path = "~/.local/share/pennyprompt/penny.db"
 mode = "guard"
 

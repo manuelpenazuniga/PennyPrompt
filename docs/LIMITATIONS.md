@@ -20,8 +20,8 @@ This list documents current constraints as of April 18, 2026.
 
 ## API/Control Plane Assumptions
 
-- `tail` and `detect` control commands assume admin API availability over HTTP (default `http://127.0.0.1:8586` in CLI commands).
-- If `serve` runs admin on a Unix socket path, use `--admin-bind 127.0.0.1:8586` (or equivalent TCP bind) for those commands.
+- `tail` and `detect` client commands are HTTP-only today (default `http://127.0.0.1:8586`).
+- Native unix-socket client connectivity for those commands is not implemented; expose admin over loopback TCP when using them.
 - If admin plane is unavailable, related commands fail as expected.
 
 ## Data and Reporting
