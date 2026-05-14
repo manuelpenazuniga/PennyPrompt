@@ -50,7 +50,7 @@ Non-default scenario:
 
 - [x] `penny-cli init --preset indie` succeeds.
 - [x] `penny-cli prices update` succeeds and reports validated default models.
-- [x] `penny-cli prices show --limit 20` shows active entries with expected models (`claude-sonnet-4-6`, `claude-haiku-4`, `gpt-4.1` at minimum).
+- [x] `penny-cli prices show --limit 20` shows active entries with expected models (`claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5`, `gpt-4.1` at minimum).
 - [x] `penny-cli serve --mock --admin-bind 127.0.0.1:8586` starts both planes.
 - [x] `curl -fsS http://127.0.0.1:8586/admin/health` returns `200`.
 - [x] Proxy request path works against `http://127.0.0.1:8585/v1/chat/completions`.
