@@ -43,6 +43,7 @@ const PRICEBOOK_OPENAI_TOML: &str = include_str!("../../../prices/openai.toml");
 #[derive(Debug, Parser)]
 #[command(name = "pennyprompt")]
 #[command(about = "PennyPrompt operator CLI")]
+#[command(version)]
 struct Cli {
     #[arg(long)]
     database: Option<PathBuf>,

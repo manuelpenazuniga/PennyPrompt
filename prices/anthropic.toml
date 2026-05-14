@@ -4,6 +4,33 @@ api_format = "anthropic"
 source = "local"
 
 [[entries]]
+model_id = "claude-opus-4-7"
+external_name = "claude-opus-4-7"
+display_name = "Claude Opus 4.7"
+class = "premium"
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+effective_from = "2026-05-13T00:00:00Z"
+
+[[entries]]
+model_id = "claude-opus-4-6"
+external_name = "claude-opus-4-6"
+display_name = "Claude Opus 4.6"
+class = "premium"
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+effective_from = "2026-05-13T00:00:00Z"
+
+[[entries]]
+model_id = "claude-opus-4-5"
+external_name = "claude-opus-4-5"
+display_name = "Claude Opus 4.5"
+class = "premium"
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+effective_from = "2026-05-13T00:00:00Z"
+
+[[entries]]
 model_id = "claude-opus-4-1"
 external_name = "claude-opus-4-1"
 display_name = "Claude Opus 4.1"
@@ -22,10 +49,19 @@ output_per_mtok = 15.0
 effective_from = "2026-04-25T00:00:00Z"
 
 [[entries]]
-model_id = "claude-haiku-4"
-external_name = "claude-haiku-4"
-display_name = "Claude Haiku 4"
+model_id = "claude-sonnet-4-5"
+external_name = "claude-sonnet-4-5"
+display_name = "Claude Sonnet 4.5"
+class = "balanced"
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+effective_from = "2026-05-13T00:00:00Z"
+
+[[entries]]
+model_id = "claude-haiku-4-5"
+external_name = "claude-haiku-4-5"
+display_name = "Claude Haiku 4.5"
 class = "fast"
-input_per_mtok = 0.8
-output_per_mtok = 4.0
-effective_from = "2026-04-25T00:00:00Z"
+input_per_mtok = 1.0
+output_per_mtok = 5.0
+effective_from = "2026-05-13T00:00:00Z"
