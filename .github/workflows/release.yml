@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Existing git tag to publish (e.g. v0.1.0-alpha.2). Must already exist as a tag on the repo."
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -29,6 +34,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version || github.ref_name }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -43,9 +50,10 @@ jobs:
 
       - name: Package release artifact and checksum
         shell: bash
+        env:
+          VERSION: ${{ inputs.version || github.ref_name }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
           TARGET="${{ matrix.target }}"
           ASSET="penny-cli-${VERSION}-${TARGET}"
           mkdir -p dist
@@ -74,6 +82,11 @@ jobs:
     name: Publish release
     runs-on: ubuntu-24.04
     needs: build
+    # Run publish whenever the build matrix has terminated, even if one or
+    # more individual matrix entries failed or were cancelled (e.g. a stuck
+    # macos-13 runner). Workflow-level cancellation by a user still skips
+    # publish. The artifact-count guard below prevents empty publishes.
+    if: ${{ !cancelled() }}
     steps:
       - name: Download all release artifacts
         uses: actions/download-artifact@v4
@@ -81,6 +94,19 @@ jobs:
           pattern: release-*
           merge-multiple: true
           path: dist
+
+      - name: Require minimum artifact count
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT_COUNT=$(find dist -maxdepth 1 -name "*.tar.gz" | wc -l | tr -d ' ')
+          MIN_ARTIFACTS=3
+          if [ "${ARTIFACT_COUNT}" -lt "${MIN_ARTIFACTS}" ]; then
+            echo "::error::Refusing to publish: only ${ARTIFACT_COUNT} artifact(s) present, require at least ${MIN_ARTIFACTS}."
+            exit 1
+          fi
+          echo "Publishing release with ${ARTIFACT_COUNT} artifact(s):"
+          (cd dist && ls -1 *.tar.gz)
 
       - name: Build aggregated checksum file
         shell: bash
@@ -92,6 +118,7 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.version || github.ref_name }}
           generate_release_notes: true
           prerelease: true
           files: |
