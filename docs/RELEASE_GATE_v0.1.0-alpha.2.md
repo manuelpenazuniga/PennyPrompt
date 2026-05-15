@@ -2,13 +2,13 @@
 
 Objective gate for publishing `v0.1.0-alpha.2` after P0 onboarding/contract fixes.
 
-Execution note (updated 2026-05-07):
+Execution note (updated 2026-05-15):
 - Release run: https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142
-- Current blocker remains `Build x86_64-apple-darwin`:
-  - latest rerun attempt: `run_attempt=3`
-  - job link: https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/74928756062
-  - queue metadata: `labels=[macos-13]`, `runner_id=null`, `status=queued`
-  - other three targets complete successfully in the same attempt.
+- Three of four matrix targets completed successfully in attempt-3.
+- `x86_64-apple-darwin` (`macos-13`) stayed queued indefinitely (`run_attempt=3`, `runner_id=null`) and was bypassed by the partial-success publish path landed in #176.
+- The Intel-Mac artifact was backfilled locally on Apple Silicon from the same tag commit (`41d662c`) and uploaded via `gh release upload` (tracked in #181).
+- Result: GitHub Release `v0.1.0-alpha.2` now carries 4 `.tar.gz` archives, 4 `.sha256` files, and an aggregated `CHECKSUMS.txt`.
+- The release remains marked as `prerelease: true` per `release.yml` policy (no GitHub `Latest` badge is expected on alpha cuts).
 
 ## 1. Scope Lock (P0 Closure)
 
@@ -79,11 +79,11 @@ Evidence:
 ## 5. CI and Release Workflow Gate
 
 - [x] Latest PR to `main` has CI check `Check, Test, Clippy, Fmt` green.
-- [ ] Release workflow (`.github/workflows/release.yml`) succeeded for all targets:
-  - [x] `x86_64-unknown-linux-gnu`
-  - [x] `aarch64-unknown-linux-gnu`
-  - [ ] `x86_64-apple-darwin` (pending runner allocation; job still queued)
-  - [x] `aarch64-apple-darwin`
+- [x] Release workflow (`.github/workflows/release.yml`) produced artifacts for all four targets (3 via CI, 1 via local Apple Silicon backfill, all uploaded to the same GitHub Release):
+  - [x] `x86_64-unknown-linux-gnu` (CI, `ubuntu-24.04`)
+  - [x] `aarch64-unknown-linux-gnu` (CI, `ubuntu-24.04-arm`)
+  - [x] `x86_64-apple-darwin` (local Apple Silicon backfill from tag commit `41d662c`; tracked in #181)
+  - [x] `aarch64-apple-darwin` (CI, `macos-14`)
 
 Evidence:
 - PR CI (latest merged PR #168):
@@ -94,13 +94,18 @@ Evidence:
   - attempt-3 job `aarch64-apple-darwin` (success): https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/74928756279
   - attempt-3 job `aarch64-unknown-linux-gnu` (success): https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/74928756259
   - attempt-3 job `x86_64-unknown-linux-gnu` (success): https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/74928756014
-  - attempt-3 job `x86_64-apple-darwin` (queued): https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/74928756062
+  - attempt-3 job `x86_64-apple-darwin` (queued/bypassed via #176): https://github.com/manuelpenazuniga/PennyPrompt/actions/runs/25174516142/job/74928756062
+- Local backfill (Intel-Mac):
+  - Built from tag commit `41d662c` with `cargo build --release -p penny-cli --target x86_64-apple-darwin --locked`.
+  - `file penny-cli` reports `Mach-O 64-bit executable x86_64`.
+  - Published SHA-256: `8a02e74fbd7d89730dbb145769d3b4fb9da4650ed8d71c58e728e14fa06d6c6e`.
+  - Provenance is intentionally distinct from the CI-built artifacts (different toolchain host, different SDK timestamps); checksum integrity remains verifiable end-to-end.
 
 ## 6. Artifact Verification Gate
 
-- [ ] Release has 4 `.tar.gz` artifacts and 4 `.sha256` files.
-- [ ] `CHECKSUMS.txt` present and complete.
-- [ ] At least one target checksum verified locally with a concrete command.
+- [x] Release has 4 `.tar.gz` artifacts and 4 `.sha256` files.
+- [x] `CHECKSUMS.txt` present and complete (4 entries, alphabetical-by-filename, regenerated after the local backfill).
+- [x] At least one target checksum verified locally with a concrete command (Intel-Mac artifact verified end-to-end after upload).
 
 Reference checksum commands (macOS/Linux):
 
@@ -117,8 +122,7 @@ shasum -a 256 -c penny-cli-v0.1.0-alpha.2-x86_64-unknown-linux-gnu.sha256
 ```
 
 Status:
-- Blocked until release workflow fully completes and publishes release assets.
-- `gh release view v0.1.0-alpha.2` currently returns `release not found` (2026-05-07), which is expected while publish job remains gated by the queued macOS x86 target.
+- Cleared on 2026-05-15. `gh release view v0.1.0-alpha.2` returns the published Release with all 4 archives, 4 `.sha256` files, and aggregated `CHECKSUMS.txt`.
 
 ## 7. Release Notes Gate
 
@@ -134,9 +138,9 @@ Evidence:
 
 ## 8. Publish Decision
 
-- [ ] All required boxes above are checked.
-- [x] Remaining non-blocking items are tracked in open issues.
+- [x] All required boxes above are checked.
+- [x] Remaining non-blocking items are tracked in open issues (alpha.3 backlog framing in `docs/status-2026-05-14.md`).
 - [x] Tag pushed as `v0.1.0-alpha.2`.
 
 Status:
-- Gate execution is in progress. Final completion still depends on `x86_64-apple-darwin` obtaining a `macos-13` runner and successful publish of release assets/checksums.
+- Gate cleared on 2026-05-15. Release is published with `prerelease: true` (intentional alpha policy) and contains all four target archives. Provenance for the Intel-Mac artifact is documented in #181 and disclosed in `docs/release-notes/v0.1.0-alpha.2.md`.
