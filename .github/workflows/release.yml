@@ -18,6 +18,11 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Cap each matrix entry so a runner that never gets allocated (e.g. a
+    # scarce macos-13 runner) cannot block the workflow indefinitely. With
+    # the partial-success publish gate added in #176, a timed-out entry
+    # no longer prevents publication of the surviving targets.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -82,6 +87,7 @@ jobs:
     name: Publish release
     runs-on: ubuntu-24.04
     needs: build
+    timeout-minutes: 15
     # Run publish whenever the build matrix has terminated, even if one or
     # more individual matrix entries failed or were cancelled (e.g. a stuck
     # macos-13 runner). Workflow-level cancellation by a user still skips
