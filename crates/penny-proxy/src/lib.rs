@@ -26,7 +26,7 @@ use penny_config::{
     CleanupConfig as RuntimeCleanupConfig, LoopAction, ScopeType as ConfigScopeType,
     WindowType as ConfigWindowType,
 };
-use penny_cost::{estimate_tokens, PricingEngine};
+use penny_cost::{estimate_tokens_for_model_id, PricingEngine};
 use penny_detect::{DetectEngine, DetectEventRecord, DetectorConfig, SESSION_PAUSED_LOOP_REASON};
 use penny_ledger::CostLedger;
 use penny_providers::{MockProvider, MockProviderConfig, ProviderAdapter, ProviderError};
@@ -601,7 +601,7 @@ fn normalize_chat_request(
     payload: &ChatCompletionsRequest,
 ) -> NormalizedRequest {
     let model = extract_model(&payload.model);
-    let estimate = estimate_tokens(&payload.messages);
+    let estimate = estimate_tokens_for_model_id(&model, &payload.messages);
 
     NormalizedRequest {
         id: ctx.request_id.clone(),

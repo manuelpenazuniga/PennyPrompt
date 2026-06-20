@@ -17,7 +17,7 @@ use penny_config::{
     load_config, resolve_user_config_path, AppConfig, ConfigError, LoadOptions, ProviderConfig,
     PRESET_EXPLORE, PRESET_INDIE, PRESET_TEAM,
 };
-use penny_cost::{estimate_tokens, import_pricebook_files, PricingEngine};
+use penny_cost::{estimate_tokens_for_model_id, import_pricebook_files, PricingEngine};
 use penny_detect::DetectEngine;
 use penny_observe::{ObserveConfig, ObserveRuntimeOverrides};
 use penny_providers::{
@@ -1191,6 +1191,7 @@ async fn run_report_top(store: &SqliteStore, limit: u32) -> Result<(), CliError>
 
 async fn run_estimate(store: &SqliteStore, command: EstimateCommand) -> Result<(), CliError> {
     let context = estimate_context(
+        command.model.as_str(),
         command.context_tokens,
         &command.context_files,
         command.max_files,
@@ -2578,6 +2579,7 @@ async fn autodetect_project_id(store: &SqliteStore) -> Result<Option<String>, Cl
 }
 
 fn estimate_context(
+    model_id: &str,
     context_tokens: Option<u64>,
     context_files: &[String],
     max_files: usize,
@@ -2609,7 +2611,7 @@ fn estimate_context(
         content.push('\n');
     }
 
-    let estimate = estimate_tokens(&Value::String(content));
+    let estimate = estimate_tokens_for_model_id(model_id, &Value::String(content));
     Ok(ContextEstimate {
         tokens: estimate.input_tokens,
         file_count: files.len(),
@@ -3487,21 +3489,28 @@ mod tests {
         fs::write(root.join("src/nested/mod.rs"), "pub fn b() {}").expect("write");
 
         let pattern = format!("{}/src/**/*.rs", root.display());
-        let estimate = estimate_context(None, &[pattern], 100).expect("estimate context");
+        let estimate =
+            estimate_context("gpt-4.1", None, &[pattern], 100).expect("estimate context");
         assert_eq!(estimate.file_count, 2);
         assert!(estimate.tokens > 0);
     }
 
     #[test]
     fn estimate_context_requires_tokens_or_files() {
-        let error = estimate_context(None, &[], 100).expect_err("missing context must fail");
+        let error =
+            estimate_context("gpt-4.1", None, &[], 100).expect_err("missing context must fail");
         assert!(matches!(error, CliError::MissingEstimateContext));
     }
 
     #[test]
     fn estimate_context_fails_when_no_files_match() {
-        let error = estimate_context(None, &[String::from("/tmp/does-not-exist/**/*.rs")], 100)
-            .expect_err("expected no matches");
+        let error = estimate_context(
+            "gpt-4.1",
+            None,
+            &[String::from("/tmp/does-not-exist/**/*.rs")],
+            100,
+        )
+        .expect_err("expected no matches");
         assert!(matches!(error, CliError::NoContextFilesMatched));
     }
 
