@@ -1,6 +1,6 @@
 //! Persistence layer for PennyPrompt.
 
-use std::{path::Path, str::FromStr};
+use std::{borrow::Cow, path::Path, str::FromStr, sync::OnceLock};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use penny_types::{
@@ -9,14 +9,77 @@ use penny_types::{
 };
 use serde_json::Value;
 use sqlx::{
-    migrate::Migrator,
+    migrate::{Migration, MigrationType, Migrator},
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     QueryBuilder, Row, Sqlite, SqlitePool,
 };
 use thiserror::Error;
 use uuid::Uuid;
 
-static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
+fn embedded_migrator() -> &'static Migrator {
+    static MIGRATOR: OnceLock<Migrator> = OnceLock::new();
+
+    MIGRATOR.get_or_init(|| Migrator {
+        migrations: Cow::Owned(vec![
+            embedded_migration(
+                1,
+                "projects_sessions",
+                include_str!("../../../migrations/0001_projects_sessions.sql"),
+            ),
+            embedded_migration(
+                2,
+                "providers_models",
+                include_str!("../../../migrations/0002_providers_models.sql"),
+            ),
+            embedded_migration(
+                3,
+                "pricebook",
+                include_str!("../../../migrations/0003_pricebook.sql"),
+            ),
+            embedded_migration(
+                4,
+                "requests_usage",
+                include_str!("../../../migrations/0004_requests_usage.sql"),
+            ),
+            embedded_migration(
+                5,
+                "budgets",
+                include_str!("../../../migrations/0005_budgets.sql"),
+            ),
+            embedded_migration(
+                6,
+                "cost_ledger",
+                include_str!("../../../migrations/0006_cost_ledger.sql"),
+            ),
+            embedded_migration(
+                7,
+                "events",
+                include_str!("../../../migrations/0007_events.sql"),
+            ),
+            embedded_migration(
+                8,
+                "money_micros",
+                include_str!("../../../migrations/0008_money_micros.sql"),
+            ),
+            embedded_migration(
+                9,
+                "pricebook_micros",
+                include_str!("../../../migrations/0009_pricebook_micros.sql"),
+            ),
+        ]),
+        ..Migrator::DEFAULT
+    })
+}
+
+fn embedded_migration(version: i64, description: &'static str, sql: &'static str) -> Migration {
+    Migration::new(
+        version,
+        Cow::Borrowed(description),
+        MigrationType::Simple,
+        Cow::Borrowed(sql),
+        false,
+    )
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -48,7 +111,7 @@ impl SqliteStore {
         sqlx::query("PRAGMA journal_mode=WAL;")
             .execute(&pool)
             .await?;
-        MIGRATOR.run(&pool).await?;
+        embedded_migrator().run(&pool).await?;
 
         Ok(Self { pool })
     }
@@ -969,6 +1032,41 @@ mod tests {
             .expect("upsert project");
         let session_id = store.create(&project_id).await.expect("create session");
         (project_id, session_id)
+    }
+
+    #[test]
+    fn embedded_migrations_match_migration_files() {
+        let migration_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+        let mut expected = std::fs::read_dir(migration_dir)
+            .expect("read migrations directory")
+            .map(|entry| {
+                let entry = entry.expect("read migration entry");
+                let file_name = entry
+                    .file_name()
+                    .into_string()
+                    .expect("migration filename is valid utf-8");
+                let stem = file_name
+                    .strip_suffix(".sql")
+                    .expect("migration file has .sql suffix");
+                let (version, description) = stem
+                    .split_once('_')
+                    .expect("migration filename has version and description");
+                (
+                    version
+                        .parse::<i64>()
+                        .expect("migration version is numeric"),
+                    description.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        expected.sort();
+
+        let actual = embedded_migrator()
+            .iter()
+            .map(|migration| (migration.version, migration.description.to_string()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

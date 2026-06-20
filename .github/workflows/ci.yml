@@ -25,6 +25,15 @@ jobs:
       - name: Cache cargo and target
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Cargo audit
+        run: |
+          # rsa is pulled into Cargo.lock by sqlx's optional MySQL support,
+          # but it is not present in the active normal dependency graph.
+          cargo audit --ignore RUSTSEC-2023-0071
+
       - name: Cargo check
         run: cargo check --workspace --locked
 
