@@ -15,10 +15,11 @@ Current release automation builds and publishes `penny-cli` binaries for:
 
 - Linux `x86_64-unknown-linux-gnu`
 - Linux `aarch64-unknown-linux-gnu`
-- macOS `x86_64-apple-darwin`
 - macOS `aarch64-apple-darwin`
 
 When a release tag is pushed and the workflow succeeds, artifacts are published as `.tar.gz` plus SHA-256 checksums.
+
+Intel macOS (`x86_64-apple-darwin`) is not part of the default CI release matrix because the `macos-13` runner has repeatedly blocked alpha publication. If an Intel-Mac artifact is required for a cut, use the local backfill procedure below and disclose the artifact provenance in the release notes.
 
 ## Workflow Trigger
 
@@ -51,9 +52,11 @@ git push origin v0.1.0-alpha.3
 
 6. Wait for the `Release` workflow to finish.
 7. Verify GitHub Release contains:
-- 4 target archives (`penny-cli-vX.Y.Z-<target>.tar.gz`)
-- 4 checksum files (`.sha256`)
+- 3 CI target archives (`penny-cli-vX.Y.Z-<target>.tar.gz`)
+- 3 checksum files (`.sha256`)
 - `CHECKSUMS.txt`
+
+If an Intel-Mac artifact is backfilled for the release, verify the Release contains 4 archives, 4 checksum files, and an updated `CHECKSUMS.txt`.
 
 For other versions, replace the tag value and keep the same gate sequence.
 
@@ -99,9 +102,9 @@ Alpha cuts are published as GitHub **Pre-release** by design. The `release.yml` 
 
 ## Operational Fallback: Local Build + Upload
 
-When a CI matrix entry cannot obtain a runner (for example a scarce `macos-13` Intel runner), the partial-success publish path landed in `#176` allows the rest of the targets to publish without blocking. The missing target can then be backfilled locally and uploaded to the same Release. Apple Silicon hosts can produce `x86_64-apple-darwin` natively because the Apple toolchain ships a multi-arch SDK; no `osxcross` or `cargo-zigbuild` is needed.
+Intel macOS is intentionally outside the default release matrix. If the project needs an `x86_64-apple-darwin` artifact for a specific cut, it can be backfilled locally and uploaded to the same Release. Apple Silicon hosts can produce `x86_64-apple-darwin` natively because the Apple toolchain ships a multi-arch SDK; no `osxcross` or `cargo-zigbuild` is needed.
 
-The procedure used for `v0.1.0-alpha.2` (#181):
+The procedure used for `v0.1.0-alpha.2` (#181) and `v0.1.0-alpha.3`:
 
 ```bash
 # 1. Sync main, then check out the exact tag commit (so Cargo.lock and source match).
