@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 penny-store = { path = "../penny-store" }
 penny-types = { path = "../penny-types" }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
 thiserror = "1"
 
 [dev-dependencies]
