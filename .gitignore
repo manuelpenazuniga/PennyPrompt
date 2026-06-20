@@ -3,4 +3,5 @@ CLAUDE.md
 CODEX.md
 target/
 .DS_Store
+# Local audit/status snapshots are intentionally not tracked.
 docs/status-*.md
