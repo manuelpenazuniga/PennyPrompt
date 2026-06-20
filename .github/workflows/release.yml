@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Existing git tag to publish (e.g. v0.1.0-alpha.2). Must already exist as a tag on the repo."
+        description: "Existing git tag to publish (e.g. v0.1.0-alpha.3). Must already exist as a tag on the repo."
         required: true
         type: string
 
@@ -18,10 +18,9 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    # Cap each matrix entry so a runner that never gets allocated (e.g. a
-    # scarce macos-13 runner) cannot block the workflow indefinitely. With
-    # the partial-success publish gate added in #176, a timed-out entry
-    # no longer prevents publication of the surviving targets.
+    # Cap each matrix entry so a runner problem cannot block the workflow
+    # indefinitely. Intel macOS is intentionally not in this matrix; if that
+    # target is needed again, use the documented local backfill procedure.
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -31,8 +30,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-13
-            target: x86_64-apple-darwin
           - os: macos-14
             target: aarch64-apple-darwin
 
@@ -88,10 +85,9 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build
     timeout-minutes: 15
-    # Run publish whenever the build matrix has terminated, even if one or
-    # more individual matrix entries failed or were cancelled (e.g. a stuck
-    # macos-13 runner). Workflow-level cancellation by a user still skips
-    # publish. The artifact-count guard below prevents empty publishes.
+    # Run publish whenever the build matrix has terminated. Workflow-level
+    # cancellation by a user still skips publish. The artifact-count guard
+    # below prevents empty publishes.
     if: ${{ !cancelled() }}
     steps:
       - name: Download all release artifacts

@@ -7,12 +7,12 @@ automation all exist.
 
 Current baseline:
 - Branch: `main`
-- Latest published release: `v0.1.0-alpha.2` published on 2026-05-15 as a GitHub prerelease.
-- Capture date: 2026-06-20 after `#183`, `#184`, `#185`, `#189`, and `#190` closed.
-- Active roadmap: final `v0.1.0-alpha.3` release-prep and publish gate.
+- Latest published release: `v0.1.0-alpha.3` published on 2026-06-20 as a GitHub prerelease.
+- Capture date: 2026-06-20 after alpha.3 publication and artifact verification.
+- Active roadmap: alpha.3 closure; next roadmap TBD.
 
 Source of truth for this backlog:
-- GitHub issues `#186` and `#196`, plus closed release blockers `#183`, `#184`, `#185`, `#189`, and `#190`.
+- GitHub issue `#186`, plus closed release blockers `#183`, `#184`, `#185`, `#189`, `#190`, and `#196`.
 - `docs/status-2026-05-07.md`.
 - `docs/CONFIG-REFERENCE.md`.
 - `docs/RELEASE.md`.
@@ -40,11 +40,11 @@ These constraints remain fixed unless a dedicated architecture decision changes 
 
 ## Current Release Direction: `v0.1.0-alpha.3`
 
-`v0.1.0-alpha.3` is a hardening release, not a feature release.
+`v0.1.0-alpha.3` is published. The remaining action is closing the release epic with final gate evidence.
 
 Goal:
-- Make the already-shipped alpha more correct, auditable, secure, and releasable.
-- Avoid new product surface area unless it is required to close a release blocker.
+- Preserve the final release evidence.
+- Start the next roadmap from a fresh issue set after `#186` closes.
 
 Out of scope for alpha.3:
 - `serve` daemon/background mode.
@@ -62,16 +62,7 @@ Out of scope for alpha.3:
 - `#186` - `[Epic] v0.1.0-alpha.3 release scope`
 
 Definition:
-- Cut and publish `v0.1.0-alpha.3`.
-- Close once version bump, changelog, release gate, release notes, tag, GitHub Release, and artifact verification are complete.
-
-### Release Prep
-
-- `#196` - `release: prepare v0.1.0-alpha.3 gate and notes`
-
-Definition:
-- Prepare version bump, changelog, release gate, release notes, and release-process docs.
-- Close through the release-prep PR before tagging.
+- Closes once this final release documentation PR merges.
 
 ### Closed Alpha.3 Implementation Scope
 
@@ -81,13 +72,18 @@ Definition:
 - `#189` - `security: refresh rustls-webpki and add cargo audit release gate`
 - `#190` - `docs(security): align admin plane security contract with implementation`
 
-### Remaining Release Work After `#196`
+### Closed Release Prep
 
-- Merge the release-prep PR after CI confirms the full gate in a loopback-capable environment.
-- Tag `v0.1.0-alpha.3` from updated `main`.
-- Publish the GitHub Release through `.github/workflows/release.yml`.
-- Verify artifacts and checksums.
-- Close `#186`.
+- `#196` - `release: prepare v0.1.0-alpha.3 gate and notes`
+
+### Publication Evidence
+
+- Tag: `v0.1.0-alpha.3`
+- Release: https://github.com/manuelpenazuniga/PennyPrompt/releases/tag/v0.1.0-alpha.3
+- Release run: `27873967227`
+- CI-built artifacts: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`
+- Local backfill: `x86_64-apple-darwin`, SHA-256 `582b1ecb273126fe089b57789d54d9e619bbf3382b83c1ed6a1d3c7ee741e6b6`
+- `CHECKSUMS.txt` downloaded from GitHub Release and verified locally for all 4 archives.
 
 ## Alpha.3 Release Sequence
 
@@ -102,15 +98,15 @@ Current order:
 7. [x] Convert `CHANGELOG.md` `[Unreleased]` into `[v0.1.0-alpha.3] - 2026-06-20`.
 8. [x] Add `docs/RELEASE_GATE_v0.1.0-alpha.3.md`.
 9. [x] Add `docs/release-notes/v0.1.0-alpha.3.md`.
-10. [ ] Run the standard gate:
+10. [x] Run the standard gate:
     - `cargo fmt --all -- --check`
     - `cargo check --workspace --locked`
     - `cargo test --workspace --locked`
     - `cargo clippy --workspace --all-targets --locked -- -D warnings`
     - `cargo audit --ignore RUSTSEC-2023-0071`
-11. [ ] Tag and publish `v0.1.0-alpha.3`.
-12. [ ] Verify release artifacts and checksums.
-13. [ ] Close `#186`.
+11. [x] Tag and publish `v0.1.0-alpha.3`.
+12. [x] Verify release artifacts and checksums.
+13. [ ] Close `#186` when final evidence PR merges.
 
 ## Release Gate Notes
 
