@@ -6,11 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## [v0.1.0-alpha.3] - 2026-06-20
+
 ### Added
-- Upcoming changes are tracked via issue-first workflow and merged through PRs.
-- Alpha.2 release gate artifacts: targeted checklist, linked release process gate, and release notes document.
+- CLI help text now includes descriptions for root and nested subcommands (`#183`).
+- Proxy hot-path tracing now emits structured `proxy.request`, `proxy.budget`, `proxy.completion`, `proxy.ledger`, and `proxy.error` events for JSON-log operators (`#185`).
+- CI now runs `cargo audit` as part of the standard gate, with the non-applicable `rsa` advisory documented inline (`#189`).
+- Alpha.3 release gate and release notes documents for the final pre-tag checklist (`#196`).
 
 ### Changed
+- `penny-cost` now dispatches token estimation by model family instead of using one OpenAI tokenizer path for every model (`#184`).
+- TLS verification dependencies were refreshed, including `rustls-webpki`, before the alpha.3 cut (`#189`).
+- Admin-plane security docs now describe the actual alpha contract: local-only Unix socket or loopback TCP, with no bearer/admin-token auth claim (`#190`).
 - Observability startup precedence is now explicit: CLI flags (`--log-filter`, `--json-log`) override environment (`PENNY_LOG`/`RUST_LOG`, `PENNY_OBSERVE_JSON`), which still override built-in defaults. Backward-compatibility note: workflows relying on env vars to force logging behavior should stop passing conflicting CLI flags.
 
 ## [v0.1.0-alpha.2] - 2026-04-30

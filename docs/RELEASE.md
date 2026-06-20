@@ -5,8 +5,8 @@ This document defines the repeatable process for alpha releases.
 ## Release Gates
 
 - Generic alpha manual checklist: [`docs/ALPHA-MANUAL-CHECKLIST.md`](./ALPHA-MANUAL-CHECKLIST.md)
-- Targeted gate for current cut: [`docs/RELEASE_GATE_v0.1.0-alpha.2.md`](./RELEASE_GATE_v0.1.0-alpha.2.md)
-- Release notes for current cut: [`docs/release-notes/v0.1.0-alpha.2.md`](./release-notes/v0.1.0-alpha.2.md)
+- Targeted gate for current cut: [`docs/RELEASE_GATE_v0.1.0-alpha.3.md`](./RELEASE_GATE_v0.1.0-alpha.3.md)
+- Release notes for current cut: [`docs/release-notes/v0.1.0-alpha.3.md`](./release-notes/v0.1.0-alpha.3.md)
 - Release history reconciliation note: [`docs/release-audit/2026-04-30-release-history-reconciliation.md`](./release-audit/2026-04-30-release-history-reconciliation.md)
 
 ## Scope
@@ -30,14 +30,14 @@ Release workflow file:
 
 Trigger condition:
 
-- push a tag that starts with `v` (example: `v0.1.0-alpha.2`)
+- push a tag that starts with `v` (example: `v0.1.0-alpha.3`)
 
 Manual trigger is also available via `workflow_dispatch`.
 
 ## Cut a Release
 
 1. Ensure `main` is green and synchronized.
-2. Complete the active release gate checklist (`RELEASE_GATE_v0.1.0-alpha.2.md` for alpha.2).
+2. Complete the active release gate checklist (`RELEASE_GATE_v0.1.0-alpha.3.md` for alpha.3).
 3. Update `CHANGELOG.md` and finalize release notes.
 4. Confirm release notes include resolved blocking issues and known limitations link.
 5. Create and push a tag:
@@ -45,8 +45,8 @@ Manual trigger is also available via `workflow_dispatch`.
 ```bash
 git switch main
 git pull --ff-only origin main
-git tag v0.1.0-alpha.2
-git push origin v0.1.0-alpha.2
+git tag v0.1.0-alpha.3
+git push origin v0.1.0-alpha.3
 ```
 
 6. Wait for the `Release` workflow to finish.
@@ -62,7 +62,7 @@ For other versions, replace the tag value and keep the same gate sequence.
 Download one artifact and verify:
 
 ```bash
-shasum -a 256 -c penny-cli-v0.1.0-alpha.2-x86_64-unknown-linux-gnu.sha256
+shasum -a 256 -c penny-cli-v0.1.0-alpha.3-x86_64-unknown-linux-gnu.sha256
 ```
 
 If `shasum` is unavailable, use `sha256sum -c`.
@@ -77,7 +77,7 @@ scripts/install.sh
 
 Supported env vars:
 
-- `PENNY_VERSION` (example: `v0.1.0-alpha.2`)
+- `PENNY_VERSION` (example: `v0.1.0-alpha.3`)
 - `PENNY_INSTALL_DIR` (default: `~/.local/bin`)
 - `PENNY_REPO` (default: `manuelpenazuniga/PennyPrompt`)
 
@@ -90,7 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/PennyPrompt/main/s
 Pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/PennyPrompt/main/scripts/install.sh | PENNY_VERSION=v0.1.0-alpha.2 sh
+curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/PennyPrompt/main/scripts/install.sh | PENNY_VERSION=v0.1.0-alpha.3 sh
 ```
 
 ## Release Maturity Policy

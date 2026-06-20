@@ -1,6 +1,6 @@
 # Known Limitations (Alpha)
 
-This list documents current constraints as of April 18, 2026.
+This list documents current constraints as of June 20, 2026.
 
 ## CLI / Product Surface
 
