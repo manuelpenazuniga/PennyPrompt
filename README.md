@@ -371,9 +371,10 @@ pricebook_entries: versioned, with effective_from/effective_until
 | Plane | Bind | Purpose |
 |-------|------|---------|
 | Proxy | `127.0.0.1:8585` | Agent traffic. OpenAI-compatible API. |
-| Admin | Unix socket (default) or `:8586` with token | Reports, budgets, health, events. |
+| Admin | Unix socket (default) or loopback TCP (`127.0.0.1:8586`) | Local operator APIs: reports, budgets, health, events. |
 
 Separated by design. Exposing `:8585` to the network never exposes admin endpoints.
+For the current alpha, admin TCP is a local-control-plane convenience only. Do not expose it outside loopback; bearer/admin-token auth is not implemented yet.
 
 ## Compatibility
 

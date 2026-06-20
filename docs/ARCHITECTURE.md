@@ -61,6 +61,11 @@ Key properties:
   - estimate endpoint
   - detect status/resume
   - events SSE stream
+- Current alpha security contract:
+  - local control plane only
+  - bind admin to a Unix socket or loopback TCP
+  - bearer/admin-token auth is not implemented yet
+  - proxy routes do not expose admin endpoints
 
 ## CLI Plane
 
