@@ -32,9 +32,11 @@ Config is resolved in this order (later overrides earlier):
 ## `[server]`
 
 - `bind` (`string`): proxy bind address (example `127.0.0.1:8585`)
-- `admin_socket` (`string`): admin bind target
+- `admin_socket` (`string`): admin bind target for the local admin control plane
   - if value is `host:port` (for example `localhost:8586` or `127.0.0.1:8586`), admin binds TCP
+  - TCP admin binds are alpha local-only; use loopback addresses and do not expose them to LAN/public networks
   - otherwise admin binds a Unix socket path
+  - bearer/admin-token auth is not implemented in the current alpha
 - `database_path` (`string`): SQLite database path
 - `mode` (`observe|guard`)
 
@@ -44,7 +46,7 @@ Operational note:
   - run serve with admin on loopback TCP (`--admin-bind 127.0.0.1:8586`) or set `server.admin_socket = "127.0.0.1:8586"`.
   - then use `tail` / `detect` defaults (no `--admin-url` required).
 - `tail` / `detect` CLI commands use HTTP URLs and default to `http://127.0.0.1:8586`.
-- If you keep `admin_socket` as a Unix path, `tail` / `detect` need an explicit reachable TCP admin bind.
+- If you keep `admin_socket` as a Unix path, `tail` / `detect` need a loopback TCP admin bind because native Unix-socket clients are not implemented for those commands yet.
 
 ## `[defaults]`
 

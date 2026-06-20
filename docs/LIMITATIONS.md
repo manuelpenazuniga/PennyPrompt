@@ -20,6 +20,8 @@ This list documents current constraints as of April 18, 2026.
 
 ## API/Control Plane Assumptions
 
+- Admin APIs have no bearer token or admin-token authentication in the current alpha; treat the admin plane as local-only.
+- Use a Unix socket or loopback TCP for admin. Do not expose admin binds to LAN or public networks.
 - `tail` and `detect` client commands are HTTP-only today (default `http://127.0.0.1:8586`).
 - Native unix-socket client connectivity for those commands is not implemented; expose admin over loopback TCP when using them.
 - If admin plane is unavailable, related commands fail as expected.
