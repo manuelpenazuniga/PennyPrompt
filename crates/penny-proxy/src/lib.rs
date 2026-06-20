@@ -47,7 +47,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::error;
+use tracing::{error, field, info, info_span, Instrument, Span};
 use uuid::Uuid;
 
 pub const DEFAULT_PROXY_BIND: &str = "127.0.0.1:8585";
@@ -324,6 +324,29 @@ async fn post_chat_completions(
     headers: HeaderMap,
     Json(payload): Json<ChatCompletionsRequest>,
 ) -> Response {
+    let request_id = ctx.request_id.clone();
+    let model = extract_model(&payload.model);
+    let provider = state.provider.provider_id().to_string();
+    let span = info_span!(
+        "proxy.request",
+        request_id = %request_id,
+        session_id = field::Empty,
+        model = %model,
+        provider = %provider
+    );
+
+    async move { post_chat_completions_instrumented(state, ctx, headers, payload).await }
+        .instrument(span)
+        .await
+}
+
+async fn post_chat_completions_instrumented(
+    state: Arc<ProxyState>,
+    ctx: RequestContext,
+    headers: HeaderMap,
+    payload: ChatCompletionsRequest,
+) -> Response {
+    let request_started_at = Instant::now();
     if let Err(message) = validate_chat_request(&payload) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_request", message);
     }
@@ -342,6 +365,8 @@ async fn post_chat_completions(
     };
     normalized.project_id = project_id;
     normalized.session_id = session_id;
+    Span::current().record("session_id", field::display(&normalized.session_id));
+    info!(target: "proxy.request", "received");
 
     if state.detector.is_session_paused(&normalized.session_id) {
         let reason = state
@@ -359,6 +384,15 @@ async fn post_chat_completions(
         Ok(context) => context,
         Err(response) => return response,
     };
+    if let Some(context) = enforcement.as_ref() {
+        if context.reserve_persisted {
+            info!(
+                target: "proxy.budget",
+                reserved_usd = %context.estimated_cost_usd,
+                "reserved"
+            );
+        }
+    }
 
     let provider_response = match state.provider.send(normalized.clone()).await {
         Ok(response) => response,
@@ -416,6 +450,11 @@ async fn post_chat_completions(
                     )
                     .await;
                 }
+                log_request_failure(
+                    status,
+                    "upstream_http",
+                    format!("upstream returned HTTP {}", status.as_u16()),
+                );
                 return (status, Json(value)).into_response();
             }
 
@@ -426,6 +465,15 @@ async fn post_chat_completions(
             let usage_cost_usd =
                 compute_usage_cost_or_fallback(&state, &normalized, &usage, enforcement.as_ref())
                     .await;
+            let latency_ms = request_started_at.elapsed().as_millis() as u64;
+            info!(
+                target: "proxy.completion",
+                input_tokens = usage.input_tokens,
+                output_tokens = usage.output_tokens,
+                cost_usd = %usage_cost_usd,
+                latency_ms,
+                "completed"
+            );
             if let Some(context) = enforcement {
                 if let Err(message) = reconcile_after_dispatch(
                     &state,
@@ -443,6 +491,12 @@ async fn post_chat_completions(
                     );
                 }
             }
+            info!(
+                target: "proxy.ledger",
+                reconciled_usd = %usage_cost_usd,
+                source = ?usage.source,
+                "reconciled"
+            );
             if let Err(message) =
                 persist_request_and_usage(&state, &normalized, &usage, usage_cost_usd).await
             {
@@ -470,6 +524,7 @@ async fn post_chat_completions(
                     normalized.clone(),
                     enforcement,
                     receiver,
+                    request_started_at,
                 )
                 .await
             } else if let Some(lines) = state.provider.stream_response_lines(&normalized) {
@@ -487,6 +542,7 @@ async fn post_chat_completions(
                     normalized.clone(),
                     enforcement,
                     rx,
+                    request_started_at,
                 )
                 .await
             } else {
@@ -982,10 +1038,10 @@ async fn evaluate_budget_before_dispatch(
         Ok(value) => value,
         Err(message) => {
             if matches!(state.mode, Mode::Guard) {
-                log_internal_error("budget_engine_has_any_budget_failed", message);
-                return Err(budget_error_response(
+                return Err(budget_internal_error_response(
                     "budget_engine_failure",
                     "budget engine temporarily unavailable".to_string(),
+                    message,
                     None,
                 ));
             }
@@ -1004,10 +1060,10 @@ async fn evaluate_budget_before_dispatch(
         Ok(cost) => cost,
         Err(message) => {
             if matches!(state.mode, Mode::Guard) {
-                log_internal_error("budget_engine_estimated_cost_failed", message);
-                return Err(budget_error_response(
+                return Err(budget_internal_error_response(
                     "budget_engine_failure",
                     "budget engine temporarily unavailable".to_string(),
+                    message,
                     None,
                 ));
             }
@@ -1037,10 +1093,10 @@ async fn evaluate_budget_before_dispatch(
         }
         RouteDecision::Failsafe { mode, reason } => {
             if matches!(mode, Mode::Guard) {
-                log_internal_error("budget_engine_guard_failsafe", reason);
-                Err(budget_error_response(
+                Err(budget_internal_error_response(
                     "budget_engine_failure",
                     "budget engine fail-closed in guard mode".to_string(),
+                    reason,
                     None,
                 ))
             } else {
@@ -1200,68 +1256,89 @@ async fn stream_passthrough_response(
     normalized: NormalizedRequest,
     enforcement: Option<BudgetEnforcementContext>,
     mut upstream: mpsc::Receiver<String>,
+    request_started_at: Instant,
 ) -> Response {
     let (client_tx, client_rx) = mpsc::channel::<Result<Bytes, Infallible>>(64);
-    tokio::spawn(async move {
-        let mut lines = Vec::new();
-        let mut cleanup_metrics = CleanupMetrics::default();
-        let mut saw_done = false;
-        while let Some(line) = upstream.recv().await {
-            let (line, line_metrics) = cleanup_sse_line(&line, state.cleanup);
-            cleanup_metrics.merge(line_metrics);
-            if line.trim().eq_ignore_ascii_case("data: [done]") {
-                saw_done = true;
+    let request_span = Span::current();
+    tokio::spawn(
+        async move {
+            let mut lines = Vec::new();
+            let mut cleanup_metrics = CleanupMetrics::default();
+            let mut saw_done = false;
+            while let Some(line) = upstream.recv().await {
+                let (line, line_metrics) = cleanup_sse_line(&line, state.cleanup);
+                cleanup_metrics.merge(line_metrics);
+                if line.trim().eq_ignore_ascii_case("data: [done]") {
+                    saw_done = true;
+                }
+                lines.push(line.clone());
+                if client_tx.send(Ok(Bytes::from(line))).await.is_err() {
+                    break;
+                }
+                if saw_done {
+                    break;
+                }
             }
-            lines.push(line.clone());
-            if client_tx.send(Ok(Bytes::from(line))).await.is_err() {
-                break;
-            }
-            if saw_done {
-                break;
-            }
-        }
 
-        let mut usage = provider_usage_from_sse_lines(&lines)
-            .unwrap_or_else(|| estimated_usage_from_request(&normalized));
-        attach_cleanup_metrics(&mut usage, state.cleanup, cleanup_metrics);
-        if !saw_done {
-            mark_stream_incomplete(&mut usage);
-            log_provider_failure_event(
-                &state,
-                &normalized,
-                status,
-                "incomplete_stream",
-                &json!({"message":"upstream stream ended before [DONE]"}),
-            )
-            .await;
-        }
+            let mut usage = provider_usage_from_sse_lines(&lines)
+                .unwrap_or_else(|| estimated_usage_from_request(&normalized));
+            attach_cleanup_metrics(&mut usage, state.cleanup, cleanup_metrics);
+            if !saw_done {
+                mark_stream_incomplete(&mut usage);
+                log_provider_failure_event(
+                    &state,
+                    &normalized,
+                    status,
+                    "incomplete_stream",
+                    &json!({"message":"upstream stream ended before [DONE]"}),
+                )
+                .await;
+            }
 
-        let usage_cost_usd =
-            compute_usage_cost_or_fallback(&state, &normalized, &usage, enforcement.as_ref()).await;
-        if let Some(context) = enforcement {
-            if let Err(message) = reconcile_after_dispatch(
-                &state,
-                &normalized.id,
-                usage_cost_usd,
-                context.reserve_persisted,
-            )
-            .await
+            let usage_cost_usd =
+                compute_usage_cost_or_fallback(&state, &normalized, &usage, enforcement.as_ref())
+                    .await;
+            let latency_ms = request_started_at.elapsed().as_millis() as u64;
+            info!(
+                target: "proxy.completion",
+                input_tokens = usage.input_tokens,
+                output_tokens = usage.output_tokens,
+                cost_usd = %usage_cost_usd,
+                latency_ms,
+                "completed"
+            );
+            if let Some(context) = enforcement {
+                if let Err(message) = reconcile_after_dispatch(
+                    &state,
+                    &normalized.id,
+                    usage_cost_usd,
+                    context.reserve_persisted,
+                )
+                .await
+                {
+                    log_internal_error("ledger_reconcile_failed", message);
+                }
+            }
+            info!(
+                target: "proxy.ledger",
+                reconciled_usd = %usage_cost_usd,
+                source = ?usage.source,
+                "reconciled"
+            );
+            if let Err(message) =
+                persist_request_and_usage(&state, &normalized, &usage, usage_cost_usd).await
             {
-                log_internal_error("ledger_reconcile_failed", message);
+                log_internal_error("persistence_failed", message);
             }
+            spawn_detection_after_reconcile(
+                state.clone(),
+                normalized.clone(),
+                usage.clone(),
+                usage_cost_usd,
+            );
         }
-        if let Err(message) =
-            persist_request_and_usage(&state, &normalized, &usage, usage_cost_usd).await
-        {
-            log_internal_error("persistence_failed", message);
-        }
-        spawn_detection_after_reconcile(
-            state.clone(),
-            normalized.clone(),
-            usage.clone(),
-            usage_cost_usd,
-        );
-    });
+        .instrument(request_span),
+    );
 
     let mut response = Response::builder()
         .status(status)
@@ -1536,6 +1613,11 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 fn error_response(status: StatusCode, code: &'static str, message: String) -> Response {
+    log_request_failure(status, code, message.clone());
+    api_error_response(status, code, message)
+}
+
+fn api_error_response(status: StatusCode, code: &'static str, message: String) -> Response {
     (
         status,
         Json(json!(ApiError {
@@ -1551,11 +1633,30 @@ fn internal_error_response(
     public_message: String,
     internal_detail: String,
 ) -> Response {
-    log_internal_error(code, internal_detail);
-    error_response(status, code, public_message)
+    log_request_failure(status, code, internal_detail);
+    api_error_response(status, code, public_message)
 }
 
 fn budget_error_response(
+    error_type: &'static str,
+    message: String,
+    budget: Option<BudgetBlockDetail>,
+) -> Response {
+    log_request_failure(StatusCode::PAYMENT_REQUIRED, error_type, message.clone());
+    budget_error_body(error_type, message, budget)
+}
+
+fn budget_internal_error_response(
+    error_type: &'static str,
+    public_message: String,
+    internal_detail: String,
+    budget: Option<BudgetBlockDetail>,
+) -> Response {
+    log_request_failure(StatusCode::PAYMENT_REQUIRED, error_type, internal_detail);
+    budget_error_body(error_type, public_message, budget)
+}
+
+fn budget_error_body(
     error_type: &'static str,
     message: String,
     budget: Option<BudgetBlockDetail>,
@@ -1574,8 +1675,18 @@ fn budget_error_response(
         .into_response()
 }
 
+fn log_request_failure(status: StatusCode, tag: &str, detail: String) {
+    error!(
+        target: "proxy.error",
+        tag = tag,
+        detail = %detail,
+        status = status.as_u16(),
+        "failed"
+    );
+}
+
 fn log_internal_error(tag: &str, detail: String) {
-    error!(tag = tag, detail = %detail, "internal proxy error");
+    error!(target: "proxy.error", tag = tag, detail = %detail, "failed");
 }
 
 #[cfg(test)]
@@ -1604,7 +1715,6 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::{sleep, Duration};
     use tower::ServiceExt;
-
     fn app() -> Router {
         build_router(ProxyState::mock_default())
     }
