@@ -1,263 +1,217 @@
 # PennyPrompt GitHub Backlog
 
-This backlog translates the project roadmap into GitHub milestones, labels, and issues that can be created automatically.
+This backlog is the current issue and release-direction source for the alpha train.
+It replaces the original M1-M6 scaffold backlog, which is now historical: the Rust
+workspace, proxy, budget ledger, admin plane, CLI, docs, tests, and alpha.2 release
+automation all exist.
 
-Source documents:
-- `README.md`
-- `CLAUDE.md`
-- `PennyPrompt-v2.md`
+Current baseline:
+- Branch: `main`
+- Latest published release: `v0.1.0-alpha.2` published on 2026-05-15 as a GitHub prerelease.
+- Open PRs at the 2026-06-19 audit: none.
+- Active roadmap: `v0.1.0-alpha.3` hardening release.
 
-Current repository state:
-- The repo is still in specification mode.
-- There is no Rust workspace or crate scaffold yet.
-- Alpha work should start from foundation, not from providers or UX polish.
+Source of truth for this backlog:
+- GitHub issues `#183`, `#184`, `#185`, and `#186`.
+- `docs/status-2026-05-07.md`.
+- `docs/CONFIG-REFERENCE.md`.
+- `docs/RELEASE.md`.
+- `docs/TECHNICAL_NOTES.md`.
+- Implementation reality in `crates/`.
+
+Operator-facing marketing copy is not used as normative release evidence here.
+Local `docs/status-*.md` snapshots are working notes only; any decision needed by
+public roadmap or release gates must be repeated in tracked docs or GitHub issues.
 
 ## Non-Negotiable Design Constraints
 
-These must stay fixed across all issues:
+These constraints remain fixed unless a dedicated architecture decision changes them:
 
 1. Budget blocks use HTTP `402`, never `429`.
-2. `guard` mode is fail-closed if budget or SQLite fails.
-3. The core accounting flow is `reserve -> dispatch -> reconcile`.
-4. Budget reservation and budget check happen in the same SQLite transaction.
-5. Project and session attribution should work without requiring custom headers.
-6. Pricebooks are local versioned files, not scraped at runtime.
-7. Proxy plane and admin plane stay separate.
+2. `guard` mode is fail-closed if budget or SQLite accounting fails.
+3. The core accounting flow remains `reserve -> dispatch -> reconcile`.
+4. Budget reservation and budget check happen in one SQLite transaction.
+5. Provider-reported usage wins over estimates during reconciliation.
+6. Project and session attribution should work without custom headers.
+7. Pricebooks are local versioned files for the current alpha train.
+8. Proxy plane and admin plane stay separate.
+9. Admin plane is local-control-plane scope; TCP admin exposure must stay loopback-only unless authentication is implemented and tested.
+10. Alpha releases are prereleases until a stable cut intentionally changes release maturity.
 
-## Milestone Plan
+## Current Release Direction: `v0.1.0-alpha.3`
 
-### M1 - Foundation
-
-Goal:
-- Workspace compiles.
-- Config loads with presets and env overrides.
-- SQLite schema exists.
-- Pricing engine resolves at least six models.
-
-Issues:
-- EPIC: M1 Foundation
-- Scaffold Cargo workspace and crate layout
-- Implement `penny-types` shared domain model
-- Implement `penny-config` loader, presets, validation, env overrides
-- Implement `penny-store` migrations and repository layer
-- Implement `penny-cost` pricing engine and pricebook loader
-- Add CI workflow for check, test, clippy, fmt
-
-Acceptance:
-- `cargo test --workspace` passes.
-- `indie` preset loads correctly.
-- Pricebook resolves six or more models.
-
-### M2 - Proxy Pass-Through
+`v0.1.0-alpha.3` is a hardening release, not a feature release.
 
 Goal:
-- Proxy accepts OpenAI-compatible traffic and forwards to a mock provider.
-- Requests are persisted.
-- Project and session are auto-attributed.
+- Make the already-shipped alpha more correct, auditable, secure, and releasable.
+- Avoid new product surface area unless it is required to close a release blocker.
 
-Issues:
-- EPIC: M2 Proxy Pass-Through
-- Implement `MockProvider` with streaming and non-streaming fixtures
-- Implement proxy server with `/v1/chat/completions` and `/v1/models`
-- Implement normalization pipeline and request persistence
-- Implement project/session auto-attribution
-- Add temporary health endpoint
+Out of scope for alpha.3:
+- `serve` daemon/background mode.
+- Full `pennyprompt run <agent>` orchestration.
+- New providers.
+- TUI/dashboard product work.
+- Remote signed pricebook feed sync.
+- PostgreSQL/team/multi-node mode.
+- Broad docs/website redesign.
 
-Acceptance:
-- A `curl` request against `localhost:8585` returns a mock response.
-- Rows are written to `projects`, `sessions`, `requests`, and `request_usage`.
+## Active Issue Set
 
-### M3 - Atomic Budgets
+### Epic
 
-Goal:
-- Budgets are enforced atomically under concurrency.
-- `observe` and `guard` modes behave correctly.
-- Budget failures return non-retriable `402`.
+- `#186` - `[Epic] v0.1.0-alpha.3 release scope`
 
-Issues:
-- EPIC: M3 Atomic Budgets
-- Implement `penny-ledger` reserve, reconcile, and release
-- Implement `penny-budget` evaluator and mode logic
-- Integrate budget enforcement into proxy pipeline
-- Seed budgets from config and presets
-- Implement `report summary` CLI
+Definition:
+- Close the implementation hardening issues.
+- Fix release blockers discovered during the 2026-06-19 audit.
+- Cut and publish `v0.1.0-alpha.3`.
 
-Acceptance:
-- Over-budget request returns `402`.
-- Concurrent requests do not leak over the hard limit.
-- Guard mode blocks on ledger or DB failure.
+### Required Child Issues
 
-### M4 - Streaming and Real Providers
+1. `#184` - `feat(cost): per-model tokenizer dispatch (Anthropic vs OpenAI families)`
 
-Goal:
-- Anthropic and OpenAI work end-to-end.
-- Streaming is forwarded in real time and accounted correctly.
-- Admin plane exposes health, reports, budgets, and event SSE.
-
-Issues:
-- EPIC: M4 Streaming and Real Providers
-- Implement Anthropic adapter
-- Implement OpenAI adapter
-- Implement streaming pass-through and post-stream accounting
-- Implement admin plane endpoints and SSE stream
-- Map upstream provider errors cleanly
+Why it matters:
+- `penny-cost` currently estimates all textual input with `cl100k_base`.
+- Anthropic-family estimates can be materially low.
+- Low estimates bias `estimate` output and budget reservations.
 
 Acceptance:
-- Real agent traffic can run through `localhost:8585`.
-- Streaming works without visible artifacts.
-- Admin endpoints expose accurate cost data.
+- `TokenizerKind` or equivalent exists.
+- Active shipped pricebook models resolve to a non-heuristic tokenizer class.
+- Unknown models use a safe heuristic fallback.
+- Tests cover OpenAI, Anthropic, and fallback behavior.
+- `docs/TECHNICAL_NOTES.md` records the Anthropic tokenizer decision.
 
-### M5 - Active Protection
+2. `#185` - `feat(proxy): structured tracing on request hot path (info spans + per-stage events)`
 
-Goal:
-- PennyPrompt detects costly loops, abnormal burn-rate, and repeated failures.
-- Estimation and live tailing are usable from the CLI.
-
-Issues:
-- EPIC: M5 Active Protection
-- Implement `penny-detect` loop detector
-- Integrate pause/resume session protection in proxy
-- Implement `estimate` CLI and `/admin/estimate`
-- Implement `tail` CLI over admin SSE
-- Implement `detect status` and `detect resume`
+Why it matters:
+- Runtime accounting exists, but the proxy hot path has too little structured log evidence.
+- Operators need request, model, provider, cost, latency, and outcome fields in JSON logs.
 
 Acceptance:
-- Repeated similar requests trigger alert or pause.
-- Burn-rate alerts appear in the live tail.
-- `estimate` returns cost ranges with budget status.
+- Successful requests emit structured `received`, `completed`, and `reconciled` events.
+- Error paths emit one structured error event with request context.
+- Proxy tests assert the structured field set.
+- Manual `--json-log` evidence is attached to the PR.
 
-### M6 - Alpha Release
+3. `#183` - `feat(cli): add --help descriptions to every subcommand`
 
-Goal:
-- New user reaches first useful report in less than ten minutes.
-- CLI, docs, tests, and release artifacts are good enough for public alpha.
-
-Issues:
-- EPIC: M6 Alpha Release
-- Finish CLI UX: `init`, `doctor`, `config`, `prices`, `budget`, `report top`
-- Write install, quickstart, config, architecture, and pricebook docs
-- Add integration and golden test coverage
-- Add release automation, install script, and changelog
+Why it matters:
+- First-run CLI help is still too bare for alpha users.
+- This is a low-risk UX improvement that makes the release more credible.
 
 Acceptance:
-- Public alpha can be installed and used quickly.
-- Multi-platform release artifacts exist.
-- Alpha checklist is green.
+- Root help and nested help groups show useful descriptions.
+- Golden/snapshot tests cover root and at least one nested group.
+- No command behavior changes.
 
-## Label Taxonomy
+## New Release Blockers From 2026-06-19 Audit
 
-Recommended labels:
-- `epic`
-- `phase:m1`
-- `phase:m2`
-- `phase:m3`
-- `phase:m4`
-- `phase:m5`
-- `phase:m6`
-- `area:types`
-- `area:config`
-- `area:store`
-- `area:cost`
-- `area:providers`
-- `area:proxy`
-- `area:ledger`
-- `area:budget`
-- `area:admin`
-- `area:detect`
-- `area:cli`
-- `area:docs`
-- `area:release`
-- `kind:test`
-- `kind:ci`
+These should be filed as GitHub issues before starting the alpha.3 implementation queue.
 
-## Proposed Alpha Issue Set
+### Security: Refresh TLS Dependency / Add Audit Gate
 
-### M1
+Proposed issue title:
+- `security: refresh rustls-webpki and add cargo audit release gate`
 
-1. EPIC: M1 Foundation
-2. Scaffold Cargo workspace and crate layout
-3. Implement `penny-types` shared domain model
-4. Implement `penny-config` loader, presets, validation, env overrides
-5. Implement `penny-store` migrations and repository layer
-6. Implement `penny-cost` pricing engine and pricebook loader
-7. Add CI workflow for check, test, clippy, fmt
+Why it matters:
+- `Cargo.lock` currently resolves `rustls-webpki 0.103.11`.
+- RustSec advisories published in April 2026 identify affected versions fixed in newer `rustls-webpki` releases.
+- The project uses `reqwest` with `rustls-tls`, so TLS verification dependencies are release-critical.
 
-### M2
+Required work:
+- Update the lockfile so `rustls-webpki` resolves to a fixed version.
+- Install or wire `cargo-audit` in the release gate path.
+- Document audit output in the alpha.3 gate.
 
-8. EPIC: M2 Proxy Pass-Through
-9. Implement `MockProvider` for deterministic integration tests
-10. Implement proxy server and OpenAI-compatible endpoints
-11. Implement normalization pipeline and SQLite request persistence
-12. Implement project and session auto-attribution
-13. Add temporary health endpoint
+Acceptance:
+- `cargo audit` passes or all advisories are explicitly documented as non-applicable.
+- `cargo test --workspace --locked` passes after the lockfile update.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` passes.
 
-### M3
+### Docs: Admin Security Contract Alignment
 
-14. EPIC: M3 Atomic Budgets
-15. Implement `penny-ledger` atomic reservation flow
-16. Implement `penny-budget` evaluator and observe/guard modes
-17. Integrate budget enforcement and structured `402` error bodies
-18. Seed budgets from config and presets
-19. Implement `report summary` CLI
+Proposed issue title:
+- `docs(security): align admin plane security contract with implementation`
 
-### M4
+Why it matters:
+- The admin plane currently exposes local operational endpoints without token authentication.
+- The valid alpha contract is loopback TCP or Unix socket, not authenticated network admin.
+- Release docs should not imply authentication that does not exist.
 
-20. EPIC: M4 Streaming and Real Providers
-21. Implement Anthropic provider adapter
-22. Implement OpenAI provider adapter
-23. Implement streaming pass-through and reconciliation
-24. Implement admin plane endpoints and event SSE
-25. Map upstream provider errors and incomplete streams
+Required work:
+- Ensure canonical docs describe admin as local-only unless auth is implemented.
+- Do not add authentication to alpha.3 unless the release scope is intentionally expanded.
+- Keep `docs/CONFIG-REFERENCE.md`, `docs/LIMITATIONS.md`, and release notes consistent.
 
-### M5
+Acceptance:
+- Canonical docs do not claim admin token auth.
+- Admin bind examples stay on `127.0.0.1` or Unix socket paths.
+- Alpha.3 release notes include the local-admin limitation.
 
-26. EPIC: M5 Active Protection
-27. Implement `penny-detect` heuristics and pause lifecycle
-28. Integrate loop protection into proxy request flow
-29. Implement `estimate` CLI and admin estimate API
-30. Implement live `tail` CLI over SSE
-31. Implement `detect status` and `detect resume`
+## Alpha.3 Release Sequence
 
-### M6
+Recommended order:
 
-32. EPIC: M6 Alpha Release
-33. Finish operator-focused CLI commands and setup wizard
-34. Write alpha docs set
-35. Add integration suite, golden tests, and manual alpha checklist
-36. Add release automation, install script, and changelog
+1. File the two new blocker issues listed above.
+2. Patch TLS dependency and add audit-gate evidence.
+3. Close `#184` tokenizer dispatch.
+4. Close `#185` structured proxy tracing.
+5. Close `#183` CLI help descriptions.
+6. Align canonical admin security docs.
+7. Bump workspace and `penny-cli` versions to `0.1.0-alpha.3`.
+8. Convert `CHANGELOG.md` `[Unreleased]` into `[v0.1.0-alpha.3] - YYYY-MM-DD`.
+9. Add `docs/RELEASE_GATE_v0.1.0-alpha.3.md`.
+10. Add `docs/release-notes/v0.1.0-alpha.3.md`.
+11. Run the standard gate:
+    - `cargo fmt --all -- --check`
+    - `cargo check --workspace --locked`
+    - `cargo test --workspace --locked`
+    - `cargo clippy --workspace --all-targets --locked -- -D warnings`
+    - `cargo audit`
+12. Tag and publish `v0.1.0-alpha.3`.
+13. Verify release artifacts and checksums.
 
-## Post-Alpha Parking Lot
+## Release Gate Notes
 
-Do not create these until alpha scope is stable:
-- `pennyprompt run <agent>`
-- Payload cleanup
-- TUI dashboard
-- Provider #3
-- Alert webhooks
-- CSV and JSON export
-- Team mode or PostgreSQL
-- Plugin system
-- Grafana or Prometheus metrics
+Known local verification caveats:
+- Tests that bind loopback ports may fail inside restricted sandboxes. They pass when loopback binding is permitted.
+- Config tests can be affected by a real user config if `HOME` is not isolated. Release gate commands should use a clean HOME or CI runner environment.
 
-## Technical Review Follow-Ups
+Recommended local command shape:
 
-Review source:
-- Gemini Code Assist comments on merged PRs `#38` through `#51` (review pass on 2026-04-12).
+```bash
+HOME="$(mktemp -d)" \
+RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+cargo test --workspace --locked
+```
 
-Actioned as dedicated issues:
-- [#45](https://github.com/manuelpenazuniga/PennyPrompt/issues/45) — Harden money representation before M3/M4.
-- [#52](https://github.com/manuelpenazuniga/PennyPrompt/issues/52) — Harden proxy health and error surfaces before M3 integration.
+Adjust `RUSTUP_HOME` and `CARGO_HOME` to existing toolchain paths when running offline.
 
-Mapped to existing planned issues (no new issue needed):
-- Streaming memory/latency behavior and reconciliation gaps → [#24](https://github.com/manuelpenazuniga/PennyPrompt/issues/24).
-- Upstream error mapping and incomplete stream handling → [#26](https://github.com/manuelpenazuniga/PennyPrompt/issues/26).
-- Budget-enforcement error contracts and structured 402 responses → [#18](https://github.com/manuelpenazuniga/PennyPrompt/issues/18).
+## Deferred Parking Lot
 
-Technical annotations to revisit (future hardening, currently no dedicated issue):
-- `penny-store`: revisit pool sizing/query patterns and slug collision risk once M3 load/concurrency tests exist.
-- `penny-config`: improve cross-platform path handling (`HOME`/tilde resolution) before alpha packaging.
-- `penny-cost`: revisit historical pricing query ergonomics and non-blocking import path as performance tuning.
+Do not pull these into alpha.3:
+- daemon/background mode
+- full `run <agent>` orchestration
+- payload cleanup expansion beyond current behavior
+- TUI/dashboard
+- provider #3
+- alert webhooks
+- CSV/JSON export expansion
+- team mode or PostgreSQL
+- plugin system
+- Grafana/Prometheus/OTLP metrics
+- remote pricebook feed
 
-## Automation
+## Historical Backlog Status
 
-Use [scripts/create_github_backlog.sh](/Volumes/MacMiniExt/dev/OpenSource%20Projects/PennyPrompt/PennyPrompt/scripts/create_github_backlog.sh) to create the milestones, labels, and alpha issues once `gh` is authenticated.
+The original M1-M6 plan is considered delivered for alpha scope:
+- M1 Foundation: delivered.
+- M2 Proxy pass-through: delivered.
+- M3 Atomic budgets: delivered.
+- M4 Streaming and real providers: delivered for alpha.
+- M5 Active protection: delivered for alpha.
+- M6 Alpha release: delivered through `v0.1.0-alpha.2`.
+
+Future roadmap docs should start from the active alpha.3 hardening scope above, not from the old scaffold issue list.
