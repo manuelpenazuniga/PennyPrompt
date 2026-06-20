@@ -22,7 +22,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use penny_config::LoopAction;
-use penny_cost::{estimate_tokens, PricingEngine};
+use penny_cost::{estimate_tokens_for_model_id, PricingEngine};
 use penny_detect::{DetectEngine, DetectStatus};
 use penny_store::{BudgetRepo, EventRepo, NewEvent, SqliteStore, StoreError};
 use penny_types::{
@@ -807,7 +807,7 @@ async fn post_estimate(
                     "provide context_tokens or messages".to_string(),
                 );
             };
-            estimate_tokens(messages).input_tokens
+            estimate_tokens_for_model_id(model, messages).input_tokens
         }
     };
 

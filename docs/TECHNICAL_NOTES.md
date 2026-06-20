@@ -3,6 +3,37 @@
 This file tracks non-blocking technical recommendations that should remain visible
 without stopping milestone delivery.
 
+## 2026-06: Alpha.3 Tokenizer Dispatch (`#184`)
+
+Decision:
+- `penny-cost` resolves a `TokenizerKind` from each model id before estimating
+  input tokens.
+- OpenAI `gpt-4.1*` uses `cl100k_base`.
+- OpenAI `gpt-4o*` uses `o200k_base`.
+- Anthropic `claude-*` uses an alpha heuristic named `AnthropicV2`: count with
+  `cl100k_base`, then apply a `1.35` multiplier and round up.
+- Unknown models use the existing `chars/4` heuristic instead of panicking.
+
+Rationale:
+- There is no stable first-party Rust Anthropic tokenizer dependency in the
+  current project graph.
+- The `1.35` multiplier matches the alpha audit finding that Claude Opus 4.7
+  can report materially more tokens than `cl100k_base` on equivalent prompts.
+- The heuristic is deliberately conservative for pre-call estimates; provider
+  reconciliation remains authoritative when real usage is returned.
+
+Calibration fixtures:
+- Empty message array: all tokenizers fall back to 1 heuristic input token.
+- Short English prompt: `cl100k_base`/`o200k_base` = 9 input tokens,
+  `AnthropicV2` = 13, `Heuristic` = 12.
+- Repeated Rust code block: `cl100k_base`/`o200k_base` = 320 input tokens,
+  `AnthropicV2` = 432, `Heuristic` = 270.
+
+Upgrade path:
+- Replace `AnthropicV2` with an official/local Anthropic tokenizer when a
+  stable Rust option is available.
+- Keep fixture tests so the switch is intentional and reviewable.
+
 ## 2026-04: Gemini Non-Blocking Recommendations (`#94`)
 
 Source reviews:

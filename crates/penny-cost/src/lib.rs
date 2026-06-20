@@ -8,7 +8,7 @@ use penny_types::{Confidence, CostRange, Money, MoneyError, TaskType, UsageSourc
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
-use tiktoken_rs::cl100k_base;
+use tiktoken_rs::{cl100k_base, o200k_base};
 
 #[derive(Debug, Error)]
 pub enum CostError {
@@ -35,6 +35,14 @@ pub struct TokenEstimate {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub source: UsageSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizerKind {
+    Cl100kBase,
+    O200kBase,
+    AnthropicV2,
+    Heuristic,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +88,10 @@ impl<'a, R: PricebookRepo> PricingEngine<'a, R> {
     /// Output tokens use heuristic `min(input * 0.3, 4096)`.
     pub fn estimate_tokens(&self, messages: &Value) -> TokenEstimate {
         estimate_tokens(messages)
+    }
+
+    pub fn estimate_tokens_for_model(&self, model_id: &str, messages: &Value) -> TokenEstimate {
+        estimate_tokens_for_model_id(model_id, messages)
     }
 
     pub async fn snapshot(&self, model_id: &str) -> Result<Value, CostError> {
@@ -131,20 +143,54 @@ impl<'a, R: PricebookRepo> PricingEngine<'a, R> {
 }
 
 pub fn estimate_tokens(messages: &Value) -> TokenEstimate {
+    estimate_tokens_for_model(messages, &TokenizerKind::Cl100kBase)
+}
+
+pub fn estimate_tokens_for_model_id(model_id: &str, messages: &Value) -> TokenEstimate {
+    let tokenizer = tokenizer_kind_for_model(model_id);
+    estimate_tokens_for_model(messages, &tokenizer)
+}
+
+pub fn estimate_tokens_for_model(messages: &Value, tokenizer: &TokenizerKind) -> TokenEstimate {
     let content_text = extract_message_text(messages);
     if content_text.trim().is_empty() {
-        let input = heuristic_chars_to_tokens(messages.to_string().chars().count());
-        return TokenEstimate {
-            input_tokens: input,
-            output_tokens: estimate_output_tokens(input),
-            source: UsageSource::Heuristic,
-        };
+        return estimate_from_chars(messages.to_string().chars().count());
     }
 
-    match cl100k_base() {
+    match tokenizer {
+        TokenizerKind::Cl100kBase => estimate_with_tiktoken(&content_text, cl100k_base()),
+        TokenizerKind::O200kBase => estimate_with_tiktoken(&content_text, o200k_base()),
+        TokenizerKind::AnthropicV2 => estimate_anthropic_v2_tokens(&content_text),
+        TokenizerKind::Heuristic => estimate_from_chars(content_text.chars().count()),
+    }
+}
+
+pub fn tokenizer_kind_for_model(model_id: &str) -> TokenizerKind {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    if normalized.starts_with("claude-") {
+        return TokenizerKind::AnthropicV2;
+    }
+    if normalized.starts_with("gpt-4o") || normalized.starts_with("chatgpt-4o") {
+        return TokenizerKind::O200kBase;
+    }
+    if normalized == "gpt-4"
+        || normalized.starts_with("gpt-4.1")
+        || normalized.starts_with("gpt-4-")
+    {
+        return TokenizerKind::Cl100kBase;
+    }
+
+    TokenizerKind::Heuristic
+}
+
+fn estimate_with_tiktoken<E>(
+    content_text: &str,
+    encoding: Result<tiktoken_rs::CoreBPE, E>,
+) -> TokenEstimate {
+    match encoding {
         Ok(encoding) => {
             let input = encoding
-                .encode_with_special_tokens(&content_text)
+                .encode_with_special_tokens(content_text)
                 .len()
                 .try_into()
                 .unwrap_or(u64::MAX);
@@ -162,6 +208,31 @@ pub fn estimate_tokens(messages: &Value) -> TokenEstimate {
                 source: UsageSource::Heuristic,
             }
         }
+    }
+}
+
+fn estimate_anthropic_v2_tokens(content_text: &str) -> TokenEstimate {
+    const ANTHROPIC_V2_CL100K_MULTIPLIER: f64 = 1.35;
+
+    let base = estimate_with_tiktoken(content_text, cl100k_base());
+    if base.source == UsageSource::Heuristic {
+        return base;
+    }
+
+    let input = ((base.input_tokens as f64) * ANTHROPIC_V2_CL100K_MULTIPLIER).ceil() as u64;
+    TokenEstimate {
+        input_tokens: input,
+        output_tokens: estimate_output_tokens(input),
+        source: UsageSource::Estimated,
+    }
+}
+
+fn estimate_from_chars(chars: usize) -> TokenEstimate {
+    let input = heuristic_chars_to_tokens(chars);
+    TokenEstimate {
+        input_tokens: input,
+        output_tokens: estimate_output_tokens(input),
+        source: UsageSource::Heuristic,
     }
 }
 
@@ -460,6 +531,176 @@ mod tests {
         ]);
         let result = estimate_tokens(&payload);
         assert!(result.input_tokens > 0);
+        assert_eq!(result.source, UsageSource::Heuristic);
+    }
+
+    fn short_english_messages() -> Value {
+        serde_json::json!([
+            { "role": "user", "content": "Hello from PennyPrompt. Estimate this request." }
+        ])
+    }
+
+    fn long_code_messages() -> Value {
+        serde_json::json!([{
+            "role": "user",
+            "content": "fn main() {\n    let mut total = 0;\n    for index in 0..128 {\n        total += index * 2;\n        println!(\"{index}: {total}\");\n    }\n}\n".repeat(8)
+        }])
+    }
+
+    fn assert_token_estimate(
+        payload: &Value,
+        tokenizer: TokenizerKind,
+        input_tokens: u64,
+        output_tokens: u64,
+        source: UsageSource,
+    ) {
+        let estimate = estimate_tokens_for_model(payload, &tokenizer);
+        assert_eq!(
+            estimate,
+            TokenEstimate {
+                input_tokens,
+                output_tokens,
+                source
+            },
+            "unexpected estimate for {tokenizer:?}"
+        );
+    }
+
+    #[test]
+    fn tokenizer_kinds_cover_empty_short_and_long_fixtures() {
+        let empty = serde_json::json!([]);
+        for tokenizer in [
+            TokenizerKind::Cl100kBase,
+            TokenizerKind::O200kBase,
+            TokenizerKind::AnthropicV2,
+            TokenizerKind::Heuristic,
+        ] {
+            assert_token_estimate(&empty, tokenizer, 1, 0, UsageSource::Heuristic);
+        }
+
+        let short = short_english_messages();
+        assert_token_estimate(
+            &short,
+            TokenizerKind::Cl100kBase,
+            9,
+            3,
+            UsageSource::Estimated,
+        );
+        assert_token_estimate(
+            &short,
+            TokenizerKind::O200kBase,
+            9,
+            3,
+            UsageSource::Estimated,
+        );
+        assert_token_estimate(
+            &short,
+            TokenizerKind::AnthropicV2,
+            13,
+            4,
+            UsageSource::Estimated,
+        );
+        assert_token_estimate(
+            &short,
+            TokenizerKind::Heuristic,
+            12,
+            4,
+            UsageSource::Heuristic,
+        );
+
+        let long = long_code_messages();
+        assert_token_estimate(
+            &long,
+            TokenizerKind::Cl100kBase,
+            320,
+            96,
+            UsageSource::Estimated,
+        );
+        assert_token_estimate(
+            &long,
+            TokenizerKind::O200kBase,
+            320,
+            96,
+            UsageSource::Estimated,
+        );
+        assert_token_estimate(
+            &long,
+            TokenizerKind::AnthropicV2,
+            432,
+            130,
+            UsageSource::Estimated,
+        );
+        assert_token_estimate(
+            &long,
+            TokenizerKind::Heuristic,
+            270,
+            81,
+            UsageSource::Heuristic,
+        );
+    }
+
+    #[test]
+    fn tokenizer_mapping_covers_shipped_pricebooks() {
+        let prices_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../prices")
+            .canonicalize()
+            .expect("resolve prices dir");
+
+        for file_name in ["anthropic.toml", "openai.toml"] {
+            let file_content =
+                fs::read_to_string(prices_dir.join(file_name)).expect("read pricebook");
+            let parsed: PricebookFile = toml::from_str(&file_content).expect("parse pricebook");
+
+            for entry in parsed.entries {
+                assert_ne!(
+                    tokenizer_kind_for_model(&entry.model_id),
+                    TokenizerKind::Heuristic,
+                    "model {} from {file_name} should have an explicit tokenizer",
+                    entry.model_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tokenizer_mapping_uses_expected_model_families() {
+        assert_eq!(
+            tokenizer_kind_for_model("claude-opus-4-7"),
+            TokenizerKind::AnthropicV2
+        );
+        assert_eq!(
+            tokenizer_kind_for_model("gpt-4o-mini"),
+            TokenizerKind::O200kBase
+        );
+        assert_eq!(
+            tokenizer_kind_for_model("gpt-4.1"),
+            TokenizerKind::Cl100kBase
+        );
+        assert_eq!(tokenizer_kind_for_model("gpt-4"), TokenizerKind::Cl100kBase);
+        assert_eq!(
+            tokenizer_kind_for_model("unknown-local-model"),
+            TokenizerKind::Heuristic
+        );
+    }
+
+    #[test]
+    fn anthropic_and_openai_estimates_diverge_for_same_prompt() {
+        let short = serde_json::json!([
+            { "role": "user", "content": "Hello from PennyPrompt. Estimate this request." }
+        ]);
+        let openai = estimate_tokens_for_model_id("gpt-4.1", &short);
+        let anthropic = estimate_tokens_for_model_id("claude-opus-4-7", &short);
+
+        assert_ne!(openai.input_tokens, anthropic.input_tokens);
+        assert_eq!(openai.source, UsageSource::Estimated);
+        assert_eq!(anthropic.source, UsageSource::Estimated);
+    }
+
+    #[test]
+    fn unknown_models_use_heuristic_tokenizer_without_panicking() {
+        let result = estimate_tokens_for_model_id("unknown-local-model", &short_english_messages());
+
+        assert_eq!(result.input_tokens, 12);
         assert_eq!(result.source, UsageSource::Heuristic);
     }
 
