@@ -57,25 +57,31 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    #[command(about = "initialize local config, database, budgets, and pricebooks")]
     Init {
         #[arg(long, default_value = PRESET_INDIE)]
         preset: String,
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    #[command(about = "check config, database, provider keys, pricebook freshness, and binds")]
     Doctor,
+    #[command(about = "print resolved configuration")]
     Config {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "inspect or update local model pricebooks")]
     Prices {
         #[command(subcommand)]
         command: PricesCommands,
     },
+    #[command(about = "list, set, or reset local budget guardrails")]
     Budget {
         #[command(subcommand)]
         command: BudgetCommands,
     },
+    #[command(about = "estimate token and cost range before running work")]
     Estimate {
         #[arg(long)]
         model: String,
@@ -92,10 +98,12 @@ enum Commands {
         #[arg(long, default_value_t = 200)]
         max_files: usize,
     },
+    #[command(about = "inspect or resume detector-paused sessions")]
     Detect {
         #[command(subcommand)]
         command: DetectCommands,
     },
+    #[command(about = "preview launcher attribution and runtime wiring (dry-run plan only)")]
     Run {
         agent: String,
         #[arg(long, default_value_t = false)]
@@ -109,6 +117,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "start proxy and admin planes")]
     Serve {
         #[arg(long, default_value_t = false)]
         mock: bool,
@@ -120,6 +129,7 @@ enum Commands {
         )]
         admin_bind: Option<String>,
     },
+    #[command(about = "stream admin events from the local control plane")]
     Tail {
         #[arg(
             long,
@@ -136,10 +146,12 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         once: bool,
     },
+    #[command(about = "summarize persisted request cost data")]
     Report {
         #[command(subcommand)]
         command: ReportCommands,
     },
+    #[command(about = "render a compact local cost dashboard")]
     Dashboard {
         #[arg(long)]
         since: Option<String>,
@@ -150,6 +162,7 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum ReportCommands {
+    #[command(about = "summarize requests by project, model, or session")]
     Summary {
         #[arg(long)]
         since: Option<String>,
@@ -158,6 +171,7 @@ enum ReportCommands {
         #[arg(long, value_enum, default_value_t = SummaryFormat::Table)]
         format: SummaryFormat,
     },
+    #[command(about = "show highest-cost requests")]
     Top {
         #[arg(long, default_value_t = 20)]
         limit: u32,
@@ -166,6 +180,7 @@ enum ReportCommands {
 
 #[derive(Debug, Subcommand)]
 enum DetectCommands {
+    #[command(about = "show detector status, active alerts, and paused sessions")]
     Status {
         #[arg(
             long,
@@ -174,6 +189,7 @@ enum DetectCommands {
         )]
         admin_url: String,
     },
+    #[command(about = "resume a paused session")]
     Resume {
         session_id: String,
         #[arg(long)]
@@ -189,16 +205,20 @@ enum DetectCommands {
 
 #[derive(Debug, Subcommand)]
 enum PricesCommands {
+    #[command(about = "show active model prices")]
     Show {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+    #[command(about = "import bundled local pricebooks")]
     Update,
 }
 
 #[derive(Debug, Subcommand)]
 enum BudgetCommands {
+    #[command(about = "list configured runtime budgets")]
     List,
+    #[command(about = "set or update a runtime budget")]
     Set {
         #[arg(long, value_enum)]
         scope_type: BudgetScopeArg,
@@ -215,6 +235,7 @@ enum BudgetCommands {
         #[arg(long, default_value = "warn")]
         action_on_soft: String,
     },
+    #[command(about = "remove a runtime budget")]
     Reset {
         #[arg(long, value_enum)]
         scope_type: BudgetScopeArg,
