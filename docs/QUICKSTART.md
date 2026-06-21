@@ -70,6 +70,17 @@ If you want a fully local smoke test without provider keys:
 ./target/release/penny-cli serve --mock --admin-bind 127.0.0.1:8586
 ```
 
+To run the same local topology in the background:
+
+```bash
+./target/release/penny-cli serve --daemon --mock --admin-bind 127.0.0.1:8586
+./target/release/penny-cli serve --status
+./target/release/penny-cli serve --stop
+```
+
+The default background pid/log files live next to the user config:
+`~/.config/pennyprompt/serve.pid` and `~/.config/pennyprompt/serve.log`.
+
 ## 7. Try Core Operator Commands (terminal B)
 
 Estimate:

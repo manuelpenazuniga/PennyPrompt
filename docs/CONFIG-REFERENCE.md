@@ -45,6 +45,9 @@ Operational note:
 - Recommended local operator path for `tail`/`detect`:
   - run serve with admin on loopback TCP (`--admin-bind 127.0.0.1:8586`) or set `server.admin_socket = "127.0.0.1:8586"`.
   - then use `tail` / `detect` defaults (no `--admin-url` required).
+- Background serve uses `~/.config/pennyprompt/serve.pid` and
+  `~/.config/pennyprompt/serve.log` by default. Override with `serve --pid-file`
+  and `serve --log-file` when running multiple local instances.
 - `tail` / `detect` CLI commands use HTTP URLs and default to `http://127.0.0.1:8586`.
 - If you keep `admin_socket` as a Unix path, `tail` / `detect` need a loopback TCP admin bind because native Unix-socket clients are not implemented for those commands yet.
 

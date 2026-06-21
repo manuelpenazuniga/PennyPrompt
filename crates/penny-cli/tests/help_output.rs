@@ -80,6 +80,14 @@ fn nested_help_lists_descriptions_for_command_groups() {
                 "show highest-cost requests",
             ][..],
         ),
+        (
+            ["serve", "--help"],
+            &[
+                "Start serve in the background",
+                "Show background serve status",
+                "Stop background serve using the pid file",
+            ][..],
+        ),
     ];
 
     for (args, expected) in cases {
