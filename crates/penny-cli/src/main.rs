@@ -1,9 +1,12 @@
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap},
-    fs,
+    ffi::OsString,
+    fs::{self, OpenOptions},
+    io::{Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -33,6 +36,9 @@ use serde_json::{json, Value};
 use sqlx::{query, Row};
 use tempfile::Builder;
 use thiserror::Error;
+
+#[cfg(unix)]
+use std::os::{fd::AsRawFd, unix::process::CommandExt};
 
 const PRESET_INDIE_TOML: &str = include_str!("../../../presets/indie.toml");
 const PRESET_TEAM_TOML: &str = include_str!("../../../presets/team.toml");
@@ -128,6 +134,30 @@ enum Commands {
             help = "Admin bind target. Use 127.0.0.1:8586 for tail/detect defaults; otherwise a unix socket path is used."
         )]
         admin_bind: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Start serve in the background and write a pid file."
+        )]
+        daemon: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Show background serve status from the pid file."
+        )]
+        status: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Stop background serve using the pid file."
+        )]
+        stop: bool,
+        #[arg(long, help = "Pid file path for --daemon, --status, and --stop.")]
+        pid_file: Option<PathBuf>,
+        #[arg(long, help = "Log file path for --daemon stdout/stderr.")]
+        log_file: Option<PathBuf>,
+        #[arg(long, hide = true, default_value_t = false)]
+        daemon_child: bool,
     },
     #[command(about = "stream admin events from the local control plane")]
     Tail {
@@ -480,11 +510,42 @@ struct ServeCommand {
     mock: bool,
     proxy_bind: Option<String>,
     admin_bind: Option<String>,
+    daemon: bool,
+    status: bool,
+    stop: bool,
+    pid_file: Option<PathBuf>,
+    log_file: Option<PathBuf>,
+    daemon_child: bool,
 }
 
 struct RuntimeProvider {
     provider: Arc<dyn ProviderAdapter>,
     models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ServeProcessMetadata {
+    pid: u32,
+    started_at: DateTime<Utc>,
+    mode: String,
+    proxy_bind: String,
+    admin_bind: String,
+    pid_file: String,
+    log_file: String,
+    database_path: String,
+    config_path: String,
+}
+
+struct ServeRuntimeSettings {
+    config: AppConfig,
+    proxy_bind: String,
+    admin_bind: String,
+    pid_file: PathBuf,
+    log_file: PathBuf,
+}
+
+struct ServePidFileLock {
+    _file: fs::File,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -701,6 +762,12 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             mock,
             proxy_bind,
             admin_bind,
+            daemon,
+            status,
+            stop,
+            pid_file,
+            log_file,
+            daemon_child,
         } => {
             run_serve(
                 &store,
@@ -708,6 +775,12 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     mock,
                     proxy_bind,
                     admin_bind,
+                    daemon,
+                    status,
+                    stop,
+                    pid_file,
+                    log_file,
+                    daemon_child,
                 },
             )
             .await?;
@@ -1325,7 +1398,190 @@ async fn run_launcher(store: &SqliteStore, command: RunCommand) -> Result<(), Cl
 }
 
 async fn run_serve(store: &SqliteStore, command: ServeCommand) -> Result<(), CliError> {
+    let control_actions = [command.daemon, command.status, command.stop]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count();
+    if control_actions > 1 {
+        return Err(CliError::Run(
+            "serve accepts only one of --daemon, --status, or --stop".to_string(),
+        ));
+    }
+    if command.status {
+        return run_serve_status(&command);
+    }
+    if command.stop {
+        return run_serve_stop(&command).await;
+    }
+    if command.daemon_child {
+        return run_serve_daemon_child(store, command).await;
+    }
+    if command.daemon {
+        return run_serve_daemon(command).await;
+    }
     run_serve_with_shutdown(store, command, shutdown_signal()).await
+}
+
+async fn run_serve_daemon(command: ServeCommand) -> Result<(), CliError> {
+    let settings = resolve_serve_runtime_settings(&command)?;
+
+    if let Some(existing) = read_serve_metadata(&settings.pid_file)? {
+        if is_serve_pid_file_locked(&settings.pid_file)? {
+            return Err(CliError::Run(format!(
+                "serve is already running with pid {} (pid_file: {})",
+                existing.pid,
+                settings.pid_file.display()
+            )));
+        }
+        remove_file_if_exists(&settings.pid_file)?;
+    }
+
+    ensure_parent_dir(&settings.pid_file)?;
+    ensure_parent_dir(&settings.log_file)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&settings.log_file)
+        .map_err(|error| {
+            CliError::Run(format!(
+                "failed to open daemon log {}: {error}",
+                settings.log_file.display()
+            ))
+        })?;
+    let log_for_stderr = log.try_clone().map_err(|error| {
+        CliError::Run(format!(
+            "failed to duplicate daemon log {}: {error}",
+            settings.log_file.display()
+        ))
+    })?;
+
+    let current_exe = std::env::current_exe()
+        .map_err(|error| CliError::Run(format!("failed to resolve current executable: {error}")))?;
+    let mut child_command = ProcessCommand::new(current_exe);
+    let mut child_args = daemon_child_args_from(std::env::args_os().skip(1));
+    child_args.push(OsString::from("--daemon-child"));
+    child_command
+        .args(child_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_for_stderr));
+
+    #[cfg(unix)]
+    unsafe {
+        child_command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = child_command
+        .spawn()
+        .map_err(|error| CliError::Run(format!("failed to start serve daemon: {error}")))?;
+    wait_for_daemon_ready(
+        &mut child,
+        &settings.proxy_bind,
+        &settings.pid_file,
+        &settings.log_file,
+    )
+    .await?;
+    let metadata = read_serve_metadata(&settings.pid_file)?.ok_or_else(|| {
+        CliError::Run(format!(
+            "serve daemon became ready but pid metadata was not written: {}",
+            settings.pid_file.display()
+        ))
+    })?;
+
+    println!("Started PennyPrompt serve in background");
+    println!("  pid: {}", metadata.pid);
+    println!("  mode: {}", metadata.mode);
+    println!("  proxy_bind: {}", metadata.proxy_bind);
+    println!("  admin_bind: {}", admin_bind_display(&metadata.admin_bind));
+    println!("  pid_file: {}", settings.pid_file.display());
+    println!("  log_file: {}", settings.log_file.display());
+    println!(
+        "  stop: pennyprompt serve --stop --pid-file {}",
+        settings.pid_file.display()
+    );
+    Ok(())
+}
+
+async fn run_serve_daemon_child(
+    store: &SqliteStore,
+    command: ServeCommand,
+) -> Result<(), CliError> {
+    let settings = resolve_serve_runtime_settings(&command)?;
+    let metadata = serve_process_metadata(std::process::id(), &settings, command.mock);
+    let _pid_lock = ServePidFileLock::acquire(&settings.pid_file, &metadata)?;
+    let result = run_serve_with_shutdown(store, command, shutdown_signal()).await;
+    let cleanup_result = remove_file_if_exists(&settings.pid_file);
+    match (result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), _) => Err(error),
+    }
+}
+
+fn run_serve_status(command: &ServeCommand) -> Result<(), CliError> {
+    let pid_file = resolve_serve_pid_file(command.pid_file.clone())?;
+    match read_serve_metadata(&pid_file)? {
+        Some(metadata) if is_serve_pid_file_locked(&pid_file)? => {
+            println!("PennyPrompt serve is running");
+            println!("  pid: {}", metadata.pid);
+            println!("  started_at: {}", metadata.started_at.to_rfc3339());
+            println!("  mode: {}", metadata.mode);
+            println!("  proxy_bind: {}", metadata.proxy_bind);
+            println!("  admin_bind: {}", admin_bind_display(&metadata.admin_bind));
+            println!("  pid_file: {}", pid_file.display());
+            println!("  log_file: {}", metadata.log_file);
+        }
+        Some(metadata) => {
+            println!("PennyPrompt serve is not running");
+            println!("  stale_pid: {}", metadata.pid);
+            println!("  pid_file: {}", pid_file.display());
+            println!(
+                "  cleanup: pennyprompt serve --stop --pid-file {}",
+                pid_file.display()
+            );
+        }
+        None => {
+            println!("PennyPrompt serve is not running");
+            println!("  pid_file: {}", pid_file.display());
+        }
+    }
+    Ok(())
+}
+
+async fn run_serve_stop(command: &ServeCommand) -> Result<(), CliError> {
+    let pid_file = resolve_serve_pid_file(command.pid_file.clone())?;
+    let Some(metadata) = read_serve_metadata(&pid_file)? else {
+        println!("PennyPrompt serve is not running");
+        println!("  pid_file: {}", pid_file.display());
+        return Ok(());
+    };
+
+    if !is_serve_pid_file_locked(&pid_file)? {
+        remove_file_if_exists(&pid_file)?;
+        println!("Removed stale PennyPrompt serve pid file");
+        println!("  stale_pid: {}", metadata.pid);
+        println!("  pid_file: {}", pid_file.display());
+        return Ok(());
+    }
+
+    terminate_process(metadata.pid)?;
+    if wait_for_pid_file_unlock(&pid_file, Duration::from_secs(5)).await {
+        remove_file_if_exists(&pid_file)?;
+        println!("Stopped PennyPrompt serve");
+        println!("  pid: {}", metadata.pid);
+        println!("  pid_file: {}", pid_file.display());
+        return Ok(());
+    }
+
+    Err(CliError::Run(format!(
+        "sent SIGTERM to pid {} but serve is still running",
+        metadata.pid
+    )))
 }
 
 async fn run_serve_with_shutdown<F>(
@@ -1456,6 +1712,348 @@ fn merge_serve_shutdown_results(
             "serve shutdown reported multiple failures: proxy={proxy_error}; admin={admin_error}"
         ))),
     }
+}
+
+fn resolve_serve_runtime_settings(
+    command: &ServeCommand,
+) -> Result<ServeRuntimeSettings, CliError> {
+    let config = load_runtime_config()?;
+    let proxy_bind = command
+        .proxy_bind
+        .clone()
+        .unwrap_or_else(|| config.server.bind.clone());
+    let admin_bind = command
+        .admin_bind
+        .clone()
+        .map(|value| expand_tilde(PathBuf::from(value)))
+        .unwrap_or_else(|| expand_tilde(PathBuf::from(config.server.admin_socket.clone())));
+    Ok(ServeRuntimeSettings {
+        config,
+        proxy_bind,
+        admin_bind,
+        pid_file: resolve_serve_pid_file(command.pid_file.clone())?,
+        log_file: resolve_serve_log_file(command.log_file.clone())?,
+    })
+}
+
+fn serve_process_metadata(
+    pid: u32,
+    settings: &ServeRuntimeSettings,
+    mock_mode: bool,
+) -> ServeProcessMetadata {
+    ServeProcessMetadata {
+        pid,
+        started_at: Utc::now(),
+        mode: if mock_mode { "mock" } else { "runtime" }.to_string(),
+        proxy_bind: settings.proxy_bind.clone(),
+        admin_bind: settings.admin_bind.clone(),
+        pid_file: settings.pid_file.display().to_string(),
+        log_file: settings.log_file.display().to_string(),
+        database_path: settings.config.server.database_path.clone(),
+        config_path: resolve_user_config_target()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "(unresolved)".to_string()),
+    }
+}
+
+impl ServePidFileLock {
+    fn acquire(pid_file: &Path, metadata: &ServeProcessMetadata) -> Result<Self, CliError> {
+        ensure_parent_dir(pid_file)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(pid_file)
+            .map_err(|error| {
+                CliError::Run(format!(
+                    "failed to open pid file {}: {error}",
+                    pid_file.display()
+                ))
+            })?;
+        if !try_lock_file_exclusive(&file)? {
+            return Err(CliError::Run(format!(
+                "serve pid file is locked by another process: {}",
+                pid_file.display()
+            )));
+        }
+
+        let raw = serde_json::to_string_pretty(metadata)
+            .map_err(|error| CliError::Run(format!("failed serializing pid metadata: {error}")))?;
+        file.set_len(0).map_err(|error| {
+            CliError::Run(format!(
+                "failed truncating pid file {}: {error}",
+                pid_file.display()
+            ))
+        })?;
+        file.seek(SeekFrom::Start(0)).map_err(|error| {
+            CliError::Run(format!(
+                "failed seeking pid file {}: {error}",
+                pid_file.display()
+            ))
+        })?;
+        file.write_all(format!("{raw}\n").as_bytes())
+            .map_err(|error| {
+                CliError::Run(format!(
+                    "failed writing pid file {}: {error}",
+                    pid_file.display()
+                ))
+            })?;
+        file.sync_all().map_err(|error| {
+            CliError::Run(format!(
+                "failed syncing pid file {}: {error}",
+                pid_file.display()
+            ))
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn resolve_serve_pid_file(pid_file: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    Ok(pid_file
+        .map(expand_path_buf)
+        .transpose()?
+        .unwrap_or(default_serve_state_path("serve.pid")?))
+}
+
+fn resolve_serve_log_file(log_file: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    Ok(log_file
+        .map(expand_path_buf)
+        .transpose()?
+        .unwrap_or(default_serve_state_path("serve.log")?))
+}
+
+fn default_serve_state_path(file_name: &str) -> Result<PathBuf, CliError> {
+    let config_path = resolve_user_config_target()?;
+    let dir = config_path
+        .parent()
+        .ok_or_else(|| CliError::Run("unable to resolve serve state directory".to_string()))?;
+    Ok(dir.join(file_name))
+}
+
+fn expand_path_buf(path: PathBuf) -> Result<PathBuf, CliError> {
+    let expanded = PathBuf::from(expand_tilde(path));
+    if expanded.is_absolute() {
+        return Ok(expanded);
+    }
+    let current_dir = std::env::current_dir()
+        .map_err(|error| CliError::Run(format!("failed to get current directory: {error}")))?;
+    Ok(current_dir.join(expanded))
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), CliError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(parent).map_err(|error| {
+        CliError::Run(format!(
+            "failed creating parent directory {}: {error}",
+            parent.display()
+        ))
+    })
+}
+
+fn read_serve_metadata(pid_file: &Path) -> Result<Option<ServeProcessMetadata>, CliError> {
+    if !pid_file.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(pid_file).map_err(|error| {
+        CliError::Run(format!(
+            "failed reading pid file {}: {error}",
+            pid_file.display()
+        ))
+    })?;
+    let metadata = match serde_json::from_str(&raw) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            remove_file_if_exists(pid_file)?;
+            return Ok(None);
+        }
+    };
+    Ok(Some(metadata))
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), CliError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CliError::Run(format!(
+            "failed removing {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn daemon_child_args_from<I>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    args.into_iter()
+        .filter(|arg| {
+            let Some(raw) = arg.to_str() else {
+                return true;
+            };
+            !matches!(raw, "--daemon" | "--status" | "--stop")
+                && !raw.starts_with("--daemon=")
+                && !raw.starts_with("--status=")
+                && !raw.starts_with("--stop=")
+        })
+        .collect()
+}
+
+async fn wait_for_daemon_ready(
+    child: &mut std::process::Child,
+    proxy_bind: &str,
+    pid_file: &Path,
+    log_file: &Path,
+) -> Result<(), CliError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let connect_target = readiness_connect_target(proxy_bind);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| CliError::Run(format!("failed to inspect serve daemon: {error}")))?
+        {
+            return Err(CliError::Run(format!(
+                "serve daemon exited during startup with status {status}. See log_file: {}",
+                log_file.display()
+            )));
+        }
+        if tcp_connect_ready(&connect_target).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = terminate_process(child.id());
+            let _ = wait_for_pid_file_unlock(pid_file, Duration::from_secs(1)).await;
+            return Err(CliError::Run(format!(
+                "serve daemon did not become ready at {} within 3s. See log_file: {}",
+                connect_target,
+                log_file.display()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(75)).await;
+    }
+}
+
+fn readiness_connect_target(proxy_bind: &str) -> String {
+    if let Ok(addr) = proxy_bind.parse::<SocketAddr>() {
+        if addr.ip().is_unspecified() {
+            return match addr {
+                SocketAddr::V4(addr) => format!("127.0.0.1:{}", addr.port()),
+                SocketAddr::V6(addr) => format!("[::1]:{}", addr.port()),
+            };
+        }
+    }
+    proxy_bind.to_string()
+}
+
+async fn tcp_connect_ready(target: &str) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(150),
+        tokio::net::TcpStream::connect(target),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+async fn wait_for_pid_file_unlock(pid_file: &Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match is_serve_pid_file_locked(pid_file) {
+            Ok(false) => return true,
+            Ok(true) => {}
+            Err(_) => return false,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn is_serve_pid_file_locked(pid_file: &Path) -> Result<bool, CliError> {
+    if !pid_file.exists() {
+        return Ok(false);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pid_file)
+        .map_err(|error| {
+            CliError::Run(format!(
+                "failed to open pid file {}: {error}",
+                pid_file.display()
+            ))
+        })?;
+    Ok(!try_lock_file_exclusive(&file)?)
+}
+
+#[cfg(unix)]
+fn try_lock_file_exclusive(file: &fs::File) -> Result<bool, CliError> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(false),
+        _ => Err(CliError::Run(format!("failed locking pid file: {error}"))),
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_file_exclusive(_file: &fs::File) -> Result<bool, CliError> {
+    Ok(true)
+}
+
+#[cfg(all(test, unix))]
+fn is_process_running(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EPERM) => true,
+        Some(libc::ESRCH) => false,
+        _ => false,
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+fn is_process_running(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) -> Result<(), CliError> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(CliError::Run(format!("invalid pid `{pid}`")));
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if result == 0 {
+        return Ok(());
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        _ => Err(CliError::Run(format!(
+            "failed sending SIGTERM to pid {}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process(_pid: u32) -> Result<(), CliError> {
+    Err(CliError::Run(
+        "serve --stop is only implemented on Unix-like targets in this alpha".to_string(),
+    ))
 }
 
 fn admin_bind_display(bind: &str) -> String {
@@ -3875,6 +4473,12 @@ mod tests {
                         mock: true,
                         proxy_bind: Some(proxy_bind),
                         admin_bind: Some(admin_bind),
+                        daemon: false,
+                        status: false,
+                        stop: false,
+                        pid_file: None,
+                        log_file: None,
+                        daemon_child: false,
                     },
                     async move {
                         let _ = shutdown_rx.await;
@@ -3922,6 +4526,86 @@ mod tests {
         shutdown_tx.send(()).expect("send shutdown");
         let serve_result = serve_task.await.expect("join serve task");
         assert!(serve_result.is_ok(), "serve task failed: {serve_result:?}");
+    }
+
+    #[test]
+    fn daemon_child_args_remove_only_control_flags() {
+        let args = daemon_child_args_from([
+            OsString::from("--database"),
+            OsString::from("/tmp/penny.db"),
+            OsString::from("serve"),
+            OsString::from("--mock"),
+            OsString::from("--daemon"),
+            OsString::from("--status=false"),
+            OsString::from("--pid-file"),
+            OsString::from("/tmp/penny.pid"),
+        ]);
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--database"),
+                OsString::from("/tmp/penny.db"),
+                OsString::from("serve"),
+                OsString::from("--mock"),
+                OsString::from("--pid-file"),
+                OsString::from("/tmp/penny.pid"),
+            ]
+        );
+    }
+
+    #[test]
+    fn relative_daemon_paths_resolve_to_absolute_paths() {
+        let expanded = expand_path_buf(PathBuf::from("serve.pid")).expect("expand relative path");
+        assert!(expanded.is_absolute());
+        assert!(expanded.ends_with("serve.pid"));
+    }
+
+    #[test]
+    fn corrupted_pid_file_is_removed_as_stale() {
+        let dir = tempdir().expect("temp dir");
+        let pid_file = dir.path().join("serve.pid");
+        fs::write(&pid_file, "{not-json").expect("write corrupt pid file");
+
+        let metadata = read_serve_metadata(&pid_file).expect("read corrupt pid file");
+        assert!(metadata.is_none());
+        assert!(!pid_file.exists());
+    }
+
+    #[test]
+    fn serve_pid_file_lock_writes_metadata_and_blocks_second_lock() {
+        let dir = tempdir().expect("temp dir");
+        let pid_file = dir.path().join("serve.pid");
+        let metadata = ServeProcessMetadata {
+            pid: 12345,
+            started_at: Utc
+                .with_ymd_and_hms(2026, 6, 20, 12, 0, 0)
+                .single()
+                .expect("timestamp"),
+            mode: "mock".to_string(),
+            proxy_bind: "127.0.0.1:8585".to_string(),
+            admin_bind: "127.0.0.1:8586".to_string(),
+            pid_file: pid_file.display().to_string(),
+            log_file: dir.path().join("serve.log").display().to_string(),
+            database_path: "/tmp/penny.db".to_string(),
+            config_path: "/tmp/config.toml".to_string(),
+        };
+
+        let lock = ServePidFileLock::acquire(&pid_file, &metadata).expect("acquire pid lock");
+        assert!(is_serve_pid_file_locked(&pid_file).expect("pid file lock state"));
+        let restored = read_serve_metadata(&pid_file)
+            .expect("read metadata")
+            .expect("metadata present");
+        assert_eq!(restored, metadata);
+        drop(lock);
+        assert!(!is_serve_pid_file_locked(&pid_file).expect("pid file unlocked"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_process_running_detects_current_process() {
+        assert!(is_process_running(std::process::id()));
+        assert!(!is_process_running(0));
     }
 
     #[test]

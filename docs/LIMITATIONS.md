@@ -4,7 +4,7 @@ This list documents current constraints as of June 20, 2026.
 
 ## CLI / Product Surface
 
-- `serve` is available in `penny-cli`, but daemon/background mode is not implemented yet.
+- `serve` is available in `penny-cli` for foreground and local background operation.
 - `run <agent>` currently emits deterministic dry-run launch plans; full process orchestration remains a follow-up.
 - Some outputs are operator-focused and intentionally minimal (not final UX polish).
 
