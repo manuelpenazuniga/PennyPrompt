@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 use sqlx::{query, Row};
 use tempfile::Builder;
 use thiserror::Error;
+use tokio::process::Command as TokioProcessCommand;
 
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::process::CommandExt};
@@ -109,11 +110,17 @@ enum Commands {
         #[command(subcommand)]
         command: DetectCommands,
     },
-    #[command(about = "preview launcher attribution and runtime wiring (dry-run plan only)")]
+    #[command(about = "run a local agent command through PennyPrompt proxy wiring")]
     Run {
         agent: String,
         #[arg(long, default_value_t = false)]
         execute: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Use the bundled mock provider for local launcher smoke tests."
+        )]
+        mock: bool,
         #[arg(long)]
         project_id: Option<String>,
         #[arg(long)]
@@ -122,6 +129,13 @@ enum Commands {
         cwd: Option<PathBuf>,
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(
+            last = true,
+            allow_hyphen_values = true,
+            value_name = "AGENT_ARG",
+            help = "Arguments passed to the agent command after `--`."
+        )]
+        agent_args: Vec<String>,
     },
     #[command(about = "start proxy and admin planes")]
     Serve {
@@ -499,10 +513,12 @@ struct TailCommand {
 struct RunCommand {
     agent: String,
     execute: bool,
+    mock: bool,
     project_id: Option<String>,
     session_id: Option<String>,
     cwd: Option<PathBuf>,
     as_json: bool,
+    agent_args: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -552,10 +568,14 @@ struct ServePidFileLock {
 struct LaunchPlan {
     mode: String,
     agent: String,
+    agent_args: Vec<String>,
+    mock: bool,
     project_id: String,
     session_id: String,
     cwd: String,
     proxy_bind: String,
+    proxy_url: String,
+    openai_base_url: String,
     admin_socket: String,
     database_path: String,
     config_path: String,
@@ -740,20 +760,24 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Run {
             agent,
             execute,
+            mock,
             project_id,
             session_id,
             cwd,
             json,
+            agent_args,
         } => {
             run_launcher(
                 &store,
                 RunCommand {
                     agent,
                     execute,
+                    mock,
                     project_id,
                     session_id,
                     cwd,
                     as_json: json,
+                    agent_args,
                 },
             )
             .await?;
@@ -1339,12 +1363,6 @@ async fn run_estimate(store: &SqliteStore, command: EstimateCommand) -> Result<(
 
 async fn run_launcher(store: &SqliteStore, command: RunCommand) -> Result<(), CliError> {
     let agent = normalize_required_arg(&command.agent, "agent")?;
-    if command.execute {
-        return Err(CliError::Run(
-            "execute mode is not implemented yet. Rerun without --execute for deterministic dry-run output.".to_string(),
-        ));
-    }
-
     let explicit_cwd = command.cwd.is_some();
     let cwd = resolve_launcher_cwd(command.cwd)?;
     let config = load_config(LoadOptions {
@@ -1373,28 +1391,197 @@ async fn run_launcher(store: &SqliteStore, command: RunCommand) -> Result<(), Cl
     let config_path = resolve_user_config_target()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "(unresolved)".to_string());
-    let plan = LaunchPlan {
-        mode: "dry_run".to_string(),
+    let mut plan = build_launch_plan(
+        if command.execute {
+            "execute"
+        } else {
+            "dry_run"
+        },
         agent,
+        command.agent_args,
+        command.mock,
         project_id,
         session_id,
-        cwd: cwd.display().to_string(),
-        proxy_bind: config.server.bind,
-        admin_socket: config.server.admin_socket,
-        database_path: config.server.database_path,
+        &cwd,
+        &config.server.bind,
+        &config.server.admin_socket,
+        &config.server.database_path,
         config_path,
-    };
+    );
+
+    if !command.execute {
+        if command.as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan)
+                    .map_err(|error| CliError::Run(error.to_string()))?
+            );
+        } else {
+            println!("{}", render_launch_plan(&plan));
+        }
+        return Ok(());
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| CliError::Run(format!("failed binding launcher proxy: {error}")))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|error| CliError::Run(format!("failed resolving launcher proxy bind: {error}")))?;
+    let proxy_bind = local_addr.to_string();
+    plan.proxy_bind = proxy_bind.clone();
+    plan.proxy_url = proxy_url_from_bind(&proxy_bind);
+    plan.openai_base_url = openai_base_url_from_proxy_url(&plan.proxy_url);
 
     if command.as_json {
-        println!(
+        eprintln!(
             "{}",
             serde_json::to_string_pretty(&plan)
                 .map_err(|error| CliError::Run(error.to_string()))?
         );
     } else {
-        println!("{}", render_launch_plan(&plan));
+        eprintln!("{}", render_launch_plan(&plan));
     }
-    Ok(())
+    run_launcher_execute(store, &config, &plan, &cwd, listener).await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_launch_plan(
+    mode: &str,
+    agent: String,
+    agent_args: Vec<String>,
+    mock: bool,
+    project_id: String,
+    session_id: String,
+    cwd: &Path,
+    proxy_bind: &str,
+    admin_socket: &str,
+    database_path: &str,
+    config_path: String,
+) -> LaunchPlan {
+    let proxy_url = proxy_url_from_bind(proxy_bind);
+    LaunchPlan {
+        mode: mode.to_string(),
+        agent,
+        agent_args,
+        mock,
+        project_id,
+        session_id,
+        cwd: cwd.display().to_string(),
+        proxy_bind: proxy_bind.to_string(),
+        openai_base_url: openai_base_url_from_proxy_url(&proxy_url),
+        proxy_url,
+        admin_socket: admin_socket.to_string(),
+        database_path: database_path.to_string(),
+        config_path,
+    }
+}
+
+async fn run_launcher_execute(
+    store: &SqliteStore,
+    config: &AppConfig,
+    plan: &LaunchPlan,
+    cwd: &Path,
+    listener: tokio::net::TcpListener,
+) -> Result<(), CliError> {
+    let runtime = build_runtime_provider(config, plan.mock)?;
+    let proxy_state =
+        build_state_from_config(runtime.provider, runtime.models, store.clone(), config)
+            .await
+            .map_err(CliError::Run)?
+            .with_default_attribution(plan.project_id.clone(), plan.session_id.clone());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let proxy_task = tokio::spawn({
+        async move {
+            penny_proxy::serve_listener_with_state_and_shutdown(listener, proxy_state, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        }
+    });
+
+    if !wait_for_launcher_proxy_ready(&plan.proxy_bind).await {
+        let _ = shutdown_tx.send(());
+        let _ = proxy_task.await;
+        return Err(CliError::Run(format!(
+            "launcher proxy did not become ready at {}",
+            plan.proxy_url
+        )));
+    }
+
+    let status_result = execute_agent_process(plan, cwd).await;
+    let _ = shutdown_tx.send(());
+    let proxy_result = proxy_task
+        .await
+        .map_err(|error| CliError::Run(format!("launcher proxy task join error: {error}")))?;
+    proxy_result.map_err(|error| CliError::Run(format!("launcher proxy error: {error}")))?;
+    let status = status_result?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    Err(CliError::Run(format!(
+        "agent `{}` exited with {}",
+        plan.agent,
+        format_exit_status(status)
+    )))
+}
+
+async fn execute_agent_process(
+    plan: &LaunchPlan,
+    cwd: &Path,
+) -> Result<std::process::ExitStatus, CliError> {
+    let mut command = TokioProcessCommand::new(&plan.agent);
+    command
+        .args(&plan.agent_args)
+        .current_dir(cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env("PENNY_PROXY_URL", &plan.proxy_url)
+        .env("PENNY_PROJECT_ID", &plan.project_id)
+        .env("PENNY_SESSION_ID", &plan.session_id)
+        .env("PENNY_CWD", &plan.cwd)
+        .env("OPENAI_BASE_URL", &plan.openai_base_url)
+        .env("OPENAI_API_BASE", &plan.openai_base_url);
+
+    if std::env::var_os("OPENAI_API_KEY").is_none() {
+        command.env("OPENAI_API_KEY", "pennyprompt-local-proxy");
+    }
+
+    command
+        .status()
+        .await
+        .map_err(|error| CliError::Run(format!("failed starting agent `{}`: {error}", plan.agent)))
+}
+
+async fn wait_for_launcher_proxy_ready(proxy_bind: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if tcp_connect_ready(proxy_bind).await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn proxy_url_from_bind(bind: &str) -> String {
+    format!("http://{}", readiness_connect_target(bind))
+}
+
+fn openai_base_url_from_proxy_url(proxy_url: &str) -> String {
+    format!("{}/v1", proxy_url.trim_end_matches('/'))
+}
+
+fn format_exit_status(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "signal termination".to_string(),
+    }
 }
 
 async fn run_serve(store: &SqliteStore, command: ServeCommand) -> Result<(), CliError> {
@@ -2311,17 +2498,28 @@ fn default_project_id_from_cwd(cwd: &Path) -> String {
 
 fn render_launch_plan(plan: &LaunchPlan) -> String {
     format!(
-        "Run launcher plan\n  mode: {}\n  agent: {}\n  project_id: {}\n  session_id: {}\n  cwd: {}\n  proxy_bind: {}\n  admin_socket: {}\n  database_path: {}\n  config_path: {}",
+        "Run launcher plan\n  mode: {}\n  agent: {}\n  agent_args: {}\n  mock: {}\n  project_id: {}\n  session_id: {}\n  cwd: {}\n  proxy_bind: {}\n  proxy_url: {}\n  openai_base_url: {}\n  admin_socket: {}\n  database_path: {}\n  config_path: {}",
         plan.mode,
         plan.agent,
+        render_agent_args(&plan.agent_args),
+        plan.mock,
         plan.project_id,
         plan.session_id,
         plan.cwd,
         plan.proxy_bind,
+        plan.proxy_url,
+        plan.openai_base_url,
         plan.admin_socket,
         plan.database_path,
         plan.config_path
     )
+}
+
+fn render_agent_args(args: &[String]) -> String {
+    if args.is_empty() {
+        return "(none)".to_string();
+    }
+    serde_json::to_string(args).unwrap_or_else(|_| format!("{args:?}"))
 }
 
 async fn run_tail(command: TailCommand) -> Result<(), CliError> {
@@ -4904,10 +5102,14 @@ mod tests {
         let plan = LaunchPlan {
             mode: "dry_run".to_string(),
             agent: "codex".to_string(),
+            agent_args: Vec::new(),
+            mock: false,
             project_id: "my-project".to_string(),
             session_id: "session-auto".to_string(),
             cwd: "/tmp/work".to_string(),
             proxy_bind: "127.0.0.1:8585".to_string(),
+            proxy_url: "http://127.0.0.1:8585".to_string(),
+            openai_base_url: "http://127.0.0.1:8585/v1".to_string(),
             admin_socket: "127.0.0.1:8586".to_string(),
             database_path: "~/.config/pennyprompt/pennyprompt.db".to_string(),
             config_path: "~/.config/pennyprompt/config.toml".to_string(),
@@ -4916,7 +5118,7 @@ mod tests {
         let rendered = render_launch_plan(&plan);
         assert_eq!(
             rendered,
-            "Run launcher plan\n  mode: dry_run\n  agent: codex\n  project_id: my-project\n  session_id: session-auto\n  cwd: /tmp/work\n  proxy_bind: 127.0.0.1:8585\n  admin_socket: 127.0.0.1:8586\n  database_path: ~/.config/pennyprompt/pennyprompt.db\n  config_path: ~/.config/pennyprompt/config.toml"
+            "Run launcher plan\n  mode: dry_run\n  agent: codex\n  agent_args: (none)\n  mock: false\n  project_id: my-project\n  session_id: session-auto\n  cwd: /tmp/work\n  proxy_bind: 127.0.0.1:8585\n  proxy_url: http://127.0.0.1:8585\n  openai_base_url: http://127.0.0.1:8585/v1\n  admin_socket: 127.0.0.1:8586\n  database_path: ~/.config/pennyprompt/pennyprompt.db\n  config_path: ~/.config/pennyprompt/config.toml"
         );
     }
 

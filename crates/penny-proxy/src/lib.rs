@@ -123,6 +123,16 @@ impl ProxyState {
         self
     }
 
+    pub fn with_default_attribution(
+        mut self,
+        project_id: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> Self {
+        self.default_project_id = project_id.into();
+        self.default_session_id = session_id.into();
+        self
+    }
+
     pub fn with_mode(mut self, mode: Mode) -> Self {
         self.mode = mode;
         self
@@ -299,6 +309,17 @@ where
 {
     let addr: SocketAddr = bind.parse()?;
     let listener = TcpListener::bind(addr).await?;
+    serve_listener_with_state_and_shutdown(listener, state, shutdown).await
+}
+
+pub async fn serve_listener_with_state_and_shutdown<F>(
+    listener: TcpListener,
+    state: ProxyState,
+    shutdown: F,
+) -> Result<(), ProxyError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let app = build_router(state);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
@@ -904,15 +925,21 @@ async fn resolve_attribution(
 
     let project_path_seed = if let Some(project) = &project_override {
         format!("/override/{project}")
+    } else if state.default_project_id != "default" {
+        format!("/override/{}", state.default_project_id)
     } else {
         detect_git_root_from(headers)
             .map(|root| root.to_string_lossy().to_string())
             .unwrap_or_else(|| "default".to_string())
     };
 
-    let fallback_project_id = project_override
-        .clone()
-        .unwrap_or_else(|| project_id_from_seed_path(&project_path_seed));
+    let fallback_project_id = project_override.clone().unwrap_or_else(|| {
+        if state.default_project_id != "default" {
+            state.default_project_id.clone()
+        } else {
+            project_id_from_seed_path(&project_path_seed)
+        }
+    });
     let fallback_session_id = session_override
         .clone()
         .unwrap_or_else(|| state.default_session_id.clone());
@@ -928,6 +955,9 @@ async fn resolve_attribution(
     let session_id = if let Some(session_id) = session_override {
         ensure_session_override_exists(store, &session_id, &project_id).await?;
         session_id
+    } else if state.default_session_id != "session-auto" {
+        ensure_session_override_exists(store, &state.default_session_id, &project_id).await?;
+        state.default_session_id.clone()
     } else {
         match SessionRepo::find_active(store, &project_id, state.session_window_minutes)
             .await
@@ -3238,6 +3268,44 @@ action_on_soft = "warn"
                 .expect("project id");
 
         assert_eq!(project_id, "default");
+    }
+
+    #[tokio::test]
+    async fn explicit_default_attribution_is_used_without_headers() {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        let state = ProxyState::mock_default()
+            .with_store(store.clone())
+            .with_default_attribution("launcher-project", "launcher-session");
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role":"user","content":"launcher attribution"}]
+                })
+                .to_string(),
+            ))
+            .expect("request");
+
+        let response = app.oneshot(request).await.expect("response");
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("request id");
+        let row = sqlx::query("SELECT project_id, session_id FROM requests WHERE id = ?1")
+            .bind(request_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("request row");
+
+        assert_eq!(row.get::<String, _>("project_id"), "launcher-project");
+        assert_eq!(row.get::<String, _>("session_id"), "launcher-session");
     }
 
     #[tokio::test]

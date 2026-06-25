@@ -61,6 +61,12 @@ Operational note:
 - `auto_detect_project` (`bool`)
 - `session_window_minutes` (`u32`, must be `> 0`)
 
+Launcher note:
+
+- `pennyprompt run <agent>` uses these settings to resolve project/session context before launching the child process.
+- `run --execute` starts a per-run loopback proxy and passes context through `PENNY_PROJECT_ID`, `PENNY_SESSION_ID`, `PENNY_CWD`, `PENNY_PROXY_URL`, `OPENAI_BASE_URL`, and `OPENAI_API_BASE`.
+- The alpha.4 execution contract is intentionally narrow: agents must use OpenAI-compatible `/v1` HTTP traffic for proxy enforcement. Native agent protocols are outside this release scope.
+
 ## `[providers.<name>]`
 
 - `enabled` (`bool`)

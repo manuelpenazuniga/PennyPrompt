@@ -80,10 +80,17 @@ alias pp='cargo run -p penny-cli --'
 pp doctor
 ```
 
-Launcher preview (dry-run):
+Launcher preview and execution:
 
 ```bash
 ./target/release/penny-cli run codex
+./target/release/penny-cli run codex --execute -- --help
+```
+
+For a credential-free smoke, use the mock provider:
+
+```bash
+./target/release/penny-cli run sh --execute --mock -- -c 'echo "$OPENAI_BASE_URL"'
 ```
 
 ## 5. Configure Initial Settings

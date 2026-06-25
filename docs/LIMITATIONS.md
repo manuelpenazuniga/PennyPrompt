@@ -1,11 +1,12 @@
 # Known Limitations (Alpha)
 
-This list documents current constraints as of June 20, 2026.
+This list documents current constraints as of June 25, 2026.
 
 ## CLI / Product Surface
 
 - `serve` is available in `penny-cli` for foreground and local background operation.
-- `run <agent>` currently emits deterministic dry-run launch plans; full process orchestration remains a follow-up.
+- `run <agent>` supports deterministic dry-run launch plans and a minimal `--execute` path.
+- `run --execute` is limited to local agents that honor OpenAI-compatible `/v1` base URL environment variables; native agent protocols are outside the current alpha scope.
 - Some outputs are operator-focused and intentionally minimal (not final UX polish).
 
 ## Pricebook Update
