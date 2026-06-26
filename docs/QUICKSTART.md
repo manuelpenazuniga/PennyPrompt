@@ -123,7 +123,7 @@ Resume a paused session:
 ./target/release/penny-cli detect resume <session_id>
 ```
 
-## 8. Launcher Plan Preview (post-alpha foundation)
+## 8. Launcher Execution
 
 Preview launcher attribution and runtime wiring:
 
@@ -132,10 +132,25 @@ Preview launcher attribution and runtime wiring:
 ./target/release/penny-cli run codex --json
 ```
 
+Execute a local agent command through a temporary PennyPrompt proxy:
+
+```bash
+./target/release/penny-cli run codex --execute -- --help
+```
+
+Smoke the launcher without provider credentials:
+
+```bash
+./target/release/penny-cli run sh --execute --mock -- -c 'echo "$OPENAI_BASE_URL"'
+```
+
 Notes:
 
-- current behavior is dry-run plan output only
+- without `--execute`, `run` remains a deterministic dry-run plan
+- `--execute` starts a per-run loopback proxy, sets `OPENAI_BASE_URL` / `OPENAI_API_BASE`, and launches the agent process
+- the alpha.4 launcher contract is OpenAI-compatible `/v1` agent traffic; native Anthropic CLI protocol routing is not claimed
 - use `--project-id` / `--session-id` to override detected defaults
+- process startup failures are reported by `pennyprompt run`; budget and provider failures are returned through the proxy to the agent
 
 ## Expected First Outcomes
 

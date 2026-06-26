@@ -300,7 +300,8 @@ pennyprompt [--log-filter <filter>] [--json-log]
 ├── init [--preset indie|team|explore]     Setup wizard
 ├── serve [--mock] [--proxy-bind] [--admin-bind]  Start proxy + admin
 ├── estimate [--model M] [--context-files]  Pre-execution cost estimate
-├── run <agent> [--json]                    Launcher dry-run plan
+├── run <agent> [--execute] [--mock] [--json] -- [args]
+│                                             Launcher plan or local execution
 ├── report
 │   ├── summary [--since] [--by project|model|session]
 │   └── top [--limit N]                     Most expensive requests

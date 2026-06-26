@@ -39,7 +39,7 @@ fn root_help_lists_descriptions_for_top_level_commands() {
             "list, set, or reset local budget guardrails",
             "estimate token and cost range before running work",
             "inspect or resume detector-paused sessions",
-            "preview launcher attribution and runtime wiring (dry-run plan only)",
+            "run a local agent command through PennyPrompt proxy wiring",
             "start proxy and admin planes",
             "stream admin events from the local control plane",
             "summarize persisted request cost data",
@@ -78,6 +78,13 @@ fn nested_help_lists_descriptions_for_command_groups() {
             &[
                 "summarize requests by project, model, or session",
                 "show highest-cost requests",
+            ][..],
+        ),
+        (
+            ["run", "--help"],
+            &[
+                "Use the bundled mock provider",
+                "Arguments passed to the agent command",
             ][..],
         ),
         (
