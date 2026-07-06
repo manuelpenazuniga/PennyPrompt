@@ -6,7 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-No unreleased changes.
+### Added
+- Strategic audit `docs/STRATEGY-AUDIT-2026-07-05.md`: progress audit, security/scalability/functional findings, competitive analysis, consolidated differentiators, and a detailed post-alpha.4 roadmap (Phases A-D, `v0.1.0-alpha.5` → `v1.0.0`).
+- Forward roadmap tracked as GitHub epics `#225`-`#228` and child issues `#207`-`#224`.
+- README "What makes PennyPrompt different" section consolidating the differentiators into the narrative.
+
+### Changed
+- `docs/GITHUB_BACKLOG.md` rewritten around the forward roadmap, with a consolidated differentiators section, the `phase:m7`-`m10` label scheme, and an honesty ledger of known gaps.
+- README compatibility table now states the current inbound contract (OpenAI-compatible `/v1/chat/completions`); native Anthropic `/v1/messages` ingress is tracked for alpha.5 (`#207`). README roadmap now points at the backlog as the single source of truth.
+- `docs/LIMITATIONS.md` records the native Anthropic ingress gap (`#207`) and the prompt-cache accounting gap (`#208`) as dated, tracked limitations.
 
 ## [v0.1.0-alpha.3] - 2026-06-20
 
