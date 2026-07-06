@@ -1,6 +1,25 @@
 # Known Limitations (Alpha)
 
-This list documents current constraints as of June 25, 2026.
+This list documents current constraints as of July 5, 2026.
+
+## Inbound API Surface
+
+- The proxy accepts the **OpenAI-compatible** `POST /v1/chat/completions` surface plus
+  `GET /v1/models`. This is the only inbound request contract today.
+- **Native Anthropic ingress (`POST /v1/messages`) is not implemented yet.** Anthropic-native
+  agents (OpenClaw, claw-code, Claude-family SDKs) must be pointed at an OpenAI-compatible base
+  URL until native ingress lands. Tracked by `#207` (alpha.5); the compatibility table in the
+  README is annotated accordingly (`#210`).
+
+## Cost Accuracy
+
+- **Prompt-cache tokens are not yet included in cost accounting.** Provider `cache_read` /
+  `cache_creation` (Anthropic) and `prompt_tokens_details.cached_tokens` (OpenAI) are not read,
+  so reported cost can diverge from the provider invoice on cache-heavy agent workloads.
+  Provider-reported non-cache usage remains authoritative during reconciliation. Tracked by
+  `#208` (alpha.5).
+- Streaming reconciliation falls back to token estimation when the provider omits a final usage
+  payload; provider-reported usage is preferred when present.
 
 ## CLI / Product Surface
 

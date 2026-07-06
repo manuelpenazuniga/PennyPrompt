@@ -89,6 +89,19 @@ PennyPrompt exists because:
 - **Agents loop.** A debugging agent retrying the same failed tool call 30 times in 2 minutes will burn $50+ before you notice. PennyPrompt detects it and pauses.
 - **"How much will this cost?" has no answer today.** PennyPrompt estimates before you start, so you can decide if a task is worth the spend.
 
+### What makes PennyPrompt different
+
+The LLM-gateway category (LiteLLM, Portkey, Helicone, OpenRouter) models *applications with users*: virtual keys, per-key rate limits, spend tracking after the call. PennyPrompt models something else — *an autonomous agent, which is a loop with a credit card* — and does it local-first. That reframing is the moat:
+
+- **Local-first, single ~15MB binary, zero external services.** No PostgreSQL, no Redis, no Docker. Your prompts, code, and costs never leave your machine except the provider call itself.
+- **Enforcement *before* the spend, not after.** A transactional reservation blocks the request that *would* break your budget — atomically, safe under concurrency — instead of reporting the overage once it already happened.
+- **402-for-agents, not 429.** `retryable:false` tells the agent to stop and ask a human, instead of the retry storm a rate-limit code triggers.
+- **Agent-loop awareness.** Burn-rate, repeated tool-failure, and content-similarity detection catch the runaway loop — a failure mode app-centric gateways don't model.
+- **Zero-config attribution.** Project by git root, session by time window. Useful reports from the first request, no virtual keys, no custom headers.
+- **Correct by design.** Integer-micros money and an append-only auditable ledger: when it says `$4.23`, it's `$4.23`.
+
+Full competitive analysis and the differentiator roadmap: [docs/STRATEGY-AUDIT-2026-07-05.md](docs/STRATEGY-AUDIT-2026-07-05.md).
+
 ### What PennyPrompt is NOT
 
 - **Not a router.** It doesn't pick models for you. Use [NadirClaw](https://github.com/NadirRouter/NadirClaw) for that — they compose well together.
@@ -391,14 +404,20 @@ PennyPrompt works with any tool that speaks the OpenAI chat completions API:
 | NadirClaw | Chain: Agent → NadirClaw → PennyPrompt → Provider |
 | curl | `curl http://localhost:8585/v1/chat/completions ...` |
 
+> **Inbound API contract (current alpha).** The proxy accepts the **OpenAI-compatible** `POST /v1/chat/completions` surface today. Native Anthropic ingress (`POST /v1/messages`), which lets Anthropic-native agents like OpenClaw/claw-code connect with no translation, is the headline item of the **alpha.5** release train ([#207](https://github.com/manuelpenazuniga/PennyPrompt/issues/207)). Until it lands, connect agents via an OpenAI-compatible base URL. See [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
+
 ## Roadmap
 
-- [x] Project specification (v2)
-- [ ] **Alpha** (6 weeks) — Proxy, atomic budgets, loop detection, estimation, reports, presets
-- [ ] **Post-alpha** — Launcher (`pennyprompt run <agent>`), TUI dashboard, payload cleanup, webhooks
-- [ ] **v1.0** — Team mode, PostgreSQL backend, plugin system, Grafana/Prometheus metrics
+The single source of truth for the roadmap is [docs/GITHUB_BACKLOG.md](docs/GITHUB_BACKLOG.md), driven by the strategic audit in [docs/STRATEGY-AUDIT-2026-07-05.md](docs/STRATEGY-AUDIT-2026-07-05.md).
 
-See [PennyPrompt-v2.md](PennyPrompt-v2.md) for the full project specification.
+- [x] **M1-M6 / Alpha** — Proxy, atomic budgets, loop detection, estimation, reports, presets, real providers, streaming, release automation (shipped through `v0.1.0-alpha.3`).
+- [~] **`v0.1.0-alpha.4`** — Operator usability: serve daemon, `run` orchestration, installer smoke check ([#199](https://github.com/manuelpenazuniga/PennyPrompt/issues/199)).
+- [ ] **`v0.1.0-alpha.5` — Compatibility & cost accuracy** — Native Anthropic ingress, prompt-cache accounting, concurrency limits ([#225](https://github.com/manuelpenazuniga/PennyPrompt/issues/225)).
+- [ ] **`v0.1.0-alpha.6` — Agent-aware moat** — Per-task budgets, human-in-the-loop circuit breaker, real `run` wrapper, alert webhooks ([#226](https://github.com/manuelpenazuniga/PennyPrompt/issues/226)).
+- [ ] **`v0.1.0-beta.1` — Scope expansion** — Gemini/local/OpenRouter providers, live TUI dashboard, signed pricebook feed, sovereignty & router-composition docs ([#227](https://github.com/manuelpenazuniga/PennyPrompt/issues/227)).
+- [ ] **`v1.0.0` — Team without betraying local-first** — Admin auth, optional PostgreSQL, read-pool split, durable detector state ([#228](https://github.com/manuelpenazuniga/PennyPrompt/issues/228)).
+
+See [PennyPrompt-v2.md](PennyPrompt-v2.md) for the full original project specification.
 
 ## Contributing
 
