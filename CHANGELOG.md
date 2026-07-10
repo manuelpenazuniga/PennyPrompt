@@ -15,6 +15,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - `docs/GITHUB_BACKLOG.md` rewritten around the forward roadmap, with a consolidated differentiators section, the `phase:m7`-`m10` label scheme, and an honesty ledger of known gaps; alpha.6/beta.1 scope extended with `#230`-`#234`.
+- README fully revamped: comparison table vs LiteLLM/Portkey/Helicone/OpenRouter, real install command (`scripts/install.sh` instead of the aspirational `get.pennyprompt.dev`), real binary name (`penny-cli` instead of `pennyprompt`), CI/release badges, phased roadmap table, privacy section, and contributor on-ramp. Model names in examples aligned with the shipped pricebook.
 - README compatibility table now states the current inbound contract (OpenAI-compatible `/v1/chat/completions`); native Anthropic `/v1/messages` ingress is tracked for alpha.5 (`#207`). README roadmap now points at the backlog as the single source of truth.
 - `docs/LIMITATIONS.md` records the native Anthropic ingress gap (`#207`) and the prompt-cache accounting gap (`#208`) as dated, tracked limitations.
 
