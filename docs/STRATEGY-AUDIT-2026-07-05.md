@@ -1,6 +1,6 @@
 # PennyPrompt — Auditoría estratégica de avance y diferenciales
 
-**Fecha:** 2026-07-05
+**Fecha:** 2026-07-05 · **Revisión 1.1:** 2026-07-06 (añade §8 D7–D9, §10 palancas de adopción/GTM, amplía roadmap B/C con issues `#230`–`#234`, y corrige claims contra prior-art verificado de LiteLLM/MCP)
 **Rama auditada:** `feat/m6-issue-202-run-orchestration` (post `v0.1.0-alpha.3`, alpha.4 en curso)
 **Autor de la auditoría:** revisión asistida sobre el estado real del código, no sobre el copy de marketing.
 **Alcance:** avance del producto, seguridad, escalabilidad, funcionalidad, panorama competitivo, diferenciales actuales y propuestos, y un roadmap accionable para aumentar adopción.
@@ -191,6 +191,21 @@ Contra gateways SaaS (OpenRouter/Portkey managed) y contra Helicone (ahora en ma
 ### D6 — Composición explícita con routers (NadirClaw) como estándar
 Publicar la integración canónica `Agente → Router → PennyPrompt → Proveedor` con estimación *por modelo candidato*. "El router elige el modelo; PennyPrompt te dice cuánto cuesta cada opción y frena si te pasas." Convierte a un competidor potencial en un canal de distribución.
 
+### D7 — El bucle cost-aware: del guardián al órgano sensorial *(añadido rev. 1.1 — el diferencial estratégico mayor)*
+Todo lo anterior trata al agente como algo que hay que *vigilar* (bloquear, pausar, aprobar). El salto conceptual siguiente es darle al agente la señal para **autorregularse**: que sepa cuánto lleva gastado y cuánto le queda, *antes* de chocar contra el muro — y pueda elegir un modelo más barato, compactar contexto o parar solo.
+
+Dos mecanismos, en orden de fricción:
+1. **Headers de respuesta** (`X-Penny-Request-Cost-USD`, `X-Penny-Session-Cost-USD`, `X-Penny-Budget-Remaining-USD`, `X-Penny-Budget-Scope`) en cada respuesta proxied — integración cero (issue `#230`).
+2. **Servidor MCP de introspección** (`pennyprompt mcp`): el agente pregunta `get_budget_status` / `estimate_cost` al *mismo ledger que hace enforcement* (issue `#232`).
+
+**Prior-art (verificado, no sobre-prometer):** LiteLLM ya expone un header de costo por respuesta (`x-litellm-response-cost`) y headers de rate-limit restante; y existen MCP servers *medidores* de gasto independientes. Lo que **no existe** es el bucle cerrado con autoridad: *presupuesto restante en USD por los scopes que le importan a un agente (tarea/sesión), emitido por el mismo ledger atómico que va a devolver el 402*. El número del header es el número que te bloquea. Medidor pasivo ≠ guardrail introspectable. Combinado con la semántica 402 y el flujo de aprobación (D3), esto convierte a PennyPrompt en la única pieza que cierra el circuito percepción→decisión→enforcement.
+
+### D8 — Prueba de exactitud publicada: el benchmark de paridad de factura *(añadido rev. 1.1)*
+La marca es "cuando decimos $X, es $X" — pero un claim sin evidencia reproducible es solo marketing. Un harness que corre una carga de trabajo representativa (stream, tools, caché) contra proveedores reales y publica la desviación entre el costo reportado por PennyPrompt y el facturado por el proveedor (**objetivo: ≤1%**), re-ejecutable por terceros, convierte la exactitud en un *hecho verificable* y además actúa como red de regresión permanente del accounting (issue `#231`). Para un producto de confianza, la prueba **es** el marketing.
+
+### D9 — Visibilidad incrustada en el flujo del desarrollador *(añadido rev. 1.1)*
+`pennyprompt statusline`: un segmento de una línea (`$1.42 session · $6.20/hr · 62% day`, <50ms) embebible en la statusline de Claude Code/OpenClaw, starship o tmux (issue `#233`). El valor del producto queda a la vista todo el día **y aparece en cada captura de pantalla que el usuario comparte** — distribución orgánica incrustada en el flujo de trabajo, complementaria al TUI (`#218`).
+
 ---
 
 ## 9. Roadmap detallado hacia los diferenciales
@@ -221,8 +236,10 @@ Objetivo: features que la categoría gateway estructuralmente no tiene.
 - **B2. Circuit breaker con aprobación humana** (D3). Nueva acción `require_approval` además de `alert`/`pause`. Notificación desktop + resume vía CLI. Evento `ApprovalRequested`.
 - **B3. `pennyprompt run <agent>` real** (F4). `run openclaw -- <args>` levanta proxy efímero, inyecta base URL, adjunta atribución de tarea, tears down al terminar. Convierte el proxy en wrapper.
 - **B4. Webhooks/alertas salientes** (F6). Slack/Discord/desktop en bloqueo, burn-rate, aprobación. Config `[detect.webhooks]`.
+- **B5. Headers de cost-feedback** (D7, `#230`) *(rev. 1.1)*. Costo del request + presupuesto restante por scope en cada respuesta, emitidos por el ledger que hace enforcement. Barato de construir, abre el bucle cost-aware.
+- **B6. Benchmark de paridad de factura** (D8, `#231`) *(rev. 1.1)*. Solo tiene sentido después de A1+A2; secuenciarlo al final del tren. Publica la evidencia del criterio de salida de la Fase A.
 
-**Salida de fase:** PennyPrompt hace cosas que LiteLLM/Portkey no pueden hacer *por diseño*, no por falta de features.
+**Salida de fase:** PennyPrompt hace cosas que LiteLLM/Portkey no pueden hacer *por diseño*, no por falta de features — y la exactitud deja de ser un claim para ser un reporte reproducible.
 
 ### Fase C — "Expandir alcance sin diluir" (beta → v1) · *crecimiento*
 - **C1. Proveedores** (F3): Gemini/Google, passthrough OpenRouter, local (Ollama/vLLM). Cada uno abre un segmento.
@@ -230,6 +247,9 @@ Objetivo: features que la categoría gateway estructuralmente no tiene.
 - **C3. Feed de pricebook remoto firmado.** Mantener exactitud sin releases manuales; firma para no romper el modelo "sin scraping, sin llamadas externas no verificadas".
 - **C4. Diferencial de privacidad explícito** (D5): auditoría "cero telemetría", doc de soberanía de datos, quizá attestation.
 - **C5. Integración canónica con router** (D6): recetas NadirClaw, estimación multi-modelo.
+- **C6. Servidor MCP de introspección de presupuesto** (D7, `#232`) *(rev. 1.1)*. Cierra el bucle cost-aware: read-only, ≤5 tools, respaldado por el ledger de enforcement.
+- **C7. Statusline embebible** (D9, `#233`) *(rev. 1.1)*. <50ms, degradación elegante, recetas para Claude Code/OpenClaw/starship/tmux.
+- **C8. Canales de distribución** (`#234`) *(rev. 1.1)*. Homebrew tap, `cargo-binstall`, guías de integración de una página por agente. El multiplicador más barato de todo lo demás (ver §10).
 
 ### Fase D — "Team sin traicionar local-first" (v1+) · *solo si el mercado single-node se agota*
 - **D-1. Auth del admin plane** (S1): diseñar el contrato de token *ahora* (Fase A, sin implementar) para no rediseñar aquí.
@@ -240,16 +260,59 @@ Objetivo: features que la categoría gateway estructuralmente no tiene.
 
 ---
 
-## 10. Prioridad recomendada (si solo se hace una cosa por trimestre)
+## 10. Palancas de adopción (go-to-market) — *añadido rev. 1.1*
 
-1. **A1 + A2** (ingreso nativo Anthropic + prompt caching). Sin esto, la promesa central no se cumple para el usuario #1. Todo lo demás es secundario.
-2. **B2 + B4** (circuit breaker con aprobación + alertas). Es el diferencial más puro de "consciente de agentes" y el más difícil de copiar.
-3. **B3** (`run` real) + **C2** (dashboard). UX y marketing orgánico.
-4. **C1** (proveedores) para abrir segmentos, en el orden de mayor demanda observada.
+La revisión crítica de la v1.0 de este documento reveló su vacío mayor: era 100% producto. Pero para un proyecto open-source, **adopción = producto × distribución × confianza × visibilidad** — y tres de los cuatro factores no aparecían. Las fases A–D construyen el producto; esta sección construye el resto. Sin esto, un buen producto se queda en 30 estrellas.
+
+### 10.1 Confianza (la prueba es el marketing)
+Para un *guardrail de dinero*, la confianza no es un nice-to-have: es la única razón de compra. Palancas:
+- **Benchmark de paridad de factura publicado por release** (`#231`, D8). "≤1% de desviación, re-ejecútalo tú mismo" vale más que cualquier post.
+- **Cero telemetría verificable** (`#220`, D5): no es solo privacidad, es coherencia — un producto que vigila tu gasto no puede vigilarte a ti.
+- **Honesty ledger** en el backlog (ya existe): las brechas se publican con fecha e issue, no se esconden. Mantenerlo es una política, no un documento.
+- `cargo audit` como gate público (ya existe).
+
+### 10.2 Distribución (canales, `#234`)
+- **Homebrew tap + `cargo-binstall`**: el single binary es el diferencial de fricción; sin `brew install` está desaprovechado en el segmento macOS que domina el público objetivo.
+- **Guías de integración de una página por agente** (OpenClaw, claw-code, Cursor, Codex, Continue): el paste exacto + un paso de verificación. Cada guía es además una landing indexable ("openclaw cost limit", "cursor budget cap") — SEO orgánico de intención altísima.
+- **Listas y registries**: awesome-rust, awesome-llm; registries MCP cuando `#232` exista (cada registry es un canal).
+
+### 10.3 Visibilidad diaria (el producto se muestra solo)
+- **Statusline** (`#233`, D9) y **TUI** (`#218`): el costo en vivo aparece en la pantalla del dev todo el día y en cada captura que comparte. Marketing incrustado en el flujo de trabajo, coherente con cero telemetría: no rastreamos usuarios, los usuarios nos muestran.
+- **Headers** (`#230`): el prefijo `X-Penny-*` viaja en logs y debug de terceros — el nombre se propaga solo.
+
+### 10.4 Comunidad (convertir el patrón adapter en cantera)
+- Los **adaptadores de proveedor** (C1–C3) son el `good-first-issue` perfecto: patrón repetible, bien delimitado, con dos ejemplos de referencia en el árbol. Etiquetar y documentar "cómo añadir un proveedor" convierte la brecha F3 en cantera de contribuidores en vez de backlog propio.
+- Cada guía por agente (`#234`) termina con "¿tu agente no está? PR bienvenido" — el directorio de integraciones crece solo.
+
+### 10.5 Métricas norte sin telemetría
+Coherencia con D5: no se instrumenta al usuario. Se mide con señales públicas:
+- **Descargas de release por versión** (`gh api`), estrellas/semana, analytics públicas del tap de Homebrew.
+- **Issues/discusiones abiertos por terceros** — la señal de adopción real más fuerte que existe para un proyecto local-first.
+- North star sugerida: **descargas semanales de release** + **issues de no-mantenedores/mes**. Ritual: snapshot mensual en `docs/status-*.md`.
+
+### 10.6 Secuencia de lanzamiento ligada a los trenes de release
+La regla: **un solo gran disparo, y solo cuando la promesa sea demostrable.** Lanzar antes de la Fase A quemaría el único tiro de credibilidad (la brecha F1 sería el primer comentario del hilo).
+- **alpha.5** — sin promoción: es un release de corrección. Solo actualizar guías/README.
+- **alpha.6** — primer contenido técnico: "cómo funciona la reserva atómica de presupuesto", "invoice-parity report #1". Construye autoridad, no tráfico.
+- **beta.1** — **el lanzamiento** (Show HN, r/LocalLLaMA, lobste.rs): con paridad publicada, demo del bucle cost-aware (GIF statusline + TUI + un 402 salvando dinero), `brew install` funcionando y cinco guías por agente. Todo alineado en un solo momento.
+- **v1.0.0** — anuncio de estabilidad; homebrew-core, winget/apt (los registries "serios" exigen no-prerelease).
+
+### 10.7 Sostenibilidad (nota de una línea)
+GitHub Sponsors desde ya (fricción cero). Si algún día hay monetización, vive en el team-tier (v1+), **nunca** como gate de features locales: local-first gratis *es* el moat, no el cebo de un freemium.
 
 ---
 
-## 11. Riesgos estratégicos y anti-objetivos
+## 11. Prioridad recomendada (si solo se hace una cosa por trimestre)
+
+1. **A1 + A2** (ingreso nativo Anthropic + prompt caching). Sin esto, la promesa central no se cumple para el usuario #1. Todo lo demás es secundario.
+2. **B5 + B2 + B4** (headers cost-feedback + circuit breaker con aprobación + alertas). El bucle agente completo: percepción, decisión, enforcement. Es el diferencial más puro de "consciente de agentes" y el más difícil de copiar.
+3. **B6 + C8** (benchmark de paridad + canales de distribución). Confianza demostrable + fricción de instalación mínima = las precondiciones del lanzamiento de beta.1 (§10.6).
+4. **B3** (`run` real) + **C7/C2** (statusline + dashboard). UX y visibilidad orgánica.
+5. **C1 proveedores + C6 MCP** para abrir segmentos y cerrar el bucle cost-aware, en el orden de demanda observada.
+
+---
+
+## 12. Riesgos estratégicos y anti-objetivos
 
 - **Riesgo #1 — Competir como gateway genérico.** Si el roadmap deriva hacia "features de LiteLLM en Rust", se pierde. El foso es agente + local-first, no cobertura de 100 modelos.
 - **Riesgo #2 — Prometer team/enterprise antes de dominar el nicho.** Diluye el mensaje y el diseño. Mantener honestidad de alcance (ya se hace bien en los docs).
@@ -260,9 +323,9 @@ Objetivo: features que la categoría gateway estructuralmente no tiene.
 
 ---
 
-## 12. Síntesis en una frase
+## 13. Síntesis en una frase
 
-> **PennyPrompt no es "un gateway LLM más": es el primer guardrail de costos que trata al agente autónomo como lo que es —un bucle local con tarjeta de crédito— y lo hace en un binario de 15MB sin dependencias. El moat ya existe en el código. La adopción depende de cerrar dos brechas que rompen la promesa central (ingreso nativo Anthropic y contabilidad de caché) y de profundizar lo que ningún gateway genérico puede copiar: presupuesto por tarea y circuit-breaker con aprobación humana.**
+> **PennyPrompt no es "un gateway LLM más": es el primer guardrail de costos que trata al agente autónomo como lo que es —un bucle local con tarjeta de crédito— y lo hace en un binario de 15MB sin dependencias. El moat ya existe en el código. La adopción depende de tres movimientos en orden: (1) cerrar las dos brechas que rompen la promesa central (ingreso nativo Anthropic y contabilidad de caché), (2) construir lo que ningún gateway genérico puede copiar —presupuesto por tarea, circuit-breaker con aprobación humana y el bucle cost-aware donde el mismo ledger que bloquea es el que informa al agente—, y (3) lanzar una sola vez, con la exactitud demostrada por un benchmark de paridad reproducible y la instalación a un comando de distancia.**
 
 ---
 
@@ -284,3 +347,7 @@ Objetivo: features que la categoría gateway estructuralmente no tiene.
 - [LLM Gateway 2026: OpenRouter vs LiteLLM vs Portkey vs Helicone](https://klymentiev.com/blog/llm-gateway-guide)
 - [Best LLM Gateways 2026 — Braintrust](https://www.braintrust.dev/articles/best-llm-gateways-2026)
 - [7 Best OpenRouter Alternatives 2026](https://ofox.ai/blog/openrouter-alternatives-2026/)
+
+Prior-art verificado para D7 (rev. 1.1):
+- [LiteLLM — Response Headers](https://docs.litellm.ai/docs/proxy/response_headers) (`x-litellm-response-cost`, rate-limit remaining) — costo por respuesta existe; presupuesto-restante-USD por tarea/sesión desde el ledger de enforcement, no.
+- [LLM Usage & Cost Tracker (MCP, Glama)](https://glama.ai/mcp/servers/zhaoyue722/llm-usage-mcp) y [Agent Budget Guard](https://earezki.com/ai-news/2026-03-02-i-built-an-mcp-server-so-my-ai-agent-can-track-its-own-spending/) — medidores MCP pasivos existen; introspección respaldada por el guardrail que bloquea, no.

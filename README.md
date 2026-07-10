@@ -413,8 +413,8 @@ The single source of truth for the roadmap is [docs/GITHUB_BACKLOG.md](docs/GITH
 - [x] **M1-M6 / Alpha** — Proxy, atomic budgets, loop detection, estimation, reports, presets, real providers, streaming, release automation (shipped through `v0.1.0-alpha.3`).
 - [~] **`v0.1.0-alpha.4`** — Operator usability: serve daemon, `run` orchestration, installer smoke check ([#199](https://github.com/manuelpenazuniga/PennyPrompt/issues/199)).
 - [ ] **`v0.1.0-alpha.5` — Compatibility & cost accuracy** — Native Anthropic ingress, prompt-cache accounting, concurrency limits ([#225](https://github.com/manuelpenazuniga/PennyPrompt/issues/225)).
-- [ ] **`v0.1.0-alpha.6` — Agent-aware moat** — Per-task budgets, human-in-the-loop circuit breaker, real `run` wrapper, alert webhooks ([#226](https://github.com/manuelpenazuniga/PennyPrompt/issues/226)).
-- [ ] **`v0.1.0-beta.1` — Scope expansion** — Gemini/local/OpenRouter providers, live TUI dashboard, signed pricebook feed, sovereignty & router-composition docs ([#227](https://github.com/manuelpenazuniga/PennyPrompt/issues/227)).
+- [ ] **`v0.1.0-alpha.6` — Agent-aware moat** — Per-task budgets, human-in-the-loop circuit breaker, real `run` wrapper, alert webhooks, cost-feedback headers, published invoice-parity benchmark ([#226](https://github.com/manuelpenazuniga/PennyPrompt/issues/226)).
+- [ ] **`v0.1.0-beta.1` — Scope expansion** — Gemini/local/OpenRouter providers, live TUI dashboard, MCP budget introspection, statusline segment, Homebrew/binstall distribution, signed pricebook feed, sovereignty & router-composition docs ([#227](https://github.com/manuelpenazuniga/PennyPrompt/issues/227)).
 - [ ] **`v1.0.0` — Team without betraying local-first** — Admin auth, optional PostgreSQL, read-pool split, durable detector state ([#228](https://github.com/manuelpenazuniga/PennyPrompt/issues/228)).
 
 See [PennyPrompt-v2.md](PennyPrompt-v2.md) for the full original project specification.

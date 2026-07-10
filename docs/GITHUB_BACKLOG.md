@@ -10,14 +10,15 @@ Current baseline:
 - Latest published release: `v0.1.0-alpha.3`, published 2026-06-20 as a GitHub prerelease.
 - In-flight release train: `v0.1.0-alpha.4` (operator usability) — `#201` and `#202`
   merged; `#203` installer smoke check open.
-- Capture date: 2026-07-05, after the strategic audit
-  (`docs/STRATEGY-AUDIT-2026-07-05.md`) established the post-alpha.4 roadmap.
+- Capture date: 2026-07-06, after the strategic audit
+  (`docs/STRATEGY-AUDIT-2026-07-05.md`, rev. 1.1) established the post-alpha.4 roadmap
+  and the go-to-market track (§10 of the audit).
 - Active forward roadmap: Phases A-D below (`v0.1.0-alpha.5` → `v1.0.0`).
 
 Source of truth for this backlog:
-- The strategic audit: `docs/STRATEGY-AUDIT-2026-07-05.md`.
+- The strategic audit: `docs/STRATEGY-AUDIT-2026-07-05.md` (rev. 1.1).
 - GitHub epics `#225` (alpha.5), `#226` (alpha.6), `#227` (beta.1), `#228` (v1.0.0),
-  plus child issues `#207`-`#224`.
+  plus child issues `#207`-`#224` and `#230`-`#234`.
 - In-flight alpha.4 epic `#199` and child `#203`.
 - Closed alpha.3 epic `#186` and blockers `#183`, `#184`, `#185`, `#189`, `#190`, `#196`.
 - Implementation reality in `crates/`.
@@ -71,7 +72,14 @@ Full competitive analysis: `docs/STRATEGY-AUDIT-2026-07-05.md` §3-§4.
 
 Differentiators to *deepen* next (roadmap): perfect native-agent compatibility (Phase A),
 cache-accurate cost receipts (Phase A), human-in-the-loop circuit breaker and per-task
-budgets (Phase B), explicit data-sovereignty and router composition (Phase C).
+budgets (Phase B), **the cost-aware loop** — budget-remaining feedback emitted by the same
+enforcing ledger, via response headers (Phase B `#230`) and MCP introspection (Phase C
+`#232`) — **published invoice-parity proof** (Phase B `#231`), in-workflow visibility via
+statusline (Phase C `#233`), and explicit data-sovereignty and router composition (Phase C).
+
+Adoption is product × distribution × trust × visibility; the non-product levers
+(launch sequencing, channels `#234`, no-telemetry metrics) are defined in the audit §10
+and are part of each phase's exit, not an afterthought.
 
 ---
 
@@ -94,7 +102,7 @@ The `phase:mX` labels continue the original M1-M6 milestone scheme into the forw
 Sequencing principle: **close the two gaps that break the core promise first (Phase A),
 then deepen the agent-aware moat (Phase B), then expand scope (Phase C), and only then
 pursue team/scale (Phase D).** Expanding before the promise is fulfilled builds on an
-unfulfilled promise. Rationale: `docs/STRATEGY-AUDIT-2026-07-05.md` §9-§11.
+unfulfilled promise. Rationale: `docs/STRATEGY-AUDIT-2026-07-05.md` §9-§12.
 
 ### Phase A — `v0.1.0-alpha.5` — Compatibility & cost accuracy · Epic `#225`
 
@@ -118,10 +126,14 @@ Build what the generic gateway category structurally cannot.
 - [ ] `#212` — feat(detect): human-in-the-loop circuit breaker (`require_approval`)
 - [ ] `#213` — feat(cli): `pennyprompt run <agent>` real orchestration
 - [ ] `#214` — feat(detect): outbound alert webhooks and desktop notifications
+- [ ] `#230` — feat(proxy): cost-feedback response headers (budget remaining per scope)
+- [ ] `#231` — test(cost): invoice-parity benchmark harness and published report (sequence last; needs `#207`/`#208`)
 
 Exit: `run --task-budget` gives a hard per-run cap; approval threshold pauses and
 requires explicit approval; alerts reach a webhook/desktop with no sensitive payload and
-no hot-path impact.
+no hot-path impact; every proxied response carries ledger-consistent cost/budget-remaining
+headers; a reproducible invoice-parity report is published (target ≤1% deviation on
+provider-usage-reported workloads).
 
 ### Phase C — `v0.1.0-beta.1` — Scope expansion · Epic `#227`
 
@@ -133,10 +145,19 @@ Widen reach and sharpen positioning without diluting the moat.
 - [ ] `#218` — feat(cli): live TUI dashboard
 - [ ] `#219` — feat(cost): signed remote pricebook feed sync
 - [ ] `#220` — docs: data-sovereignty positioning and router composition guide
+- [ ] `#232` — feat(cli): MCP budget introspection server (cost-aware agents)
+- [ ] `#233` — feat(cli): statusline integration (live session cost segment)
+- [ ] `#234` — chore(release): distribution channels — Homebrew tap, cargo-binstall, per-agent guides
 
 Exit: Gemini + local models route/stream/reconcile; live TUI dashboard renders and
 degrades gracefully; `prices update --remote` verifies a signed feed atomically;
-sovereignty + router docs published; README differentiators consolidated.
+sovereignty + router docs published; README differentiators consolidated; an MCP client
+can query budget status from the enforcing ledger (read-only); a <50ms statusline segment
+is documented for Claude Code/OpenClaw/tmux; `brew install` (tap) and `cargo binstall`
+resolve the latest release with five per-agent integration guides published.
+
+Beta.1 is also **the launch release** (audit §10.6): one shot, taken only when invoice
+parity is published, the cost-aware loop is demoable, and install is one command.
 
 ### Phase D — `v1.0.0` — Team without betraying local-first · Epic `#228`
 
