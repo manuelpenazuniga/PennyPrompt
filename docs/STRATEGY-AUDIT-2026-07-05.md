@@ -1,286 +1,353 @@
-# PennyPrompt — Auditoría estratégica de avance y diferenciales
+# PennyPrompt — Strategic Audit: Progress & Differentiators
 
-**Fecha:** 2026-07-05
-**Rama auditada:** `feat/m6-issue-202-run-orchestration` (post `v0.1.0-alpha.3`, alpha.4 en curso)
-**Autor de la auditoría:** revisión asistida sobre el estado real del código, no sobre el copy de marketing.
-**Alcance:** avance del producto, seguridad, escalabilidad, funcionalidad, panorama competitivo, diferenciales actuales y propuestos, y un roadmap accionable para aumentar adopción.
+**Date:** 2026-07-05 · **Revision 1.1:** 2026-07-06 (adds §8 D7–D9, §10 adoption/GTM levers, extends roadmap B/C with issues `#230`–`#234`, and corrects claims against verified LiteLLM/MCP prior art)
+**Branch audited:** `feat/m6-issue-202-run-orchestration` (post `v0.1.0-alpha.3`, alpha.4 in flight)
+**Audit author:** assisted review against the real state of the code, not the marketing copy.
+**Scope:** product progress, security, scalability, functionality, competitive landscape, current and proposed differentiators, and an actionable roadmap to grow adoption.
 
-> Nota de método: todas las afirmaciones sobre el estado del producto se contrastaron contra `crates/`, `migrations/`, `prices/`, `presets/` y los docs de release. Donde el README promete algo que el código todavía no cumple, se marca explícitamente como **brecha**, porque una brecha entre promesa y superficie real es exactamente lo que frena la adopción.
-
----
-
-## 0. TL;DR ejecutivo
-
-PennyPrompt ya es un producto real, no un prototipo: ~19.5k líneas de Rust, 12 crates con fronteras limpias, 190 tests, ledger atómico con `BEGIN IMMEDIATE`, dinero en enteros (micros), tres releases alpha publicados y automatización de release funcionando. **El núcleo financiero es sólido y defendible.**
-
-Pero el producto está posicionado como "guardrail de costos para agentes de IA que funciona con tu agente sin cambiar nada", y hay **dos brechas que atacan directamente esa promesa central**:
-
-1. **No hay ingreso nativo Anthropic (`/v1/messages`).** El proxy solo acepta formato OpenAI (`/v1/chat/completions`). Los agentes tipo OpenClaw/claw-code que el propio README nombra como target primario hablan Messages API nativo. Hoy, apuntar `ANTHROPIC_BASE_URL` al proxy da 404 en la ruta que el agente realmente usa.
-2. **No se contabiliza el prompt caching de Anthropic.** Los agentes de código reutilizan contextos enormes con caché; sin leer `cache_read_input_tokens`/`cache_creation_input_tokens`, el costo reportado es sistemáticamente incorrecto justo en el caso de uso estrella.
-
-La tesis de esta auditoría: **el foso (moat) de PennyPrompt no es "otro gateway LLM" — ese espacio está saturado (LiteLLM, Portkey, Helicone, OpenRouter). El foso es ser el único guardrail *local-first, cero-dependencias, consciente de agentes autónomos*, con enforcement atómico *antes* del gasto.** Las dos brechas de arriba, más 4-5 diferenciales nuevos que se detallan abajo, son lo que convierte ese foso en adopción.
+> Method note: every claim about product state was checked against `crates/`, `migrations/`, `prices/`, `presets/`, and the release docs. Wherever the README promises something the code does not yet deliver, it is explicitly flagged as a **gap**, because a promise/reality gap is exactly what blocks adoption.
 
 ---
 
-## 1. El dolor real que resolvemos (máxima abstracción)
+## 0. Executive TL;DR
 
-Subiendo un nivel de abstracción sobre "controlar costos": el dolor de fondo tiene tres capas.
+PennyPrompt is already a real product, not a prototype: ~19.5k lines of Rust, 12 crates with clean boundaries, 190 tests, an atomic ledger using `BEGIN IMMEDIATE`, integer money (micros), three published alpha releases, and working release automation. **The financial core is solid and defensible.**
 
-**Capa 1 — Pérdida de control sobre un gasto que se volvió variable de golpe.**
-El evento fundacional (el fin de la tarifa plana para 135k instancias de OpenClaw el 2026-04-04) convirtió un costo *fijo y predecible* en uno *variable, invisible y potencialmente ilimitado*. El agente autónomo es un proceso que gasta dinero real en un bucle, sin un humano mirando cada iteración. Es la primera vez que el desarrollador individual tiene un proceso local que puede quemar $50 mientras almuerza.
+But the product is positioned as "cost guardrails for AI agents that work with your agent without changing anything", and there are **two gaps that attack that central promise directly**:
 
-**Capa 2 — Asimetría de información temporal.**
-El costo se conoce *después* de incurrirlo. Los dashboards de proveedor son agregados y con retraso. El desarrollador no puede responder tres preguntas básicas *en el momento en que importan*:
-- *Antes:* "¿cuánto me va a costar esta tarea?" → hoy no tiene respuesta.
-- *Durante:* "¿esto se está yendo de las manos ahora mismo?" → hoy se entera por la factura.
-- *Después:* "¿en qué se fue exactamente el dinero?" → hoy solo ve un total.
+1. **No native Anthropic ingress (`/v1/messages`).** The proxy only accepts the OpenAI format (`/v1/chat/completions`). OpenClaw/claw-code-style agents — the README's own primary target — speak the native Messages API. Today, pointing `ANTHROPIC_BASE_URL` at the proxy 404s on the route the agent actually calls.
+2. **Anthropic prompt caching is not accounted.** Coding agents reuse huge contexts with caching; without reading `cache_read_input_tokens`/`cache_creation_input_tokens`, the reported cost is systematically wrong in exactly the flagship use case.
 
-PennyPrompt existe para colapsar esa asimetría: **estimar antes, proteger durante, explicar después.**
-
-**Capa 3 — El agente no es un usuario, es un bucle.**
-Esta es la abstracción clave que separa a PennyPrompt de todos los gateways genéricos. Un gateway LLM tradicional modela *aplicaciones con usuarios* (claves virtuales, rate limits por API key, tags por equipo). Un agente autónomo modela *un proceso que reintenta, compacta memoria, y puede entrar en bucles de fallo*. El fallo económico característico de un agente —reintentar la misma tool fallida 30 veces— **no tiene análogo en el mundo de las apps** y por eso los gateways genéricos no lo detectan. PennyPrompt trata el agente como lo que es: un bucle con tarjeta de crédito.
-
-> **El público que siente este dolor con más agudeza:** el desarrollador indie y el equipo pequeño (2-10) que corre agentes de código autónomos localmente, que fue expulsado de la tarifa plana, y para quien levantar un LiteLLM + PostgreSQL + Redis en la nube es desproporcionado. Ese es el wedge de adopción.
+This audit's thesis: **PennyPrompt's moat is not "another LLM gateway" — that space is saturated (LiteLLM, Portkey, Helicone, OpenRouter). The moat is being the only *local-first, zero-dependency, autonomous-agent-aware* guardrail with atomic enforcement *before* the spend.** The two gaps above, plus the new differentiators detailed below, are what turn that moat into adoption.
 
 ---
 
-## 2. Estado del avance (qué está construido y con qué madurez)
+## 1. The real pain we solve (maximum abstraction)
 
-| Área | Estado | Evidencia |
-|------|--------|-----------|
-| Workspace / arquitectura | ✅ Sólido | 12 crates, grafo de dependencias limpio (leaf `penny-types`/`penny-config`), 19.5k LOC |
-| Núcleo financiero (ledger) | ✅ Sólido | `reserve/reconcile/release`, `BEGIN IMMEDIATE`, tests de concurrencia |
-| Tipo dinero | ✅ Sólido | `Money(i64)` en micros — migraciones 0008/0009 movieron todo a enteros. Sin deriva de float |
-| Presupuestos + modos | ✅ Funciona | observe/guard, fail-closed en guard, soft/hard, ventanas day/week/month |
-| Detección de bucles | ✅ Funciona | burn-rate, fallos de tool repetidos, similitud de contenido (sha256 de primeros 500 chars) |
-| Adaptadores de proveedor | 🟡 Parcial | Anthropic + OpenAI + Mock. Streaming SSE en ambos. Solo 2 proveedores reales |
-| Pricebook | 🟡 Parcial | Local versionado; 7 modelos Anthropic + 3 OpenAI. Sin feed remoto firmado |
-| Superficie de ingreso proxy | 🔴 Brecha | Solo `/v1/chat/completions`. **Sin `/v1/messages` nativo Anthropic** |
-| Prompt caching accounting | 🔴 Brecha | No se leen tokens de caché → costo incorrecto en agentes de código |
-| Admin plane | 🟡 Intencional | Reports, budgets, health, SSE de eventos. **Sin auth** (documentado como local-only) |
-| CLI | ✅ Rico | init, serve, estimate, run, report, budget, detect, tail, doctor, prices, config, dashboard |
-| `serve --daemon` | ✅ Nuevo (alpha.4) | #201 |
-| `run <agent>` orquestación | 🟡 Mínimo | #202 — dry-run + `--execute` limitado a agentes que respetan base URL OpenAI-compatible |
-| Release / CI | ✅ Maduro | `cargo audit` como gate, checksums, matriz multi-arch, 3 alphas publicados |
+Going one level of abstraction above "controlling costs": the underlying pain has three layers.
 
-**Lectura:** el proyecto ejecutó M1–M6 con disciplina. La deuda no está en el núcleo (que es la parte difícil y está bien hecha) sino en la **superficie de compatibilidad** y en algunos **detalles de exactitud de costo** que, paradójicamente, son los que el usuario *ve primero*.
+**Layer 1 — Loss of control over a spend that became variable overnight.**
+The founding event (the end of flat-rate pricing for 135k OpenClaw instances on 2026-04-04) turned a *fixed, predictable* cost into a *variable, invisible, potentially unbounded* one. An autonomous agent is a process that spends real money in a loop, with no human watching each iteration. It is the first time the individual developer has a local process that can burn $50 while they're at lunch.
 
----
+**Layer 2 — Temporal information asymmetry.**
+Cost is known *after* it is incurred. Provider dashboards are aggregate and delayed. The developer cannot answer three basic questions *at the moment they matter*:
+- *Before:* "how much will this task cost me?" → no answer today.
+- *During:* "is this getting out of hand right now?" → today they find out from the invoice.
+- *After:* "where exactly did the money go?" → today they only see a total.
 
-## 3. Panorama competitivo — alternativas en otros repos y dónde está OpenClaw
+PennyPrompt exists to collapse that asymmetry: **estimate before, protect during, explain after.**
 
-El error estratégico a evitar es competir en la categoría equivocada. Hay tres categorías y PennyPrompt solo debería pelear en una.
+**Layer 3 — The agent is not a user, it is a loop.**
+This is the key abstraction that separates PennyPrompt from every generic gateway. A traditional LLM gateway models *applications with users* (virtual keys, per-API-key rate limits, team tags). An autonomous agent models *a process that retries, compacts memory, and can enter failure loops*. An agent's characteristic economic failure — retrying the same failed tool 30 times — **has no analogue in the app world**, which is why generic gateways don't detect it. PennyPrompt treats the agent as what it is: a loop with a credit card.
 
-### 3.1 Los gateways/observabilidad (la categoría saturada — NO competir de frente)
-
-| Herramienta | Qué es | Enforcement de presupuesto | Requisitos | Orientación |
-|-------------|--------|----------------------------|------------|-------------|
-| **LiteLLM** | Proxy Python, 100+ LLMs | `max_budget` por key/user/team, ventanas múltiples | **PostgreSQL + Redis** | Equipos/nube, claves virtuales |
-| **Portkey** | LLMOps full-stack; gateway open-source (Apache 2.0, mar-2026) | Presupuestos + guardrails, PII redaction, jailbreak detection | Gateway self-host + plataforma | Producción/enterprise |
-| **Helicone** | Observabilidad + proxy ligero, open-source | Tracking + rate limiting | Self-host o SaaS | Logging/analítica. **Adquirido por Mintlify 2026, en modo mantenimiento** |
-| **OpenRouter** | Agregador hosted, 300+ modelos | — (marca 5.5% fee) | Ninguno (SaaS) | Simplicidad, una API key |
-
-**Conclusión:** todos estos modelan *aplicaciones con usuarios* y casi todos hacen tracking de gasto *después* de la llamada (o límites blandos). LiteLLM es el más cercano en features de presupuesto, pero su enforcement no es una reserva atómica pre-dispatch a prueba de concurrencia, y su costo de operación (Python + Postgres + Redis) es desproporcionado para un dev individual. **PennyPrompt pierde si intenta ser "LiteLLM pero en Rust". Gana si es la categoría de al lado.**
-
-### 3.2 Los routers (complementarios — componer, no competir)
-
-NadirClaw y similares *eligen el modelo*. PennyPrompt explícitamente **no** es un router (lo dice el README y es correcto). La cadena natural es `Agente → NadirClaw → PennyPrompt → Proveedor`. Esto es un activo: no hay que construir routing, hay que integrarse limpiamente con él.
-
-### 3.3 Dónde está OpenClaw (el hospedero del dolor)
-
-OpenClaw (y claw-code) es el **agente autónomo de código** que vive en la terminal del desarrollador y que sufrió el cambio de tarifa. No es un competidor: **es el sustrato sobre el que PennyPrompt se instala**. La pregunta estratégica no es "¿cómo le gano a OpenClaw?" sino "¿cómo me vuelvo la capa por defecto que todo usuario de OpenClaw instala el día 1?". Eso exige:
-- Compatibilidad nativa perfecta con cómo OpenClaw habla (→ brecha `/v1/messages`).
-- Exactitud de costo en el patrón real de OpenClaw (→ brecha prompt caching).
-- Fricción cero de instalación (single binary — **esto ya lo tenemos y es enorme**).
+> **The audience that feels this pain most acutely:** the indie developer and the small team (2-10) running autonomous coding agents locally, who were pushed off flat-rate pricing, and for whom standing up LiteLLM + PostgreSQL + Redis in the cloud is disproportionate. That is the adoption wedge.
 
 ---
 
-## 4. Nuestros diferenciales ACTUALES (lo que ya nos separa)
+## 2. Progress state (what is built and how mature)
 
-Estos son reales y ya están en el código. Hay que protegerlos y hacerlos legibles en el mensaje.
+| Area | State | Evidence |
+|------|-------|----------|
+| Workspace / architecture | ✅ Solid | 12 crates, clean dependency graph (leaf `penny-types`/`penny-config`), 19.5k LOC |
+| Financial core (ledger) | ✅ Solid | `reserve/reconcile/release`, `BEGIN IMMEDIATE`, concurrency tests |
+| Money type | ✅ Solid | `Money(i64)` in micros — migrations 0008/0009 moved everything to integers. No float drift |
+| Budgets + modes | ✅ Works | observe/guard, fail-closed in guard, soft/hard, day/week/month windows |
+| Loop detection | ✅ Works | burn-rate, repeated tool failures, content similarity (sha256 of first 500 chars) |
+| Provider adapters | 🟡 Partial | Anthropic + OpenAI + Mock. SSE streaming in both. Only 2 real providers |
+| Pricebook | 🟡 Partial | Local, versioned; 7 Anthropic + 3 OpenAI models. No signed remote feed |
+| Proxy ingress surface | 🔴 Gap | Only `/v1/chat/completions`. **No native Anthropic `/v1/messages`** |
+| Prompt caching accounting | 🔴 Gap | Cache tokens not read → wrong cost for coding agents |
+| Admin plane | 🟡 Intentional | Reports, budgets, health, event SSE. **No auth** (documented as local-only) |
+| CLI | ✅ Rich | init, serve, estimate, run, report, budget, detect, tail, doctor, prices, config, dashboard |
+| `serve --daemon` | ✅ New (alpha.4) | #201 |
+| `run <agent>` orchestration | 🟡 Minimal | #202 — dry-run + `--execute` limited to agents honoring an OpenAI-compatible base URL |
+| Release / CI | ✅ Mature | `cargo audit` as gate, checksums, multi-arch matrix, 3 published alphas |
 
-1. **Local-first, single binary, cero dependencias externas.** ~15MB, SQLite embebido, sin PostgreSQL/Redis/Docker. Contra LiteLLM/Portkey esto es un diferencial de *fricción* y de *privacidad* (el tráfico no sale de la máquina salvo hacia el proveedor). Para el dev indie es la diferencia entre "lo instalo en 2 min" y "no lo instalo".
-
-2. **Enforcement atómico *antes* del gasto (reserva en ledger).** RESERVE→DISPATCH→RECONCILE en una transacción SQLite con `BEGIN IMMEDIATE`. La mayoría de competidores contabilizan *después*; PennyPrompt bloquea la request N+1 que rompería el límite, y es correcto bajo concurrencia. Es un diferencial *técnico y verificable*.
-
-3. **Semántica HTTP 402 pensada para agentes, no 429.** El agente reintenta 429; 402 `retryable:false` le dice "para y pregúntale al humano". Es un detalle pequeño con impacto enorme en un bucle autónomo. Ningún gateway genérico piensa en esto.
-
-4. **Detección de bucles de agente (burn-rate, fallos de tool, similitud).** Feature que *no existe* en la categoría gateway porque nace de modelar el agente como bucle. Es el diferencial más difícil de copiar porque requiere pensar en agentes, no en apps.
-
-5. **Auto-atribución sin headers custom** (proyecto por git root, sesión por ventana temporal). Reports útiles desde la primera request, cero config. Los competidores exigen claves virtuales o tags.
-
-6. **Estimación pre-ejecución** ("¿cuánto costará esto?"). Rara en el mercado; responde la pregunta *antes* que casi nadie más responde.
-
-7. **Núcleo financiero correcto por diseño** (dinero en enteros micros, ledger append-only auditable). Confianza: cuando el producto dice "$4.23", es $4.23.
-
----
-
-## 5. Hallazgos de seguridad
-
-Ordenados por relevancia para adopción/operación real.
-
-| # | Hallazgo | Severidad | Nota |
-|---|----------|-----------|------|
-| S1 | **Admin plane sin autenticación.** No hay bearer/admin-token (confirmado: cero referencias a auth en `penny-admin`). | Media (mitigada por diseño) | Ya documentado como local-only y loopback/unix-socket. Aceptable para alpha, pero es un **techo de adopción** para el salto a "team". Cualquier proceso local puede leer reports y **mutar budgets** vía `POST /admin/budgets` → efectivamente desactivar el guardrail. |
-| S2 | **Sin ruta de reset/gestión de claves de proveedor.** Las API keys se leen de env (`api_key_env`). Bien (no se persisten), pero no hay rotación ni scoping. | Baja | Correcto para alpha; documentar que las keys nunca tocan la DB es un *punto de venta de privacidad*. |
-| S3 | **SQL dinámico en reports** (group key / join variant). | Baja (controlada) | Ya auditado: fragmentos vienen de enums, filtros usan bind params. Mantener el guardrail y migrar a query-builder si crece. |
-| S4 | **`cargo audit` como gate** ya integrado (rustls-webpki refrescado). | ✅ Positivo | Buena higiene. Mantener el gate en cada release. |
-| S5 | **Cleanup de payload / strip ANSI** en el proxy. | ✅ Positivo | Reduce superficie de inyección de secuencias de terminal en outputs que el operador ve en `tail`. |
-
-**Recomendación de seguridad de mayor palanca:** convertir la ausencia de auth de "limitación" en una *decisión de arquitectura con puerta de salida*: mantener local-only por defecto, pero diseñar ya el contrato de token admin (aunque no se implemente) para que "team mode" no requiera rediseño. La mutación de budgets vía admin sin auth es el riesgo más concreto: un agente comprometido que descubra el puerto admin puede subir su propio límite.
+**Reading:** the project executed M1–M6 with discipline. The debt is not in the core (the hard part, and it is well built) but in the **compatibility surface** and some **cost-accuracy details** which, paradoxically, are what the user *sees first*.
 
 ---
 
-## 6. Hallazgos de escalabilidad
+## 3. Competitive landscape — alternatives in other repos and where OpenClaw sits
 
-| # | Hallazgo | Impacto | Recomendación |
-|---|----------|---------|---------------|
-| E1 | **`max_connections(1)` en el pool SQLite.** Serializa *todas* las operaciones, no solo las escrituras de reserva. | Techo de throughput bajo concurrencia de muchos agentes/sesiones simultáneas. | Correcto para consistencia local single-node. Para escalar lecturas: separar un pool de lectura (WAL permite lectores concurrentes) del único escritor. Medir antes de optimizar. |
-| E2 | **Detección de bucles en memoria** (`HashMap<SessionId, SessionWindow>` con `RwLock`). | Estado no persistente: un restart pierde ventanas y sesiones pausadas. | Aceptable para alpha. Documentar que `detect resume` y el estado de pausa no sobreviven restart. Para v1, considerar snapshot ligero. |
-| E3 | **Sin backpressure explícito ni límite de conexiones entrantes** en el proxy. | Un agente que abra muchas conexiones puede saturar el único writer. | Añadir límite de concurrencia (tower `ConcurrencyLimit`) y timeouts de upstream configurables. |
-| E4 | **Un solo nodo, un solo archivo SQLite.** | Multi-máquina / team compartido no soportado. | Ya es no-objetivo de alpha (correcto). PostgreSQL es el camino v1 para team, pero **no antes** de agotar el mercado single-node. |
-| E5 | **Pricebook y reconciliación cargan bien**, pero **el reconcile de streaming depende de estimación** cuando el proveedor no manda usage. | Exactitud de costo degradada en streams sin usage final. | Ligado a la brecha de prompt caching (§7). Priorizar exactitud sobre throughput: es la promesa de marca. |
+The strategic mistake to avoid is competing in the wrong category. There are three categories and PennyPrompt should only fight in one.
 
-**Lectura:** la escalabilidad *actual* es la correcta para el público objetivo (single-node local). El riesgo estratégico no es "no escala a 1000 nodos" (no es el mercado) sino **presentar el producto como team-ready antes de tiempo**. Mantener el mensaje honesto: "guardrail local para tu máquina/equipo pequeño".
+### 3.1 Gateways/observability (the saturated category — do NOT compete head-on)
 
----
+| Tool | What it is | Budget enforcement | Requirements | Orientation |
+|------|-----------|--------------------|--------------|-------------|
+| **LiteLLM** | Python proxy, 100+ LLMs | `max_budget` per key/user/team, multiple windows | **PostgreSQL + Redis** | Teams/cloud, virtual keys |
+| **Portkey** | Full-stack LLMOps; open-source gateway (Apache 2.0, Mar 2026) | Budgets + guardrails, PII redaction, jailbreak detection | Self-host gateway + platform | Production/enterprise |
+| **Helicone** | Observability + light proxy, open-source | Tracking + rate limiting | Self-host or SaaS | Logging/analytics. **Acquired by Mintlify 2026, maintenance mode** |
+| **OpenRouter** | Hosted aggregator, 300+ models | — (5.5% fee) | None (SaaS) | Simplicity, one API key |
 
-## 7. Hallazgos funcionales / brechas de producto (las que mueven adopción)
+**Conclusion:** all of these model *applications with users* and almost all track spend *after* the call (or with soft limits). LiteLLM is the closest on budget features, but its enforcement is not a concurrency-proof atomic pre-dispatch reservation, and its operating cost (Python + Postgres + Redis) is disproportionate for an individual dev. **PennyPrompt loses if it tries to be "LiteLLM but in Rust". It wins by being the category next door.**
 
-Ordenadas por impacto en la promesa central "funciona con tu agente sin cambios".
+### 3.2 Routers (complementary — compose, don't compete)
 
-### F1 — 🔴 Sin ingreso nativo Anthropic (`/v1/messages`) — **la brecha #1**
-El router del proxy registra exactamente tres rutas: `/v1/chat/completions`, `/v1/models`, `/internal/health`. No hay `/v1/messages`. El `AnthropicProvider` traduce **salida** al formato Anthropic, pero **no hay superficie de entrada** para un cliente que hable Messages API nativo. Como OpenClaw/claw-code (el target primario declarado) hablan Anthropic nativo, apuntar `ANTHROPIC_BASE_URL=http://localhost:8585/v1` haría que el agente golpee `/v1/messages` → 404. **Esto contradice la tabla de compatibilidad del README.** Es la corrección de mayor ROI de todo el backlog: sin ella, el eslogan de fricción-cero no se cumple para el usuario más importante.
+NadirClaw and similar tools *pick the model*. PennyPrompt explicitly is **not** a router (the README says so, and it is correct). The natural chain is `Agent → NadirClaw → PennyPrompt → Provider`. This is an asset: no routing needs to be built, only clean integration with it.
 
-### F2 — 🔴 Sin contabilidad de prompt caching — **la brecha #2**
-No se leen `cache_creation_input_tokens` ni `cache_read_input_tokens` (cero referencias en `penny-cost`/`penny-providers`/`penny-types`). Los agentes de código usan caché de prompt de forma agresiva (contexto de repo reutilizado). Un read cacheado cuesta ~10% del input normal y una escritura de caché ~125%; ignorarlos **sobreestima o subestima el costo real de forma material** en exactamente el flujo estrella. La marca es "cuando decimos $X, es $X" — esta brecha la erosiona en silencio.
+### 3.3 Where OpenClaw sits (the host of the pain)
 
-### F3 — 🟡 Cobertura de proveedores estrecha
-Solo Anthropic + OpenAI. Sin Google/Gemini, sin OpenRouter passthrough, sin local (Ollama/vLLM). Muchos devs indie corren modelos locales o mezclan proveedores. Cada proveedor ausente es un segmento que no puede adoptar.
-
-### F4 — 🟡 `run <agent>` todavía mínimo
-Dry-run + `--execute` limitado a agentes que respetan base URL OpenAI-compatible. Es la pieza que convertiría a PennyPrompt de "proxy que configuras" a "wrapper que ejecutas" (`pennyprompt run openclaw -- ...`). Alta palanca de UX pero correctamente acotada por ahora.
-
-### F5 — 🟡 Sin dashboard en vivo (solo `tail` textual)
-`tail` es funcional pero un TUI/panel es lo que genera el "momento ajá" y las capturas que se comparten (marketing orgánico). Diferido correctamente, pero es un multiplicador de adopción.
-
-### F6 — 🟢 Sin webhooks/alertas salientes
-No hay forma de notificar a Slack/Discord/desktop cuando salta un bloqueo o burn-rate. El dev no vive mirando `tail`. Diferido, razonable.
+OpenClaw (and claw-code) is the **autonomous coding agent** that lives in the developer's terminal and suffered the pricing change. It is not a competitor: **it is the substrate PennyPrompt installs onto**. The strategic question is not "how do I beat OpenClaw?" but "how do I become the default layer every OpenClaw user installs on day 1?". That requires:
+- Perfect native compatibility with how OpenClaw speaks (→ the `/v1/messages` gap).
+- Cost accuracy on OpenClaw's real usage pattern (→ the prompt caching gap).
+- Zero install friction (single binary — **we already have this, and it's huge**).
 
 ---
 
-## 8. Diferenciales NUEVOS propuestos (para aumentar adopción)
+## 4. Our CURRENT differentiators (what already sets us apart)
 
-Cada uno se elige por una regla: **profundizar el foso "consciente de agentes + local-first", no diluirlo hacia "otro gateway".**
+These are real and already in the code. They must be protected and made legible in the message.
 
-### D1 — Compatibilidad nativa Anthropic como *feature de portada* (resuelve F1)
-No es solo cerrar un bug: convertirlo en mensaje. "Apunta tu OpenClaw a PennyPrompt y funciona idéntico, sin traducciones, sin perder streaming ni tool-use." La compatibilidad *perfecta* con el agente #1 del mercado es en sí un diferencial contra gateways que fuerzan formato OpenAI.
+1. **Local-first, single binary, zero external dependencies.** ~15MB, embedded SQLite, no PostgreSQL/Redis/Docker. Against LiteLLM/Portkey this is a *friction* differentiator and a *privacy* one (traffic never leaves the machine except to the provider). For the indie dev it is the difference between "installed in 2 minutes" and "not installed".
 
-### D2 — "Cost receipt" del agente: exactitud con caché como bandera (resuelve F2)
-Ser el **único** guardrail que contabiliza correctamente el prompt caching de Anthropic. Reporte que desglosa: input fresco vs. input cacheado vs. escritura de caché vs. output. Para el usuario de agentes de código esto es *el* número que nadie más le da bien. Es exactitud como diferencial, no como higiene.
+2. **Atomic enforcement *before* the spend (ledger reservation).** RESERVE→DISPATCH→RECONCILE in one SQLite transaction with `BEGIN IMMEDIATE`. Most competitors account *after*; PennyPrompt blocks the N+1 request that would break the limit, correctly under concurrency. A *technical, verifiable* differentiator.
 
-### D3 — "Circuit breaker con aprobación humana" (profundiza el diferencial de bucle)
-Hoy: bloquear (402) o pausar sesión. Nuevo: cuando una tarea supera un umbral de costo estimado, **pausar y pedir aprobación explícita** (desktop notification / respuesta en CLI) antes de continuar. Convierte el guardrail pasivo en un *human-in-the-loop económico*. Nadie en la categoría gateway hace esto porque nadie modela "tarea de agente" como unidad.
+3. **HTTP 402 semantics designed for agents, not 429.** Agents retry 429; 402 `retryable:false` tells them "stop and ask the human". A small detail with enormous impact inside an autonomous loop. No generic gateway thinks about this.
 
-### D4 — Presupuesto por *tarea de agente*, no solo por ventana temporal
-Los competidores presupuestan por key/user/día. PennyPrompt puede presupuestar por **tarea** ("no gastes más de $2 resolviendo este issue"), atado a la sesión auto-detectada. Es la unidad mental real del usuario de agentes: "esta feature valió $3". Diferencial conceptual difícil de copiar sin la auto-atribución que ya tenemos.
+4. **Agent-loop detection (burn-rate, tool failures, similarity).** A feature that *does not exist* in the gateway category because it comes from modeling the agent as a loop. The hardest differentiator to copy, because it requires thinking in agents, not apps.
 
-### D5 — Privacidad/soberanía de datos como diferencial explícito
-Contra gateways SaaS (OpenRouter/Portkey managed) y contra Helicone (ahora en mantenimiento): "tu prompt, tu código, tu costo — nada sale de tu máquina salvo la llamada al proveedor." Para healthcare/finance/legal esto es requisito duro. Ya es cierto en el código; falta convertirlo en mensaje de primera línea y quizá una certificación de "no telemetría".
+5. **Auto-attribution without custom headers** (project by git root, session by time window). Useful reports from the first request, zero config. Competitors demand virtual keys or tags.
 
-### D6 — Composición explícita con routers (NadirClaw) como estándar
-Publicar la integración canónica `Agente → Router → PennyPrompt → Proveedor` con estimación *por modelo candidato*. "El router elige el modelo; PennyPrompt te dice cuánto cuesta cada opción y frena si te pasas." Convierte a un competidor potencial en un canal de distribución.
+6. **Pre-execution estimation** ("how much will this cost?"). Rare in the market; answers the question *before* almost anyone else does.
+
+7. **Financial core correct by design** (integer-micros money, auditable append-only ledger). Trust: when the product says "$4.23", it is $4.23.
 
 ---
 
-## 9. Roadmap detallado hacia los diferenciales
+## 5. Security findings
 
-Principio rector: **primero cerrar las dos brechas que rompen la promesa central (F1, F2), luego profundizar el foso de agente (D3, D4), y solo entonces expandir alcance (proveedores, team).** Expandir antes de cerrar las brechas es construir sobre una promesa incumplida.
+Ordered by relevance to real adoption/operation.
 
-### Fase A — "Cumplir la promesa" (alpha.4 → alpha.5) · *bloqueante para adopción*
-Objetivo: que la tabla de compatibilidad del README sea literalmente cierta y que el número de costo sea correcto.
+| # | Finding | Severity | Note |
+|---|---------|----------|------|
+| S1 | **Admin plane has no authentication.** No bearer/admin token (confirmed: zero auth references in `penny-admin`). | Medium (mitigated by design) | Already documented as local-only and loopback/unix-socket. Acceptable for alpha, but an **adoption ceiling** for the jump to "team". Any local process can read reports and **mutate budgets** via `POST /admin/budgets` → effectively disable the guardrail. |
+| S2 | **No provider key management/rotation path.** API keys are read from env (`api_key_env`). Good (not persisted), but no rotation or scoping. | Low | Correct for alpha; documenting that keys never touch the DB is a *privacy selling point*. |
+| S3 | **Dynamic SQL in reports** (group key / join variant). | Low (controlled) | Already audited: fragments come from enums, filters use bind params. Keep the guardrail; migrate to a query builder if it grows. |
+| S4 | **`cargo audit` as a gate** already integrated (rustls-webpki refreshed). | ✅ Positive | Good hygiene. Keep the gate on every release. |
+| S5 | **Payload cleanup / ANSI strip** in the proxy. | ✅ Positive | Reduces terminal-escape-injection surface in outputs the operator views in `tail`. |
 
-- **A1. Ingreso nativo Anthropic `/v1/messages`** (cierra F1 → D1).
-  - Nueva ruta en `build_router`. Normalizador Messages→`NormalizedRequest`. Preservar streaming SSE nativo Anthropic (event: message_start/content_block_delta/message_delta/message_stop) y `tool_use`.
-  - Test de integración: request Messages nativa → mock → 200 con formato Anthropic, ledger reconciliado.
-  - Actualizar README para que la afirmación OpenClaw sea verificable end-to-end.
-- **A2. Contabilidad de prompt caching** (cierra F2 → D2).
-  - Extender `AccountedUsage` y pricebook con tarifas de `cache_read`/`cache_write`. Leer los campos de usage de Anthropic (y `prompt_tokens_details.cached_tokens` de OpenAI).
-  - Reconcile usa las cuatro categorías. Reports desglosan input fresco/cacheado/output.
-  - Fixtures de calibración como en el tokenizer dispatch (`#184`).
-- **A3. Límite de concurrencia + timeout de upstream** (E3).
-  - `tower` ConcurrencyLimit y timeout configurable. Test de saturación.
-- **A4. Smoke test del instalador** (#203, ya en alpha.4). Cerrar.
-
-**Salida de fase:** un usuario de OpenClaw instala, apunta, corre una tarea real con caché, y el costo reportado coincide con la factura del proveedor dentro de un margen pequeño. *Ese* es el momento de credibilidad.
-
-### Fase B — "Profundizar el foso de agente" (alpha.5 → beta) · *diferenciación*
-Objetivo: features que la categoría gateway estructuralmente no tiene.
-
-- **B1. Presupuesto por tarea/sesión** (D4). Nuevo `ScopeType::Task` atado a sesión auto-detectada; CLI `budget set task:<id>`; estimación consume presupuesto de tarea.
-- **B2. Circuit breaker con aprobación humana** (D3). Nueva acción `require_approval` además de `alert`/`pause`. Notificación desktop + resume vía CLI. Evento `ApprovalRequested`.
-- **B3. `pennyprompt run <agent>` real** (F4). `run openclaw -- <args>` levanta proxy efímero, inyecta base URL, adjunta atribución de tarea, tears down al terminar. Convierte el proxy en wrapper.
-- **B4. Webhooks/alertas salientes** (F6). Slack/Discord/desktop en bloqueo, burn-rate, aprobación. Config `[detect.webhooks]`.
-
-**Salida de fase:** PennyPrompt hace cosas que LiteLLM/Portkey no pueden hacer *por diseño*, no por falta de features.
-
-### Fase C — "Expandir alcance sin diluir" (beta → v1) · *crecimiento*
-- **C1. Proveedores** (F3): Gemini/Google, passthrough OpenRouter, local (Ollama/vLLM). Cada uno abre un segmento.
-- **C2. TUI/dashboard en vivo** (F5). El multiplicador de marketing orgánico (capturas compartibles).
-- **C3. Feed de pricebook remoto firmado.** Mantener exactitud sin releases manuales; firma para no romper el modelo "sin scraping, sin llamadas externas no verificadas".
-- **C4. Diferencial de privacidad explícito** (D5): auditoría "cero telemetría", doc de soberanía de datos, quizá attestation.
-- **C5. Integración canónica con router** (D6): recetas NadirClaw, estimación multi-modelo.
-
-### Fase D — "Team sin traicionar local-first" (v1+) · *solo si el mercado single-node se agota*
-- **D-1. Auth del admin plane** (S1): diseñar el contrato de token *ahora* (Fase A, sin implementar) para no rediseñar aquí.
-- **D-2. Backend PostgreSQL opcional** (E4) detrás del mismo trait de store. SQLite sigue siendo el default.
-- **D-3. Pool de lectura separado del writer** (E1).
-
-**Regla de oro para la Fase D:** no empezar hasta tener evidencia de demanda de equipos. El riesgo de muerte no es "no tenemos team mode", es "diluimos el foso local-first persiguiendo enterprise antes de dominar el nicho".
+**Highest-leverage security recommendation:** turn the absence of auth from a "limitation" into an *architecture decision with an exit door*: keep local-only by default, but design the admin token contract now (even before implementing) so "team mode" needs no redesign. Budget mutation via unauthenticated admin is the most concrete risk: a compromised agent that discovers the admin port can raise its own limit.
 
 ---
 
-## 10. Prioridad recomendada (si solo se hace una cosa por trimestre)
+## 6. Scalability findings
 
-1. **A1 + A2** (ingreso nativo Anthropic + prompt caching). Sin esto, la promesa central no se cumple para el usuario #1. Todo lo demás es secundario.
-2. **B2 + B4** (circuit breaker con aprobación + alertas). Es el diferencial más puro de "consciente de agentes" y el más difícil de copiar.
-3. **B3** (`run` real) + **C2** (dashboard). UX y marketing orgánico.
-4. **C1** (proveedores) para abrir segmentos, en el orden de mayor demanda observada.
+| # | Finding | Impact | Recommendation |
+|---|---------|--------|----------------|
+| E1 | **`max_connections(1)` on the SQLite pool.** Serializes *all* operations, not only reservation writes. | Throughput ceiling under many concurrent agents/sessions. | Correct for local single-node consistency. To scale reads: separate a read pool (WAL allows concurrent readers) from the single writer. Measure before optimizing. |
+| E2 | **In-memory loop detection** (`HashMap<SessionId, SessionWindow>` behind `RwLock`). | Non-persistent state: a restart loses windows and paused sessions. | Acceptable for alpha. Document that `detect resume` and pause state don't survive restart. For v1, consider a light snapshot. |
+| E3 | **No explicit backpressure or inbound connection limit** on the proxy. | An agent opening many connections can saturate the single writer. | Add a concurrency limit (tower `ConcurrencyLimit`) and configurable upstream timeouts. |
+| E4 | **One node, one SQLite file.** | Multi-machine / shared team not supported. | Already an alpha non-goal (correct). PostgreSQL is the v1 path for team, but **not before** exhausting the single-node market. |
+| E5 | **Pricebook and reconciliation load fine**, but **streaming reconcile depends on estimation** when the provider sends no usage. | Degraded cost accuracy on streams without final usage. | Tied to the prompt caching gap (§7). Prioritize accuracy over throughput: it is the brand promise. |
 
----
-
-## 11. Riesgos estratégicos y anti-objetivos
-
-- **Riesgo #1 — Competir como gateway genérico.** Si el roadmap deriva hacia "features de LiteLLM en Rust", se pierde. El foso es agente + local-first, no cobertura de 100 modelos.
-- **Riesgo #2 — Prometer team/enterprise antes de dominar el nicho.** Diluye el mensaje y el diseño. Mantener honestidad de alcance (ya se hace bien en los docs).
-- **Riesgo #3 — Exactitud silenciosamente incorrecta** (F2). Un guardrail de costos que reporta mal el costo pierde su única razón de existir. La exactitud es la marca, no una feature.
-- **Riesgo #4 — Brecha promesa/realidad** (F1). El README promete compatibilidad que el router no cumple. Cerrar la brecha o ajustar la promesa; no dejar ninguna abierta.
-
-**Anti-objetivos que hay que mantener** (ya bien definidos en el backlog): no ser router, no ser gateway enterprise, no ser SaaS, no scrapear precios, no exponer admin sin auth fuera de loopback.
+**Reading:** *current* scalability is right for the target audience (local single-node). The strategic risk is not "doesn't scale to 1000 nodes" (not the market) but **presenting the product as team-ready too early**. Keep the message honest: "a local guardrail for your machine/small team".
 
 ---
 
-## 12. Síntesis en una frase
+## 7. Functional findings / product gaps (the ones that move adoption)
 
-> **PennyPrompt no es "un gateway LLM más": es el primer guardrail de costos que trata al agente autónomo como lo que es —un bucle local con tarjeta de crédito— y lo hace en un binario de 15MB sin dependencias. El moat ya existe en el código. La adopción depende de cerrar dos brechas que rompen la promesa central (ingreso nativo Anthropic y contabilidad de caché) y de profundizar lo que ningún gateway genérico puede copiar: presupuesto por tarea y circuit-breaker con aprobación humana.**
+Ordered by impact on the central promise "works with your agent, zero changes".
+
+### F1 — 🔴 No native Anthropic ingress (`/v1/messages`) — **gap #1**
+The proxy router registers exactly three routes: `/v1/chat/completions`, `/v1/models`, `/internal/health`. There is no `/v1/messages`. The `AnthropicProvider` translates **output**, but **there is no input surface** for a client speaking the native Messages API. Since OpenClaw/claw-code (the declared primary target) speak native Anthropic, pointing `ANTHROPIC_BASE_URL=http://localhost:8585/v1` would make the agent hit `/v1/messages` → 404. **This contradicts the README compatibility table.** It is the highest-ROI fix in the entire backlog: without it, the zero-friction tagline is unfulfilled for the most important user.
+
+### F2 — 🔴 No prompt caching accounting — **gap #2**
+`cache_creation_input_tokens` and `cache_read_input_tokens` are not read (zero references in `penny-cost`/`penny-providers`/`penny-types`). Coding agents use prompt caching aggressively (reused repo context). A cached read costs ~10% of normal input and a cache write ~125%; ignoring them **materially over- or under-states real cost** in exactly the flagship flow. The brand is "when we say $X, it's $X" — this gap silently erodes it.
+
+### F3 — 🟡 Narrow provider coverage
+Only Anthropic + OpenAI. No Google/Gemini, no OpenRouter passthrough, no local (Ollama/vLLM). Many indie devs run local models or mix providers. Every missing provider is a segment that cannot adopt.
+
+### F4 — 🟡 `run <agent>` still minimal
+Dry-run + `--execute` limited to agents honoring an OpenAI-compatible base URL. The piece that turns PennyPrompt from "a proxy you configure" into "a wrapper you invoke" (`pennyprompt run openclaw -- ...`). High UX leverage, but correctly bounded for now.
+
+### F5 — 🟡 No live dashboard (only textual `tail`)
+`tail` is functional, but a TUI/panel is what creates the "aha moment" and the shareable screenshots (organic marketing). Correctly deferred, but it is an adoption multiplier.
+
+### F6 — 🟢 No webhooks/outbound alerts
+No way to notify Slack/Discord/desktop on a block or burn-rate alert. Devs don't live watching `tail`. Deferred, reasonable.
 
 ---
 
-### Anexo — Evidencia de código consultada
+## 8. Proposed NEW differentiators (to grow adoption)
 
-- Rutas del proxy: `crates/penny-proxy/src/lib.rs` (`build_router`, líneas ~281-285) — solo 3 rutas, sin `/v1/messages` de ingreso.
-- Adaptadores: `crates/penny-providers/src/lib.rs` — Anthropic/OpenAI/Mock; Anthropic traduce salida a `/v1/messages` (~272).
-- Prompt caching: sin referencias a `cache_read`/`cache_creation` en `penny-cost`/`penny-providers`/`penny-types`.
-- Pool SQLite: `crates/penny-store/src/lib.rs:106-114` — `max_connections(1)`, WAL, foreign_keys.
-- Ledger atómico: `crates/penny-ledger/src/lib.rs:373-375` — `begin_with("BEGIN IMMEDIATE")`.
-- Dinero: `crates/penny-types/src/lib.rs` — `Money(i64)` en micros.
-- Auth admin: sin referencias a bearer/token/auth en `crates/penny-admin/`.
-- Pricebook: `prices/anthropic.toml` (7 modelos), `prices/openai.toml` (3 modelos); sin Gemini/local.
+Each is chosen by one rule: **deepen the "agent-aware + local-first" moat, don't dilute it toward "another gateway".**
+
+### D1 — Native Anthropic compatibility as a *headline feature* (solves F1)
+Not just closing a bug: make it the message. "Point your OpenClaw at PennyPrompt and it works identically — no translation, no lost streaming or tool-use." *Perfect* compatibility with the market's #1 agent is itself a differentiator against gateways that force the OpenAI format.
+
+### D2 — The agent's "cost receipt": cache accuracy as a flag (solves F2)
+Be the **only** guardrail that correctly accounts Anthropic prompt caching. A report that breaks down fresh input vs cached input vs cache write vs output. For the coding-agent user this is *the* number nobody else gets right. Accuracy as differentiator, not as hygiene.
+
+### D3 — "Circuit breaker with human approval" (deepens the loop differentiator)
+Today: block (402) or pause session. New: when a task exceeds an estimated-cost threshold, **pause and request explicit approval** (desktop notification / CLI response) before continuing. Turns the passive guardrail into an *economic human-in-the-loop*. Nobody in the gateway category does this because nobody models "agent task" as a unit.
+
+### D4 — Budget per *agent task*, not only per time window
+Competitors budget per key/user/day. PennyPrompt can budget per **task** ("don't spend more than $2 solving this issue"), tied to the auto-detected session. It is the user's real mental unit for agents: "this feature cost $3". A conceptual differentiator that is hard to copy without the auto-attribution we already have.
+
+### D5 — Privacy/data sovereignty as an explicit differentiator
+Against SaaS gateways (OpenRouter/Portkey managed) and against Helicone (now in maintenance): "your prompt, your code, your cost — nothing leaves your machine except the provider call." For healthcare/finance/legal this is a hard requirement. Already true in the code; missing is making it a first-line message and perhaps a "no telemetry" attestation.
+
+### D6 — Explicit composition with routers (NadirClaw) as the standard
+Publish the canonical integration `Agent → Router → PennyPrompt → Provider` with *per-candidate-model* estimation. "The router picks the model; PennyPrompt tells you what each option costs and stops you if you exceed." Turns a potential competitor into a distribution channel.
+
+### D7 — The cost-aware loop: from guard to sense organ *(added rev. 1.1 — the biggest strategic differentiator)*
+Everything above treats the agent as something to *police* (block, pause, approve). The next conceptual leap is giving the agent the signal to **self-regulate**: knowing how much it has spent and how much remains, *before* hitting the wall — so it can pick a cheaper model, compact context, or stop on its own.
+
+Two mechanisms, in order of friction:
+1. **Response headers** (`X-Penny-Request-Cost-USD`, `X-Penny-Session-Cost-USD`, `X-Penny-Budget-Remaining-USD`, `X-Penny-Budget-Scope`) on every proxied response — zero integration (issue `#230`).
+2. **MCP introspection server** (`pennyprompt mcp`): the agent asks `get_budget_status` / `estimate_cost` of the *same ledger that enforces* (issue `#232`).
+
+**Prior art (verified — do not over-claim):** LiteLLM already exposes a per-response cost header (`x-litellm-response-cost`) and rate-limit-remaining headers; and standalone MCP spend *meters* exist. What does **not** exist is the closed loop with authority: *remaining budget in USD for the scopes an agent cares about (task/session), emitted by the same atomic ledger that will return the 402*. The number in the header is the number that blocks you. Passive meter ≠ introspectable guardrail. Combined with the 402 semantics and the approval flow (D3), this makes PennyPrompt the only piece that closes the perception→decision→enforcement circuit.
+
+### D8 — Published accuracy proof: the invoice-parity benchmark *(added rev. 1.1)*
+The brand is "when we say $X, it's $X" — but a claim without reproducible evidence is just marketing. A harness that runs a representative workload (streaming, tools, cache) against real providers and publishes the deviation between PennyPrompt-reported and provider-billed cost (**target: ≤1%**), re-runnable by third parties, turns accuracy into a *verifiable fact* and doubles as a permanent regression net for the accounting (issue `#231`). For a trust product, the proof **is** the marketing.
+
+### D9 — Visibility embedded in the developer's workflow *(added rev. 1.1)*
+`pennyprompt statusline`: a one-line segment (`$1.42 session · $6.20/hr · 62% day`, <50ms) embeddable in the Claude Code/OpenClaw status line, starship, or tmux (issue `#233`). The product's value stays on screen all day **and appears in every screenshot the user shares** — organic distribution embedded in the workflow, complementary to the TUI (`#218`).
+
+---
+
+## 9. Detailed roadmap toward the differentiators
+
+Guiding principle: **first close the two gaps that break the central promise (F1, F2), then deepen the agent moat (D3, D4, D7), and only then expand scope (providers, team).** Expanding before closing the gaps is building on an unfulfilled promise.
+
+### Phase A — "Fulfill the promise" (alpha.4 → alpha.5) · *adoption blocker*
+Goal: the README compatibility table becomes literally true and the cost number becomes correct.
+
+- **A1. Native Anthropic ingress `/v1/messages`** (closes F1 → D1).
+  - New route in `build_router`. Messages→`NormalizedRequest` normalizer. Preserve native Anthropic SSE streaming (event: message_start/content_block_delta/message_delta/message_stop) and `tool_use`.
+  - Integration test: native Messages request → mock → 200 with Anthropic shape, ledger reconciled.
+  - Update the README so the OpenClaw claim is end-to-end verifiable.
+- **A2. Prompt caching accounting** (closes F2 → D2).
+  - Extend `AccountedUsage` and the pricebook with `cache_read`/`cache_write` rates. Read Anthropic usage fields (and OpenAI `prompt_tokens_details.cached_tokens`).
+  - Reconcile uses the four categories. Reports break down fresh/cached input/output.
+  - Calibration fixtures as in the tokenizer dispatch (`#184`).
+- **A3. Concurrency limit + upstream timeout** (E3).
+  - `tower` ConcurrencyLimit and configurable timeout. Saturation test.
+- **A4. Installer smoke test** (#203, already in alpha.4). Close it.
+
+**Phase exit:** an OpenClaw user installs, points, runs a real cache-heavy task, and the reported cost matches the provider invoice within a small margin. *That* is the credibility moment.
+
+### Phase B — "Deepen the agent moat" (alpha.5 → beta) · *differentiation*
+Goal: features the gateway category structurally does not have.
+
+- **B1. Per-task/session budget** (D4). New `ScopeType::Task` tied to the auto-detected session; CLI `budget set task:<id>`; estimation consumes task budget.
+- **B2. Circuit breaker with human approval** (D3). New `require_approval` action besides `alert`/`pause`. Desktop notification + resume via CLI. `ApprovalRequested` event.
+- **B3. Real `pennyprompt run <agent>`** (F4). `run openclaw -- <args>` spins an ephemeral proxy, injects the base URL, attaches task attribution, tears down on exit. Turns the proxy into a wrapper.
+- **B4. Webhooks/outbound alerts** (F6). Slack/Discord/desktop on block, burn-rate, approval. `[detect.webhooks]` config.
+- **B5. Cost-feedback headers** (D7, `#230`) *(rev. 1.1)*. Request cost + remaining budget per scope on every response, emitted by the enforcing ledger. Cheap to build, opens the cost-aware loop.
+- **B6. Invoice-parity benchmark** (D8, `#231`) *(rev. 1.1)*. Only meaningful after A1+A2; sequence it last in the train. Publishes the evidence for Phase A's exit criterion.
+
+**Phase exit:** PennyPrompt does things LiteLLM/Portkey cannot do *by design*, not for lack of features — and accuracy stops being a claim and becomes a reproducible report.
+
+### Phase C — "Expand scope without diluting" (beta → v1) · *growth*
+- **C1. Providers** (F3): Gemini/Google, OpenRouter passthrough, local (Ollama/vLLM). Each opens a segment.
+- **C2. Live TUI/dashboard** (F5). The organic-marketing multiplier (shareable screenshots).
+- **C3. Signed remote pricebook feed.** Keep accuracy current without manual releases; signed so as not to break the "no scraping, no unverified external calls" model.
+- **C4. Explicit privacy differentiator** (D5): "zero telemetry" audit, data sovereignty doc, perhaps attestation.
+- **C5. Canonical router integration** (D6): NadirClaw recipes, multi-model estimation.
+- **C6. MCP budget introspection server** (D7, `#232`) *(rev. 1.1)*. Closes the cost-aware loop: read-only, ≤5 tools, backed by the enforcement ledger.
+- **C7. Embeddable statusline** (D9, `#233`) *(rev. 1.1)*. <50ms, graceful degradation, recipes for Claude Code/OpenClaw/starship/tmux.
+- **C8. Distribution channels** (`#234`) *(rev. 1.1)*. Homebrew tap, `cargo-binstall`, one-page per-agent integration guides. The cheapest multiplier on everything else (see §10).
+
+### Phase D — "Team without betraying local-first" (v1+) · *only if the single-node market is exhausted*
+- **D-1. Admin plane auth** (S1): design the token contract *now* (Phase A, without implementing) to avoid a redesign here.
+- **D-2. Optional PostgreSQL backend** (E4) behind the same store trait. SQLite remains the default.
+- **D-3. Read pool separated from the writer** (E1).
+
+**Golden rule for Phase D:** do not start until there is evidence of team demand. The death risk is not "we lack team mode" — it is "we diluted the local-first moat chasing enterprise before dominating the niche".
+
+---
+
+## 10. Adoption levers (go-to-market) — *added rev. 1.1*
+
+The critical review of v1.0 of this document exposed its biggest hole: it was 100% product. But for an open-source project, **adoption = product × distribution × trust × visibility** — and three of the four factors were missing. Phases A–D build the product; this section builds the rest. Without it, a good product stalls at 30 stars.
+
+### 10.1 Trust (the proof is the marketing)
+For a *money guardrail*, trust is not a nice-to-have: it is the only buying reason. Levers:
+- **Invoice-parity benchmark published per release** (`#231`, D8). "≤1% deviation — re-run it yourself" is worth more than any post.
+- **Verifiable zero telemetry** (`#220`, D5): not just privacy but coherence — a product that watches your spend must not watch you.
+- **Honesty ledger** in the backlog (already exists): gaps are published with a date and an issue, not hidden. Keeping it is a policy, not a document.
+- Public `cargo audit` gate (already exists).
+
+### 10.2 Distribution (channels, `#234`)
+- **Homebrew tap + `cargo-binstall`**: the single binary is the friction differentiator; without `brew install` it is wasted on the macOS segment that dominates the target audience.
+- **One-page integration guides per agent** (OpenClaw, claw-code, Cursor, Codex, Continue): the exact paste + a verification step. Each guide doubles as an indexable landing page ("openclaw cost limit", "cursor budget cap") — organic SEO with extremely high intent.
+- **Lists and registries**: awesome-rust, awesome-llm; MCP registries once `#232` exists (every registry is a channel).
+
+### 10.3 Daily visibility (the product shows itself)
+- **Statusline** (`#233`, D9) and **TUI** (`#218`): live cost sits on the dev's screen all day and in every screenshot they share. Marketing embedded in the workflow, consistent with zero telemetry: we don't track users — users show us off.
+- **Headers** (`#230`): the `X-Penny-*` prefix travels through third-party logs and debug output — the name propagates on its own.
+
+### 10.4 Community (turn the adapter pattern into a quarry)
+- **Provider adapters** (C1–C3) are the perfect `good-first-issue`: a repeatable, well-bounded pattern with two reference examples in the tree. Labeling and documenting "how to add a provider" turns gap F3 into a contributor quarry instead of our own backlog.
+- Every per-agent guide (`#234`) ends with "your agent missing? PRs welcome" — the integration directory grows itself.
+
+### 10.5 North-star metrics without telemetry
+Consistent with D5: users are never instrumented. Measure with public signals:
+- **Release downloads per version** (`gh api`), stars/week, public Homebrew tap analytics.
+- **Issues/discussions opened by third parties** — the strongest real-adoption signal that exists for a local-first project.
+- Suggested north star: **weekly release downloads** + **non-maintainer issues/month**. Ritual: monthly snapshot in `docs/status-*.md`.
+
+### 10.6 Launch sequence tied to the release trains
+The rule: **one big shot, and only when the promise is demonstrable.** Launching before Phase A would burn the only credibility shot (gap F1 would be the first comment in the thread).
+- **alpha.5** — no promotion: it is a correction release. Only update guides/README.
+- **alpha.6** — first technical content: "how atomic budget reservation works", "invoice-parity report #1". Builds authority, not traffic.
+- **beta.1** — **the launch** (Show HN, r/LocalLLaMA, lobste.rs): with parity published, a cost-aware-loop demo (statusline + TUI GIF + a 402 saving money), `brew install` working, and five per-agent guides. Everything aligned in a single moment.
+- **v1.0.0** — stability announcement; homebrew-core, winget/apt (the "serious" registries require non-prerelease).
+
+### 10.7 Sustainability (one-line note)
+GitHub Sponsors from now (zero friction). If monetization ever comes, it lives in the team tier (v1+), **never** as a gate on local features: free local-first *is* the moat, not the bait of a freemium.
+
+---
+
+## 11. Recommended priority (if only one thing per quarter)
+
+1. **A1 + A2** (native Anthropic ingress + prompt caching). Without these, the central promise is unfulfilled for user #1. Everything else is secondary.
+2. **B5 + B2 + B4** (cost-feedback headers + approval circuit breaker + alerts). The complete agent loop: perception, decision, enforcement. The purest "agent-aware" differentiator and the hardest to copy.
+3. **B6 + C8** (parity benchmark + distribution channels). Demonstrable trust + minimal install friction = the preconditions of the beta.1 launch (§10.6).
+4. **B3** (real `run`) + **C7/C2** (statusline + dashboard). UX and organic visibility.
+5. **C1 providers + C6 MCP** to open segments and close the cost-aware loop, in observed-demand order.
+
+---
+
+## 12. Strategic risks and anti-goals
+
+- **Risk #1 — Competing as a generic gateway.** If the roadmap drifts toward "LiteLLM features in Rust", we lose. The moat is agent + local-first, not 100-model coverage.
+- **Risk #2 — Promising team/enterprise before dominating the niche.** Dilutes the message and the design. Keep scope honesty (the docs already do this well).
+- **Risk #3 — Silently wrong accuracy** (F2). A cost guardrail that misreports cost loses its only reason to exist. Accuracy is the brand, not a feature.
+- **Risk #4 — Promise/reality gap** (F1). The README promises compatibility the router does not deliver. Close the gap or adjust the promise; leave none open.
+
+**Anti-goals to maintain** (already well defined in the backlog): not a router, not an enterprise gateway, not a SaaS, no price scraping, no admin exposure without auth beyond loopback.
+
+---
+
+## 13. One-sentence synthesis
+
+> **PennyPrompt is not "another LLM gateway": it is the first cost guardrail that treats the autonomous agent as what it is — a local loop with a credit card — in a 15MB binary with zero dependencies. The moat already exists in the code. Adoption depends on three moves in order: (1) close the two gaps that break the central promise (native Anthropic ingress and cache accounting), (2) build what no generic gateway can copy — per-task budgets, a human-approval circuit breaker, and the cost-aware loop where the same ledger that blocks is the one that informs the agent — and (3) launch once, with accuracy proven by a reproducible parity benchmark and installation one command away.**
+
+---
+
+### Annex — Code evidence consulted
+
+- Proxy routes: `crates/penny-proxy/src/lib.rs` (`build_router`, ~lines 281-285) — only 3 routes, no `/v1/messages` ingress.
+- Adapters: `crates/penny-providers/src/lib.rs` — Anthropic/OpenAI/Mock; Anthropic translates output to `/v1/messages` (~272).
+- Prompt caching: no references to `cache_read`/`cache_creation` in `penny-cost`/`penny-providers`/`penny-types`.
+- SQLite pool: `crates/penny-store/src/lib.rs:106-114` — `max_connections(1)`, WAL, foreign_keys.
+- Atomic ledger: `crates/penny-ledger/src/lib.rs:373-375` — `begin_with("BEGIN IMMEDIATE")`.
+- Money: `crates/penny-types/src/lib.rs` — `Money(i64)` in micros.
+- Admin auth: no bearer/token/auth references in `crates/penny-admin/`.
+- Pricebook: `prices/anthropic.toml` (7 models), `prices/openai.toml` (3 models); no Gemini/local.
 - Tests: 190 (`#[test]`/`#[tokio::test]`/`#[sqlx::test]`).
 
-### Anexo — Fuentes competitivas
+### Annex — Competitive sources
 
 - [LiteLLM — Budgets & Rate Limits](https://docs.litellm.ai/docs/proxy/users) · [Virtual Keys](https://docs.litellm.ai/docs/proxy/virtual_keys) · [Spend Tracking](https://docs.litellm.ai/docs/proxy/cost_tracking)
 - [LLM Gateway 2026: OpenRouter vs LiteLLM vs Portkey vs Helicone](https://klymentiev.com/blog/llm-gateway-guide)
 - [Best LLM Gateways 2026 — Braintrust](https://www.braintrust.dev/articles/best-llm-gateways-2026)
 - [7 Best OpenRouter Alternatives 2026](https://ofox.ai/blog/openrouter-alternatives-2026/)
+
+Verified prior art for D7 (rev. 1.1):
+- [LiteLLM — Response Headers](https://docs.litellm.ai/docs/proxy/response_headers) (`x-litellm-response-cost`, rate-limit remaining) — per-response cost exists; budget-remaining-USD per task/session from the enforcing ledger does not.
+- [LLM Usage & Cost Tracker (MCP, Glama)](https://glama.ai/mcp/servers/zhaoyue722/llm-usage-mcp) and [Agent Budget Guard](https://earezki.com/ai-news/2026-03-02-i-built-an-mcp-server-so-my-ai-agent-can-track-its-own-spending/) — passive MCP meters exist; introspection backed by the guardrail that blocks does not.
