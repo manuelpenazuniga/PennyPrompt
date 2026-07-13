@@ -48,7 +48,18 @@ pub struct ServerConfig {
     pub admin_socket: String,
     pub database_path: String,
     pub mode: Mode,
+    /// Maximum number of proxy requests processed concurrently. Excess requests
+    /// queue (backpressure) rather than overwhelming the single SQLite writer.
+    pub max_inflight_requests: u32,
+    /// Upstream dispatch timeout in milliseconds. A provider that does not
+    /// respond within this window yields HTTP 504 and releases its reservation.
+    pub upstream_timeout_ms: u64,
 }
+
+/// Default inbound concurrency limit when unset in config.
+pub const DEFAULT_MAX_INFLIGHT_REQUESTS: u32 = 64;
+/// Default upstream dispatch timeout in milliseconds when unset in config.
+pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DefaultsConfig {
@@ -329,6 +340,16 @@ fn validate_config(config: &AppConfig) -> Result<(), ConfigError> {
             "server.bind is required".to_string(),
         ));
     }
+    if config.server.max_inflight_requests == 0 {
+        return Err(ConfigError::Validation(
+            "server.max_inflight_requests must be > 0".to_string(),
+        ));
+    }
+    if config.server.upstream_timeout_ms == 0 {
+        return Err(ConfigError::Validation(
+            "server.upstream_timeout_ms must be > 0".to_string(),
+        ));
+    }
     if config.attribution.session_window_minutes == 0 {
         return Err(ConfigError::Validation(
             "attribution.session_window_minutes must be > 0".to_string(),
@@ -472,6 +493,8 @@ struct PartialServerConfig {
     admin_socket: Option<String>,
     database_path: Option<String>,
     mode: Option<Mode>,
+    max_inflight_requests: Option<u32>,
+    upstream_timeout_ms: Option<u64>,
 }
 
 impl PartialServerConfig {
@@ -487,6 +510,12 @@ impl PartialServerConfig {
         }
         if other.mode.is_some() {
             self.mode = other.mode;
+        }
+        if other.max_inflight_requests.is_some() {
+            self.max_inflight_requests = other.max_inflight_requests;
+        }
+        if other.upstream_timeout_ms.is_some() {
+            self.upstream_timeout_ms = other.upstream_timeout_ms;
         }
     }
 
@@ -504,6 +533,13 @@ impl PartialServerConfig {
             mode: self
                 .mode
                 .ok_or_else(|| ConfigError::Validation("missing server.mode".to_string()))?,
+            // Optional with sane defaults so existing configs keep working.
+            max_inflight_requests: self
+                .max_inflight_requests
+                .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUESTS),
+            upstream_timeout_ms: self
+                .upstream_timeout_ms
+                .unwrap_or(DEFAULT_UPSTREAM_TIMEOUT_MS),
         })
     }
 }
