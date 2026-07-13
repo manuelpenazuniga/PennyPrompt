@@ -6,18 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added
-- Strategic audit `docs/STRATEGY-AUDIT-2026-07-05.md`: progress audit, security/scalability/functional findings, competitive analysis, consolidated differentiators, and a detailed post-alpha.4 roadmap (Phases A-D, `v0.1.0-alpha.5` → `v1.0.0`).
-- Forward roadmap tracked as GitHub epics `#225`-`#228` and child issues `#207`-`#224`.
-- README "What makes PennyPrompt different" section consolidating the differentiators into the narrative.
+## [v0.1.0-alpha.5] - 2026-07-12
 
-- Strategy audit rev. 1.1: cost-aware loop differentiator (response headers `#230` + MCP introspection `#232`, positioned against verified LiteLLM/MCP prior art), invoice-parity benchmark (`#231`), statusline visibility (`#233`), distribution channels (`#234`), and a full go-to-market/adoption section (§10: trust, channels, visibility, community, no-telemetry metrics, launch sequencing).
+Compatibility & cost accuracy (Phase A). Makes the headline promise — "works with
+your agent, zero changes" — literally true for Anthropic-native agents, and makes
+reported cost correct on the flagship cache-heavy coding-agent workload.
+
+### Added
+- Native Anthropic Messages ingress: `POST /v1/messages` accepts native Anthropic-format requests (preserving `system`, `tools`, and `tool_use`/`tool_result` content blocks) and returns the native Anthropic response shape. Streaming forwards the native Anthropic SSE event sequence unmodified while accumulating usage for reconciliation. Anthropic-native agents (OpenClaw, claw-code, Claude-family SDKs) connect with `ANTHROPIC_BASE_URL=http://localhost:8585` and zero translation. The shared budget/attribution/detect pipeline is factored so both ingress formats run through one core (`#207`).
+- Prompt-cache cost accounting: cache-read and cache-write tokens are read from Anthropic (`cache_read_input_tokens`/`cache_creation_input_tokens`, non-stream and streaming `message_start`) and OpenAI (`prompt_tokens_details.cached_tokens`) usage and priced with dedicated cache-read/cache-write rates. `report summary` (CLI and admin) breaks usage into fresh input / cache read / cache write / output; totals reconcile to the ledger. Models without cache rates bill cache tokens at the input rate (logged at debug), never dropped (`#208`).
+- Inbound concurrency limit `[server].max_inflight_requests` (default 64) and configurable upstream timeout `[server].upstream_timeout_ms` (default 60000). A provider that does not respond in time yields HTTP 504 with a `provider_timeout` event and releases its reservation (net-zero charge), preserving reserve → dispatch → reconcile (`#209`).
+- Strategic audit `docs/STRATEGY-AUDIT-2026-07-05.md` (rev. 1.1): progress audit, security/scalability/functional findings, competitive analysis, consolidated differentiators, the cost-aware loop and invoice-parity direction, and the go-to-market track; forward roadmap tracked as GitHub epics `#225`-`#228` and child issues `#207`-`#224`, `#230`-`#234`.
 
 ### Changed
-- `docs/GITHUB_BACKLOG.md` rewritten around the forward roadmap, with a consolidated differentiators section, the `phase:m7`-`m10` label scheme, and an honesty ledger of known gaps; alpha.6/beta.1 scope extended with `#230`-`#234`.
-- README fully revamped: comparison table vs LiteLLM/Portkey/Helicone/OpenRouter, real install command (`scripts/install.sh` instead of the aspirational `get.pennyprompt.dev`), real binary name (`penny-cli` instead of `pennyprompt`), CI/release badges, phased roadmap table, privacy section, and contributor on-ramp. Model names in examples aligned with the shipped pricebook.
-- README compatibility table now states the current inbound contract (OpenAI-compatible `/v1/chat/completions`); native Anthropic `/v1/messages` ingress is tracked for alpha.5 (`#207`). README roadmap now points at the backlog as the single source of truth.
-- `docs/LIMITATIONS.md` records the native Anthropic ingress gap (`#207`) and the prompt-cache accounting gap (`#208`) as dated, tracked limitations.
+- The shipped binary is now `pennyprompt` (was `penny-cli`); the crate/package name is unchanged. A `penny-cli` compatibility symlink and one-line deprecation notice ship for one train (removed in beta.1); the installer and release artifacts use `pennyprompt-*` naming, with a legacy-asset fallback so pinned pre-rename tags stay installable (`#236`).
+- Additive migrations `0010`/`0011`: nullable pricebook cache-rate columns and per-request cache-token columns; `input_tokens` now records fresh (non-cached) input. `prices/anthropic.toml` and `prices/openai.toml` carry cache rates for all listed models (`#208`).
+- README compatibility table and `docs/LIMITATIONS.md` flipped to verified now that native Anthropic ingress and cache accounting have landed; README roadmap points at `docs/GITHUB_BACKLOG.md` as the single source of truth (`#210`).
+- `docs/GITHUB_BACKLOG.md` rewritten around the forward roadmap with a consolidated differentiators section, the `phase:m7`-`m10` label scheme, and an honesty ledger of known gaps. README revamped: comparison table vs LiteLLM/Portkey/Helicone/OpenRouter, real install command, CI/release badges, phased roadmap table, privacy section, and contributor on-ramp.
+- `docs/CONFIG-REFERENCE.md` documents the new `[server].max_inflight_requests` and `[server].upstream_timeout_ms` fields (`#209`).
 
 ## [v0.1.0-alpha.3] - 2026-06-20
 

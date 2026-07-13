@@ -5,8 +5,8 @@ This document defines the repeatable process for alpha releases.
 ## Release Gates
 
 - Generic alpha manual checklist: [`docs/ALPHA-MANUAL-CHECKLIST.md`](./ALPHA-MANUAL-CHECKLIST.md)
-- Targeted gate for current cut: [`docs/RELEASE_GATE_v0.1.0-alpha.3.md`](./RELEASE_GATE_v0.1.0-alpha.3.md)
-- Release notes for current cut: [`docs/release-notes/v0.1.0-alpha.3.md`](./release-notes/v0.1.0-alpha.3.md)
+- Targeted gate for current cut: [`docs/RELEASE_GATE_v0.1.0-alpha.5.md`](./RELEASE_GATE_v0.1.0-alpha.5.md)
+- Release notes for current cut: [`docs/release-notes/v0.1.0-alpha.5.md`](./release-notes/v0.1.0-alpha.5.md)
 - Release history reconciliation note: [`docs/release-audit/2026-04-30-release-history-reconciliation.md`](./release-audit/2026-04-30-release-history-reconciliation.md)
 
 ## Scope
@@ -38,7 +38,7 @@ Manual trigger is also available via `workflow_dispatch`.
 ## Cut a Release
 
 1. Ensure `main` is green and synchronized.
-2. Complete the active release gate checklist (`RELEASE_GATE_v0.1.0-alpha.3.md` for alpha.3).
+2. Complete the active release gate checklist (`RELEASE_GATE_v0.1.0-alpha.5.md` for alpha.5).
 3. Update `CHANGELOG.md` and finalize release notes.
 4. Confirm release notes include resolved blocking issues and known limitations link.
 5. Create and push a tag:
