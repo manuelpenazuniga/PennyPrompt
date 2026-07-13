@@ -3,6 +3,12 @@ bind = "127.0.0.1:8585"
 admin_socket = "~/.local/share/pennyprompt/admin.sock"
 database_path = "~/.local/share/pennyprompt/penny.db"
 mode = "guard"
+# Maximum proxy requests processed concurrently. Excess requests queue
+# (backpressure) instead of overwhelming the single SQLite writer. Must be > 0.
+max_inflight_requests = 64
+# Upstream dispatch timeout in milliseconds. A provider that does not respond
+# within this window yields HTTP 504 and releases its budget reservation.
+upstream_timeout_ms = 60000
 
 [defaults]
 provider = "anthropic"

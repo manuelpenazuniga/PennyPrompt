@@ -47,6 +47,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
+use tower::limit::GlobalConcurrencyLimitLayer;
 use tracing::{error, field, info, info_span, Instrument, Span};
 use uuid::Uuid;
 
@@ -78,6 +79,8 @@ pub struct ProxyState {
     session_window_minutes: u64,
     health_db_probe_timeout: Duration,
     cleanup: CleanupSettings,
+    max_inflight_requests: usize,
+    upstream_timeout: Duration,
     started_at: Instant,
 }
 
@@ -104,6 +107,8 @@ impl ProxyState {
             session_window_minutes: 30,
             health_db_probe_timeout: Duration::from_millis(200),
             cleanup: CleanupSettings::default(),
+            max_inflight_requests: penny_config::DEFAULT_MAX_INFLIGHT_REQUESTS as usize,
+            upstream_timeout: Duration::from_millis(penny_config::DEFAULT_UPSTREAM_TIMEOUT_MS),
             started_at: Instant::now(),
         }
     }
@@ -143,6 +148,16 @@ impl ProxyState {
         self
     }
 
+    pub fn with_max_inflight_requests(mut self, max_inflight_requests: usize) -> Self {
+        self.max_inflight_requests = max_inflight_requests.max(1);
+        self
+    }
+
+    pub fn with_upstream_timeout(mut self, timeout: Duration) -> Self {
+        self.upstream_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
     fn with_cleanup(mut self, cleanup: CleanupSettings) -> Self {
         self.cleanup = cleanup;
         self
@@ -167,7 +182,9 @@ pub async fn build_state_from_config(
         .with_detector(Arc::new(DetectEngine::from_runtime_config(&config.detect)))
         .with_mode(mode_from_config(&config.server.mode))
         .with_cleanup(CleanupSettings::from(&config.cleanup))
-        .with_session_window_minutes(config.attribution.session_window_minutes as u64))
+        .with_session_window_minutes(config.attribution.session_window_minutes as u64)
+        .with_max_inflight_requests(config.server.max_inflight_requests as usize)
+        .with_upstream_timeout(Duration::from_millis(config.server.upstream_timeout_ms)))
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +316,12 @@ impl From<&RuntimeCleanupConfig> for CleanupSettings {
 }
 
 pub fn build_router(state: ProxyState) -> Router {
+    // Bound the number of requests processed concurrently. The limit is global
+    // across connections (shared semaphore), so a burst of agents queues behind
+    // it (backpressure) instead of saturating the single SQLite writer. Requests
+    // wait for a permit before any handler runs, so no ledger reservation is
+    // created for a request that is still queued.
+    let max_inflight = state.max_inflight_requests.max(1);
     Router::new()
         .route("/v1/chat/completions", post(post_chat_completions))
         .route("/v1/messages", post(post_messages))
@@ -306,6 +329,7 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/internal/health", get(get_internal_health))
         .with_state(Arc::new(state))
         .layer(middleware::from_fn(request_id_middleware))
+        .layer(GlobalConcurrencyLimitLayer::new(max_inflight))
 }
 
 pub async fn serve_default() -> Result<(), ProxyError> {
@@ -489,9 +513,17 @@ async fn process_normalized_request(
         }
     }
 
-    let provider_response = match state.provider.send(normalized.clone()).await {
-        Ok(response) => response,
-        Err(ProviderError::UnsupportedModel(model)) => {
+    // Bound the dispatch: a provider that never responds must not pin the request
+    // forever. On timeout we release the reservation (net-zero charge) and return
+    // 504 with a `provider_timeout` event.
+    let provider_response = match timeout(
+        state.upstream_timeout,
+        state.provider.send(normalized.clone()),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(ProviderError::UnsupportedModel(model))) => {
             if let Some(context) = enforcement {
                 maybe_release_on_dispatch_failure(
                     &state,
@@ -506,7 +538,7 @@ async fn process_normalized_request(
                 format!("model `{model}` is not configured in the active provider"),
             );
         }
-        Err(ProviderError::InternalState(message)) => {
+        Ok(Err(ProviderError::InternalState(message))) => {
             if let Some(context) = enforcement {
                 maybe_release_on_dispatch_failure(
                     &state,
@@ -519,6 +551,33 @@ async fn process_normalized_request(
                 StatusCode::BAD_GATEWAY,
                 "provider_internal_state",
                 format!("provider internal state error: {message}"),
+            );
+        }
+        Err(_elapsed) => {
+            if let Some(context) = enforcement {
+                maybe_release_on_dispatch_failure(
+                    &state,
+                    &normalized.id,
+                    context.reserve_persisted,
+                )
+                .await;
+            }
+            let timeout_ms = state.upstream_timeout.as_millis() as u64;
+            log_provider_failure_event(
+                &state,
+                &normalized,
+                StatusCode::GATEWAY_TIMEOUT,
+                "provider_timeout",
+                &json!({
+                    "message": "upstream provider did not respond within the timeout",
+                    "timeout_ms": timeout_ms,
+                }),
+            )
+            .await;
+            return error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "provider_timeout",
+                format!("upstream provider did not respond within {timeout_ms}ms"),
             );
         }
     };
@@ -4004,5 +4063,197 @@ action_on_soft = "warn"
             passthrough["headers"]["anthropic-beta"],
             "prompt-caching-2024-07-31"
         );
+    }
+
+    // ---- #209: inbound concurrency limit and upstream timeout ----
+
+    #[derive(Debug, Default)]
+    struct StallingProvider {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for StallingProvider {
+        async fn send(&self, req: NormalizedRequest) -> Result<ProviderResponse, ProviderError> {
+            sleep(self.delay).await;
+            Ok(ProviderResponse {
+                status: 200,
+                body: ResponseBody::Complete(json!({
+                    "id": format!("chatcmpl_{}", req.id),
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "late"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                })),
+                upstream_ms: 0,
+            })
+        }
+
+        fn provider_id(&self) -> &str {
+            "stalling"
+        }
+
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct ConcurrencyProbeProvider {
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+        hold: Duration,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for ConcurrencyProbeProvider {
+        async fn send(&self, req: NormalizedRequest) -> Result<ProviderResponse, ProviderError> {
+            use std::sync::atomic::Ordering;
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+            sleep(self.hold).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(ProviderResponse {
+                status: 200,
+                body: ResponseBody::Complete(json!({
+                    "id": format!("chatcmpl_{}", req.id),
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })),
+                upstream_ms: 0,
+            })
+        }
+
+        fn provider_id(&self) -> &str {
+            "concurrency-probe"
+        }
+
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+    }
+
+    fn chat_request(prompt: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role": "user", "content": prompt}]
+                })
+                .to_string(),
+            ))
+            .expect("build request")
+    }
+
+    #[tokio::test]
+    async fn upstream_timeout_returns_504_releases_reservation_and_logs_event() {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        seed_pricebooks(&store).await;
+        seed_global_day_budget(&store, Money::from_usd(10.0).expect("money")).await;
+
+        let provider: Arc<dyn ProviderAdapter> = Arc::new(StallingProvider {
+            delay: Duration::from_millis(500),
+        });
+        let state = ProxyState::with_provider(provider, vec!["claude-sonnet-4-6".to_string()])
+            .with_store(store.clone())
+            .with_upstream_timeout(Duration::from_millis(50));
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(chat_request("stall please"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json_body["error"]["code"], "provider_timeout");
+
+        // Reservation released → net-zero: reserve then release, running_total back to 0.
+        let entry_types: Vec<String> = sqlx::query_scalar(
+            "SELECT entry_type FROM cost_ledger WHERE request_id = ?1 ORDER BY id",
+        )
+        .bind(&request_id)
+        .fetch_all(store.pool())
+        .await
+        .expect("ledger entries");
+        assert_eq!(entry_types, vec!["reserve", "release"]);
+        let running_total: f64 =
+            sqlx::query_scalar("SELECT running_total FROM cost_ledger ORDER BY id DESC LIMIT 1")
+                .fetch_one(store.pool())
+                .await
+                .expect("running total");
+        assert!(
+            running_total.abs() < 1e-9,
+            "reservation must net to zero after release, got {running_total}"
+        );
+
+        // A `provider_timeout` event is recorded for operators.
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail FROM events WHERE request_id = ?1 AND event_type = 'provider_failure' ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("provider failure event");
+        let detail_json: Value = serde_json::from_str(&detail).expect("event detail json");
+        assert_eq!(detail_json["kind"], "provider_timeout");
+    }
+
+    #[tokio::test]
+    async fn inbound_concurrency_limit_caps_in_flight_requests() {
+        let probe = Arc::new(ConcurrencyProbeProvider {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            hold: Duration::from_millis(40),
+        });
+        let provider: Arc<dyn ProviderAdapter> = probe.clone();
+        // No store: skip budget/ledger so the test isolates the concurrency gate.
+        let state = ProxyState::with_provider(provider, vec!["claude-sonnet-4-6".to_string()])
+            .with_max_inflight_requests(2);
+        let app = build_router(state);
+
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let app = app.clone();
+            handles.push(tokio::spawn(async move {
+                app.oneshot(chat_request(&format!("req {index}")))
+                    .await
+                    .expect("response")
+                    .status()
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.await.expect("join"), StatusCode::OK);
+        }
+
+        let observed_max = probe
+            .max_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed_max <= 2,
+            "expected at most 2 concurrent dispatches, observed {observed_max}"
+        );
+        assert!(observed_max >= 1, "expected the probe to record dispatches");
     }
 }

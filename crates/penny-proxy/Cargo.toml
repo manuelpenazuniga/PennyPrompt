@@ -23,6 +23,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 thiserror = "1"
 tokio = { version = "1", features = ["net", "rt"] }
 tokio-stream = "0.1"
+tower = { version = "0.5", features = ["limit"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v7"] }
 
@@ -30,5 +31,5 @@ uuid = { version = "1", features = ["serde", "v7"] }
 async-trait = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "0.5", features = ["limit", "util"] }
 tracing-subscriber = "0.3"

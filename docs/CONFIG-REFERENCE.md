@@ -39,6 +39,14 @@ Config is resolved in this order (later overrides earlier):
   - bearer/admin-token auth is not implemented in the current alpha
 - `database_path` (`string`): SQLite database path
 - `mode` (`observe|guard`)
+- `max_inflight_requests` (`integer`, default `64`, must be `> 0`): maximum proxy
+  requests processed concurrently. Excess requests queue (backpressure) instead of
+  saturating the single SQLite writer; no budget reservation is created while a
+  request is queued.
+- `upstream_timeout_ms` (`integer`, default `60000`, must be `> 0`): upstream
+  dispatch timeout. A provider that does not respond within this window yields
+  HTTP `504` with a `provider_timeout` event and releases its reservation
+  (net-zero charge).
 
 Operational note:
 
@@ -138,6 +146,8 @@ bind = "127.0.0.1:8585"
 admin_socket = "127.0.0.1:8586"
 database_path = "~/.local/share/pennyprompt/penny.db"
 mode = "guard"
+max_inflight_requests = 64
+upstream_timeout_ms = 60000
 
 [defaults]
 provider = "anthropic"
