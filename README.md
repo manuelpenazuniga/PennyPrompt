@@ -53,14 +53,14 @@ No cloud. No PostgreSQL. No Redis. No YAML labyrinth. No telemetry.
 curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/PennyPrompt/main/scripts/install.sh | sh
 
 # 2. Initialize with a preset ($30/mo, $10/day hard stop, guard mode)
-penny-cli init --preset indie
+pennyprompt init --preset indie
 
 # 3. Import the local pricebook and check your setup
-penny-cli prices update
-penny-cli doctor
+pennyprompt prices update
+pennyprompt doctor
 
 # 4. Start the proxy
-penny-cli serve
+pennyprompt serve
 
 # 5. Point your agent at it (OpenAI-compatible clients)
 export OPENAI_BASE_URL=http://localhost:8585/v1
@@ -69,7 +69,7 @@ export OPENAI_BASE_URL=http://localhost:8585/v1
 Your agent works exactly the same. You control the spend. First report in minutes:
 
 ```
-$ penny-cli report summary --since 1d
+$ pennyprompt report summary --since 1d
 
   Total:       $4.23  (67 requests)
   Burn-rate:   $2.80/hr active
@@ -152,12 +152,12 @@ Three per-session heuristics, no ML, sub-millisecond:
 - **Abnormal burn-rate** — `$14.20/hr (threshold: $10/hr)`
 - **Request similarity** — near-identical requests hammering the window
 
-Actions: `alert` (log + `tail`) or `pause` (block the session until `penny-cli detect resume`).
+Actions: `alert` (log + `tail`) or `pause` (block the session until `pennyprompt detect resume`).
 
 ### 🔮 Pre-Execution Cost Estimation
 
 ```
-$ penny-cli estimate --model claude-sonnet-4-6 --context-files src/auth/
+$ pennyprompt estimate --model claude-sonnet-4-6 --context-files src/auth/
 
   claude-sonnet-4-6:  $0.12 – $0.45 (single pass) | $0.60 – $2.25 (agent task)
   claude-opus-4-7:    $0.35 – $1.25 (single pass) | $1.75 – $6.25 (agent task)
@@ -173,7 +173,7 @@ No custom headers, no virtual keys. **Project** is detected from the git root; *
 ### 📺 Real-Time Monitoring
 
 ```
-$ penny-cli tail
+$ pennyprompt tail
 
   [14:23:01] → sonnet  4,231 in / 892 out    $0.018  webapp/sess_x1
   [14:23:04] → sonnet  6,102 in / 1,203 out  $0.031  webapp/sess_x1
@@ -240,9 +240,9 @@ PennyPrompt works with any tool that speaks the OpenAI chat completions API:
 Zero-friction start with presets:
 
 ```bash
-penny-cli init --preset indie     # $30/mo, $10/day hard stop, guard mode
-penny-cli init --preset team      # $100/mo, $20/day hard stop, guard mode
-penny-cli init --preset explore   # $10/mo soft limit only, observe mode
+pennyprompt init --preset indie     # $30/mo, $10/day hard stop, guard mode
+pennyprompt init --preset team      # $100/mo, $20/day hard stop, guard mode
+pennyprompt init --preset explore   # $10/mo soft limit only, observe mode
 ```
 
 Everything lives in one TOML file (`~/.config/pennyprompt/config.toml`):

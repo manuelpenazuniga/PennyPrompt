@@ -3,7 +3,11 @@ set -eu
 
 REPO="${PENNY_REPO:-manuelpenazuniga/PennyPrompt}"
 INSTALL_DIR="${PENNY_INSTALL_DIR:-${HOME:-$PWD}/.local/bin}"
-BIN_NAME="penny-cli"
+# The shipped binary is `pennyprompt`. Releases at or before the rename
+# (v0.1.0-alpha.4 and older) shipped `penny-cli`; the installer falls back to
+# that legacy asset name so pinned older tags stay installable.
+BIN_NAME="pennyprompt"
+LEGACY_BIN_NAME="penny-cli"
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -75,17 +79,25 @@ main() {
   target="${arch}-${os}"
   version="$(resolve_version)"
 
-  asset="${BIN_NAME}-${version}-${target}.tar.gz"
-  checksum="${BIN_NAME}-${version}-${target}.sha256"
   base_url="https://github.com/${REPO}/releases/download/${version}"
-
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 
-  echo "Installing ${BIN_NAME} ${version} for ${target}"
-  curl -fsSL "${base_url}/${asset}" -o "${tmp_dir}/${asset}"
+  # Prefer the current `pennyprompt-*` asset. Fall back to the legacy
+  # `penny-cli-*` asset for releases published before the rename.
+  bin_name="$BIN_NAME"
+  asset="${BIN_NAME}-${version}-${target}.tar.gz"
+  checksum="${BIN_NAME}-${version}-${target}.sha256"
+  if ! curl -fsSL "${base_url}/${asset}" -o "${tmp_dir}/${asset}" 2>/dev/null; then
+    echo "note: ${asset} not found; falling back to legacy ${LEGACY_BIN_NAME} asset for ${version}"
+    bin_name="$LEGACY_BIN_NAME"
+    asset="${LEGACY_BIN_NAME}-${version}-${target}.tar.gz"
+    checksum="${LEGACY_BIN_NAME}-${version}-${target}.sha256"
+    curl -fsSL "${base_url}/${asset}" -o "${tmp_dir}/${asset}"
+  fi
   curl -fsSL "${base_url}/${checksum}" -o "${tmp_dir}/${checksum}"
 
+  echo "Installing ${bin_name} ${version} for ${target}"
   (
     cd "$tmp_dir"
     verify_checksum "$checksum"
@@ -94,13 +106,21 @@ main() {
 
   mkdir -p "$INSTALL_DIR"
   if command -v install >/dev/null 2>&1; then
-    install -m 755 "${tmp_dir}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+    install -m 755 "${tmp_dir}/${bin_name}" "${INSTALL_DIR}/${bin_name}"
   else
-    cp "${tmp_dir}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
-    chmod 755 "${INSTALL_DIR}/${BIN_NAME}"
+    cp "${tmp_dir}/${bin_name}" "${INSTALL_DIR}/${bin_name}"
+    chmod 755 "${INSTALL_DIR}/${bin_name}"
   fi
 
-  echo "Installed to ${INSTALL_DIR}/${BIN_NAME}"
+  # One-train compatibility: expose the legacy `penny-cli` command as a symlink
+  # to `pennyprompt` (removed in beta.1). Skipped when installing a legacy asset,
+  # which already installs `penny-cli` directly.
+  if [ "$bin_name" = "$BIN_NAME" ]; then
+    ln -sf "$BIN_NAME" "${INSTALL_DIR}/${LEGACY_BIN_NAME}"
+    echo "note: created legacy '${LEGACY_BIN_NAME}' -> '${BIN_NAME}' symlink (deprecated, removed in beta.1)"
+  fi
+
+  echo "Installed to ${INSTALL_DIR}/${bin_name}"
   case ":$PATH:" in
     *":${INSTALL_DIR}:"*) ;;
     *)

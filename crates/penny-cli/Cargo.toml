@@ -4,6 +4,13 @@ version = "0.1.0-alpha.3"
 edition = "2021"
 publish = false
 
+# The shipped binary is `pennyprompt` (matching the product name). The crate
+# name stays `penny-cli` to avoid workspace/CI churn. A legacy `penny-cli`
+# compatibility symlink is created by the installer (one train; removed in beta.1).
+[[bin]]
+name = "pennyprompt"
+path = "src/main.rs"
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }

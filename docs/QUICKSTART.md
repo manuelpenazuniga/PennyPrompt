@@ -12,13 +12,13 @@ cargo build --release -p penny-cli
 
 Use one of these command styles in the rest of this guide:
 
-- `./target/release/penny-cli <command>`
+- `./target/release/pennyprompt <command>`
 - `cargo run -p penny-cli -- <command>`
 
 ## 2. Initialize Configuration
 
 ```bash
-./target/release/penny-cli init --preset indie
+./target/release/pennyprompt init --preset indie
 ```
 
 Available presets:
@@ -30,7 +30,7 @@ Available presets:
 If the file already exists and you want to overwrite:
 
 ```bash
-./target/release/penny-cli init --preset indie --force
+./target/release/pennyprompt init --preset indie --force
 ```
 
 ## 3. Set Provider Keys
@@ -43,15 +43,15 @@ export OPENAI_API_KEY=...
 ## 4. Import Local Pricebook
 
 ```bash
-./target/release/penny-cli prices update
-./target/release/penny-cli prices show --limit 20
+./target/release/pennyprompt prices update
+./target/release/pennyprompt prices show --limit 20
 ```
 
 ## 5. Run Health and Config Checks
 
 ```bash
-./target/release/penny-cli doctor
-./target/release/penny-cli config --json
+./target/release/pennyprompt doctor
+./target/release/pennyprompt config --json
 ```
 
 ## 6. Start Proxy + Admin Planes
@@ -59,7 +59,7 @@ export OPENAI_API_KEY=...
 Run `serve` in terminal A and keep it running:
 
 ```bash
-./target/release/penny-cli serve --admin-bind 127.0.0.1:8586
+./target/release/pennyprompt serve --admin-bind 127.0.0.1:8586
 ```
 
 This is the recommended default topology for local operator workflows because `tail` and `detect` commands default to `http://127.0.0.1:8586`.
@@ -67,15 +67,15 @@ This is the recommended default topology for local operator workflows because `t
 If you want a fully local smoke test without provider keys:
 
 ```bash
-./target/release/penny-cli serve --mock --admin-bind 127.0.0.1:8586
+./target/release/pennyprompt serve --mock --admin-bind 127.0.0.1:8586
 ```
 
 To run the same local topology in the background:
 
 ```bash
-./target/release/penny-cli serve --daemon --mock --admin-bind 127.0.0.1:8586
-./target/release/penny-cli serve --status
-./target/release/penny-cli serve --stop
+./target/release/pennyprompt serve --daemon --mock --admin-bind 127.0.0.1:8586
+./target/release/pennyprompt serve --status
+./target/release/pennyprompt serve --stop
 ```
 
 The default background pid/log files live next to the user config:
@@ -86,7 +86,7 @@ The default background pid/log files live next to the user config:
 Estimate:
 
 ```bash
-./target/release/penny-cli estimate \
+./target/release/pennyprompt estimate \
   --model claude-sonnet-4-6 \
   --context-files "src/**/*.rs" \
   --task-type multi-round
@@ -95,32 +95,32 @@ Estimate:
 Budget overview:
 
 ```bash
-./target/release/penny-cli budget list
+./target/release/pennyprompt budget list
 ```
 
 Detect control plane:
 
 ```bash
-./target/release/penny-cli detect status
+./target/release/pennyprompt detect status
 ```
 
 Reports:
 
 ```bash
-./target/release/penny-cli report summary --since 1d
-./target/release/penny-cli report top --limit 20
+./target/release/pennyprompt report summary --since 1d
+./target/release/pennyprompt report top --limit 20
 ```
 
 Live monitoring:
 
 ```bash
-./target/release/penny-cli tail
+./target/release/pennyprompt tail
 ```
 
 Resume a paused session:
 
 ```bash
-./target/release/penny-cli detect resume <session_id>
+./target/release/pennyprompt detect resume <session_id>
 ```
 
 ## 8. Launcher Execution
@@ -128,20 +128,20 @@ Resume a paused session:
 Preview launcher attribution and runtime wiring:
 
 ```bash
-./target/release/penny-cli run codex
-./target/release/penny-cli run codex --json
+./target/release/pennyprompt run codex
+./target/release/pennyprompt run codex --json
 ```
 
 Execute a local agent command through a temporary PennyPrompt proxy:
 
 ```bash
-./target/release/penny-cli run codex --execute -- --help
+./target/release/pennyprompt run codex --execute -- --help
 ```
 
 Smoke the launcher without provider credentials:
 
 ```bash
-./target/release/penny-cli run sh --execute --mock -- -c 'echo "$OPENAI_BASE_URL"'
+./target/release/pennyprompt run sh --execute --mock -- -c 'echo "$OPENAI_BASE_URL"'
 ```
 
 Notes:

@@ -25,8 +25,13 @@ curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/PennyPrompt/main/s
 By default the binary is installed to:
 
 ```text
-~/.local/bin/penny-cli
+~/.local/bin/pennyprompt
 ```
+
+The installer also creates a legacy `penny-cli` symlink pointing at `pennyprompt`
+for one release train; invoking `penny-cli` prints a deprecation notice and the
+symlink is removed in `beta.1`. Pinned installs of pre-rename tags
+(`v0.1.0-alpha.4` and older) still resolve via the legacy `penny-cli-*` asset.
 
 Override install location:
 
@@ -54,7 +59,7 @@ cargo build --release -p penny-cli
 The binary is generated at:
 
 ```text
-target/release/penny-cli
+target/release/pennyprompt
 ```
 
 ## 4. Run Commands
@@ -64,7 +69,7 @@ You can either:
 - run the binary directly:
 
 ```bash
-./target/release/penny-cli doctor
+./target/release/pennyprompt doctor
 ```
 
 - or run from source:
@@ -83,14 +88,14 @@ pp doctor
 Launcher preview and execution:
 
 ```bash
-./target/release/penny-cli run codex
-./target/release/penny-cli run codex --execute -- --help
+./target/release/pennyprompt run codex
+./target/release/pennyprompt run codex --execute -- --help
 ```
 
 For a credential-free smoke, use the mock provider:
 
 ```bash
-./target/release/penny-cli run sh --execute --mock -- -c 'echo "$OPENAI_BASE_URL"'
+./target/release/pennyprompt run sh --execute --mock -- -c 'echo "$OPENAI_BASE_URL"'
 ```
 
 ## 5. Configure Initial Settings
@@ -98,7 +103,7 @@ For a credential-free smoke, use the mock provider:
 Create a local config from a preset:
 
 ```bash
-./target/release/penny-cli init --preset indie
+./target/release/pennyprompt init --preset indie
 ```
 
 Default config target:
@@ -116,9 +121,9 @@ export PENNY_CONFIG=/absolute/path/to/config.toml
 ## 6. Seed Pricebook and Verify
 
 ```bash
-./target/release/penny-cli prices update
-./target/release/penny-cli doctor
-./target/release/penny-cli config --json
+./target/release/pennyprompt prices update
+./target/release/pennyprompt doctor
+./target/release/pennyprompt config --json
 ```
 
 ## 7. API Key Environment Variables

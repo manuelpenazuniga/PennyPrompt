@@ -1,10 +1,10 @@
 use std::process::Command;
 
 fn help_output(args: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_penny-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_pennyprompt"))
         .args(args)
         .output()
-        .expect("run penny-cli help");
+        .expect("run pennyprompt help");
 
     assert!(
         output.status.success(),

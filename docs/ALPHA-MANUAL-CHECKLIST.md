@@ -19,44 +19,44 @@ Use this checklist before cutting an alpha release candidate.
 - [ ] Build CLI:
   - [ ] `cargo build --release -p penny-cli`
 - [ ] Initialize config:
-  - [ ] `penny-cli init --preset indie`
+  - [ ] `pennyprompt init --preset indie`
 - [ ] Verify doctor output is actionable:
-  - [ ] `penny-cli doctor`
+  - [ ] `pennyprompt doctor`
 - [ ] Verify effective config visibility:
-  - [ ] `penny-cli config --json`
+  - [ ] `pennyprompt config --json`
 
 ## Pricing and Budget Ops
 
 - [ ] Import pricebook:
-  - [ ] `penny-cli prices update`
+  - [ ] `pennyprompt prices update`
 - [ ] List active pricebook entries:
-  - [ ] `penny-cli prices show --limit 20`
+  - [ ] `pennyprompt prices show --limit 20`
 - [ ] List budgets:
-  - [ ] `penny-cli budget list`
+  - [ ] `pennyprompt budget list`
 - [ ] Set and reset a test budget:
-  - [ ] `penny-cli budget set ...`
-  - [ ] `penny-cli budget reset ...`
+  - [ ] `pennyprompt budget set ...`
+  - [ ] `pennyprompt budget reset ...`
 
 ## Reporting and Estimation
 
 - [ ] Estimate command returns range + confidence:
-  - [ ] `penny-cli estimate --model claude-sonnet-4-6 --context-files "src/**/*.rs"`
+  - [ ] `pennyprompt estimate --model claude-sonnet-4-6 --context-files "src/**/*.rs"`
 - [ ] Summary report runs:
-  - [ ] `penny-cli report summary --since 1d`
+  - [ ] `pennyprompt report summary --since 1d`
 - [ ] Top report runs:
-  - [ ] `penny-cli report top --limit 20`
+  - [ ] `pennyprompt report top --limit 20`
 
 ## Detection Control Plane
 
 - [ ] Detect status returns operator-readable state:
-  - [ ] `penny-cli detect status`
+  - [ ] `pennyprompt detect status`
 - [ ] Detect resume command responds correctly for paused session:
-  - [ ] `penny-cli detect resume <session_id>`
+  - [ ] `pennyprompt detect resume <session_id>`
 
 ## Event Streaming
 
 - [ ] Tail attaches to admin SSE and prints near-real-time events:
-  - [ ] `penny-cli tail --admin-url http://127.0.0.1:8586`
+  - [ ] `pennyprompt tail --admin-url http://127.0.0.1:8586`
 - [ ] `NO_COLOR=1` disables ANSI formatting in tail output.
 
 ## Documentation Gate

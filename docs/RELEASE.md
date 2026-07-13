@@ -11,7 +11,7 @@ This document defines the repeatable process for alpha releases.
 
 ## Scope
 
-Current release automation builds and publishes `penny-cli` binaries for:
+Current release automation builds and publishes `pennyprompt` binaries for:
 
 - Linux `x86_64-unknown-linux-gnu`
 - Linux `aarch64-unknown-linux-gnu`
@@ -52,7 +52,7 @@ git push origin v0.1.0-alpha.3
 
 6. Wait for the `Release` workflow to finish.
 7. Verify GitHub Release contains:
-- 3 CI target archives (`penny-cli-vX.Y.Z-<target>.tar.gz`)
+- 3 CI target archives (`pennyprompt-vX.Y.Z-<target>.tar.gz`)
 - 3 checksum files (`.sha256`)
 - `CHECKSUMS.txt`
 
@@ -65,7 +65,7 @@ For other versions, replace the tag value and keep the same gate sequence.
 Download one artifact and verify:
 
 ```bash
-shasum -a 256 -c penny-cli-v0.1.0-alpha.3-x86_64-unknown-linux-gnu.sha256
+shasum -a 256 -c pennyprompt-v0.1.0-alpha.3-x86_64-unknown-linux-gnu.sha256
 ```
 
 If `shasum` is unavailable, use `sha256sum -c`.
@@ -120,12 +120,12 @@ cargo build --release -p penny-cli --target x86_64-apple-darwin --locked
 # 4. Package exactly as release.yml does.
 VERSION=v0.1.0-alpha.2
 TARGET=x86_64-apple-darwin
-ASSET="penny-cli-${VERSION}-${TARGET}"
+ASSET="pennyprompt-${VERSION}-${TARGET}"
 mkdir -p dist
-cp "target/${TARGET}/release/penny-cli" "dist/penny-cli"
-tar -C dist -czf "dist/${ASSET}.tar.gz" penny-cli
+cp "target/${TARGET}/release/pennyprompt" "dist/pennyprompt"
+tar -C dist -czf "dist/${ASSET}.tar.gz" pennyprompt
 ( cd dist && shasum -a 256 "${ASSET}.tar.gz" > "${ASSET}.sha256" )
-rm -f dist/penny-cli
+rm -f dist/pennyprompt
 
 # 5. Upload artifacts to the existing GitHub Release.
 gh release upload "${VERSION}" --repo manuelpenazuniga/PennyPrompt \
@@ -142,8 +142,8 @@ gh release upload "${VERSION}" --repo manuelpenazuniga/PennyPrompt \
 # 7. Verify end-to-end from a fresh temp dir.
 VD=$(mktemp -d) && cd "$VD"
 gh release download "${VERSION}" --repo manuelpenazuniga/PennyPrompt \
-  --pattern "penny-cli-${VERSION}-${TARGET}.*"
-shasum -a 256 -c "penny-cli-${VERSION}-${TARGET}.sha256"
+  --pattern "pennyprompt-${VERSION}-${TARGET}.*"
+shasum -a 256 -c "pennyprompt-${VERSION}-${TARGET}.sha256"
 ```
 
 Locally backfilled artifacts have a different host/SDK provenance from CI-built artifacts; this difference must be disclosed in the corresponding `docs/release-notes/<tag>.md` file under an `### Artifact provenance` section.

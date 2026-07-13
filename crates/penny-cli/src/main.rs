@@ -675,10 +675,30 @@ enum CliError {
 
 #[tokio::main]
 async fn main() {
+    warn_if_legacy_invocation();
     let cli = Cli::parse();
     if let Err(error) = run(cli).await {
         eprintln!("error: {error}");
         std::process::exit(1);
+    }
+}
+
+/// The binary is now `pennyprompt`. A `penny-cli` compatibility symlink ships for
+/// one release train; warn (once, to stderr) when invoked under the old name so
+/// users migrate before the shim is removed in beta.1.
+fn warn_if_legacy_invocation() {
+    let invoked_as = std::env::args_os()
+        .next()
+        .map(std::path::PathBuf::from)
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    if invoked_as == "penny-cli" {
+        eprintln!(
+            "warning: `penny-cli` is deprecated and will be removed in beta.1; use `pennyprompt` instead"
+        );
     }
 }
 
