@@ -201,6 +201,23 @@ fn parse_money_str(value: &str) -> Result<Money, MoneyError> {
     Ok(Money::from_micros(micros))
 }
 
+/// Wire format the client used to reach the proxy.
+///
+/// The proxy accepts both the OpenAI Chat Completions contract and the native
+/// Anthropic Messages contract on separate ingress routes. The format is carried
+/// on the normalized request so provider adapters know which response shape the
+/// client expects (OpenAI-shaped JSON/SSE vs. native Anthropic JSON/SSE) while
+/// the budget/attribution/detect pipeline stays format-agnostic.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressFormat {
+    /// OpenAI `/v1/chat/completions` contract (default).
+    #[default]
+    OpenAi,
+    /// Native Anthropic `/v1/messages` contract.
+    Anthropic,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NormalizedRequest {
     pub id: RequestId,
@@ -214,6 +231,17 @@ pub struct NormalizedRequest {
     pub estimated_input_tokens: u64,
     pub estimated_output_tokens: u64,
     pub timestamp: DateTime<Utc>,
+    /// Wire format of the inbound request; determines the response shape returned
+    /// to the client. Defaults to OpenAI for backward compatibility.
+    #[serde(default)]
+    pub ingress_format: IngressFormat,
+    /// Format-specific request fields that must be forwarded to the upstream
+    /// provider verbatim but are not modeled on the shared pipeline (for native
+    /// Anthropic ingress: the `system`, `tools`, `tool_choice`, and `max_tokens`
+    /// fields). `None` for OpenAI ingress, where the payload is reconstructed
+    /// from the normalized fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -522,6 +550,11 @@ mod tests {
             estimated_input_tokens: 1200,
             estimated_output_tokens: 300,
             timestamp: ts(),
+            ingress_format: IngressFormat::Anthropic,
+            passthrough: Some(serde_json::json!({
+                "body": { "max_tokens": 512 },
+                "headers": { "anthropic-version": "2023-06-01" }
+            })),
         };
         assert_round_trip(&value);
     }

@@ -35,8 +35,8 @@ use penny_store::{
     SqliteStore, UsageRecord,
 };
 use penny_types::{
-    Budget, BudgetBlockDetail, EventType, Mode, Money, NormalizedRequest, RequestDigest,
-    ResponseBody, RouteDecision, ScopeType, Severity, UsageSource, WindowType,
+    Budget, BudgetBlockDetail, EventType, IngressFormat, Mode, Money, NormalizedRequest,
+    RequestDigest, ResponseBody, RouteDecision, ScopeType, Severity, UsageSource, WindowType,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -184,6 +184,21 @@ struct ChatCompletionsRequest {
     stream: bool,
 }
 
+/// Native Anthropic Messages API request. `model`, `messages`, and `stream` are
+/// lifted into the normalized pipeline; every other top-level field (`system`,
+/// `tools`, `tool_choice`, `max_tokens`, `temperature`, `metadata`, …) is captured
+/// in `rest` and forwarded to the upstream provider verbatim.
+#[derive(Debug, Deserialize)]
+struct AnthropicMessagesRequest {
+    model: String,
+    #[serde(default)]
+    messages: Value,
+    #[serde(default)]
+    stream: bool,
+    #[serde(flatten)]
+    rest: serde_json::Map<String, Value>,
+}
+
 #[derive(Debug, Serialize)]
 struct ApiError {
     error: ApiErrorDetail,
@@ -281,6 +296,7 @@ impl From<&RuntimeCleanupConfig> for CleanupSettings {
 pub fn build_router(state: ProxyState) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(post_chat_completions))
+        .route("/v1/messages", post(post_messages))
         .route("/v1/models", get(get_models))
         .route("/internal/health", get(get_internal_health))
         .with_state(Arc::new(state))
@@ -361,6 +377,43 @@ async fn post_chat_completions(
         .await
 }
 
+async fn post_messages(
+    State(state): State<Arc<ProxyState>>,
+    Extension(ctx): Extension<RequestContext>,
+    headers: HeaderMap,
+    Json(payload): Json<AnthropicMessagesRequest>,
+) -> Response {
+    let request_id = ctx.request_id.clone();
+    let model = extract_model(&payload.model);
+    let provider = state.provider.provider_id().to_string();
+    let span = info_span!(
+        "proxy.request",
+        request_id = %request_id,
+        session_id = field::Empty,
+        model = %model,
+        provider = %provider
+    );
+
+    async move { post_messages_instrumented(state, ctx, headers, payload).await }
+        .instrument(span)
+        .await
+}
+
+async fn post_messages_instrumented(
+    state: Arc<ProxyState>,
+    ctx: RequestContext,
+    headers: HeaderMap,
+    payload: AnthropicMessagesRequest,
+) -> Response {
+    let request_started_at = Instant::now();
+    if let Err(message) = validate_messages_request(&payload) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_request", message);
+    }
+
+    let normalized = normalize_messages_request(&ctx, &state, &payload, &headers);
+    process_normalized_request(state, headers, normalized, request_started_at).await
+}
+
 async fn post_chat_completions_instrumented(
     state: Arc<ProxyState>,
     ctx: RequestContext,
@@ -372,7 +425,23 @@ async fn post_chat_completions_instrumented(
         return error_response(StatusCode::BAD_REQUEST, "invalid_request", message);
     }
 
-    let mut normalized = normalize_chat_request(&ctx, &state, &payload);
+    let normalized = normalize_chat_request(&ctx, &state, &payload);
+    process_normalized_request(state, headers, normalized, request_started_at).await
+}
+
+/// Shared request pipeline for every ingress format.
+///
+/// Both the OpenAI `/v1/chat/completions` and the native Anthropic `/v1/messages`
+/// handlers normalize their wire payload into a [`NormalizedRequest`] and then
+/// call this core, which owns attribution, pause checks, budget reserve/dispatch/
+/// reconcile, persistence, and detector feed identically. Only the request
+/// (de)serialization and the response shape (carried by `ingress_format`) differ.
+async fn process_normalized_request(
+    state: Arc<ProxyState>,
+    headers: HeaderMap,
+    mut normalized: NormalizedRequest,
+    request_started_at: Instant,
+) -> Response {
     let (project_id, session_id) = match resolve_attribution(&state, &headers).await {
         Ok(attribution) => attribution,
         Err(message) => {
@@ -479,7 +548,7 @@ async fn post_chat_completions_instrumented(
                 return (status, Json(value)).into_response();
             }
 
-            let mut usage = provider_usage_from_completion(&value)
+            let mut usage = provider_usage_from_response(&value, normalized.ingress_format)
                 .unwrap_or_else(|| estimated_usage_from_request(&normalized));
             let cleanup_metrics = apply_cleanup_to_json(&mut value, state.cleanup);
             attach_cleanup_metrics(&mut usage, state.cleanup, cleanup_metrics);
@@ -692,6 +761,66 @@ fn normalize_chat_request(
         estimated_input_tokens: estimate.input_tokens,
         estimated_output_tokens: estimate.output_tokens,
         timestamp: Utc::now(),
+        ingress_format: IngressFormat::OpenAi,
+        passthrough: None,
+    }
+}
+
+fn validate_messages_request(payload: &AnthropicMessagesRequest) -> Result<(), String> {
+    if extract_model(&payload.model).is_empty() {
+        return Err("field `model` must not be empty".to_string());
+    }
+
+    let Some(messages) = payload.messages.as_array() else {
+        return Err("field `messages` must be an array".to_string());
+    };
+
+    if messages.is_empty() {
+        return Err("field `messages` must contain at least one message".to_string());
+    }
+
+    Ok(())
+}
+
+fn normalize_messages_request(
+    ctx: &RequestContext,
+    state: &ProxyState,
+    payload: &AnthropicMessagesRequest,
+    headers: &HeaderMap,
+) -> NormalizedRequest {
+    let model = extract_model(&payload.model);
+    let estimate = estimate_tokens_for_model_id(&model, &payload.messages);
+
+    // Body extras: every top-level Anthropic field except model/messages/stream,
+    // forwarded upstream verbatim so tools, system, tool_choice, max_tokens, and
+    // any other parameters survive.
+    let body_extras = Value::Object(payload.rest.clone());
+    // Preserve the client's Anthropic protocol headers on the outbound call.
+    let mut forwarded_headers = serde_json::Map::new();
+    for name in ["anthropic-version", "anthropic-beta"] {
+        if let Some(value) = header_value(headers, name) {
+            forwarded_headers.insert(name.to_string(), Value::String(value));
+        }
+    }
+    let passthrough = Some(json!({
+        "body": body_extras,
+        "headers": Value::Object(forwarded_headers),
+    }));
+
+    NormalizedRequest {
+        id: ctx.request_id.clone(),
+        project_id: state.default_project_id.clone(),
+        session_id: state.default_session_id.clone(),
+        model_requested: model.clone(),
+        model_resolved: model,
+        provider_id: state.provider.provider_id().to_string(),
+        messages: payload.messages.clone(),
+        stream: payload.stream,
+        estimated_input_tokens: estimate.input_tokens,
+        estimated_output_tokens: estimate.output_tokens,
+        timestamp: Utc::now(),
+        ingress_format: IngressFormat::Anthropic,
+        passthrough,
     }
 }
 
@@ -699,10 +828,34 @@ fn extract_model(raw: &str) -> String {
     raw.trim().to_string()
 }
 
+fn provider_usage_from_response(
+    payload: &Value,
+    ingress: IngressFormat,
+) -> Option<NormalizedUsage> {
+    match ingress {
+        IngressFormat::Anthropic => provider_usage_from_anthropic_message(payload),
+        IngressFormat::OpenAi => provider_usage_from_completion(payload),
+    }
+}
+
 fn provider_usage_from_completion(payload: &Value) -> Option<NormalizedUsage> {
     let usage = payload.get("usage")?;
     let input_tokens = usage.get("prompt_tokens")?.as_u64()?;
     let output_tokens = usage.get("completion_tokens")?.as_u64()?;
+    Some(NormalizedUsage {
+        input_tokens,
+        output_tokens,
+        source: UsageSource::Provider,
+        pricing_snapshot: usage.clone(),
+    })
+}
+
+/// Extract provider usage from a native Anthropic Messages response body
+/// (`usage.input_tokens` / `usage.output_tokens`).
+fn provider_usage_from_anthropic_message(payload: &Value) -> Option<NormalizedUsage> {
+    let usage = payload.get("usage")?;
+    let input_tokens = usage.get("input_tokens")?.as_u64()?;
+    let output_tokens = usage.get("output_tokens")?.as_u64()?;
     Some(NormalizedUsage {
         input_tokens,
         output_tokens,
@@ -883,7 +1036,17 @@ fn attach_cleanup_metrics(
     usage.pricing_snapshot = Value::Object(snapshot);
 }
 
-fn provider_usage_from_sse_lines(lines: &[String]) -> Option<NormalizedUsage> {
+fn provider_usage_from_sse_lines(
+    lines: &[String],
+    ingress: IngressFormat,
+) -> Option<NormalizedUsage> {
+    match ingress {
+        IngressFormat::Anthropic => provider_usage_from_anthropic_sse_lines(lines),
+        IngressFormat::OpenAi => provider_usage_from_openai_sse_lines(lines),
+    }
+}
+
+fn provider_usage_from_openai_sse_lines(lines: &[String]) -> Option<NormalizedUsage> {
     for line in lines {
         let Some(data) = line.strip_prefix("data:") else {
             continue;
@@ -901,6 +1064,78 @@ fn provider_usage_from_sse_lines(lines: &[String]) -> Option<NormalizedUsage> {
     }
 
     None
+}
+
+/// Accumulate usage from a native Anthropic SSE stream: `input_tokens` arrives in
+/// the `message_start` event and the final `output_tokens` in `message_delta`.
+fn provider_usage_from_anthropic_sse_lines(lines: &[String]) -> Option<NormalizedUsage> {
+    let mut input_tokens: Option<u64> = None;
+    let mut output_tokens: Option<u64> = None;
+
+    for chunk in lines {
+        for physical in chunk.lines() {
+            let Some(data) = physical.trim_start().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data.eq_ignore_ascii_case("[DONE]") {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            match parsed.get("type").and_then(Value::as_str) {
+                Some("message_start") => {
+                    let usage = parsed
+                        .get("message")
+                        .and_then(|message| message.get("usage"));
+                    if let Some(value) = usage
+                        .and_then(|u| u.get("input_tokens"))
+                        .and_then(Value::as_u64)
+                    {
+                        input_tokens = Some(value);
+                    }
+                    if let Some(value) = usage
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(Value::as_u64)
+                    {
+                        output_tokens = Some(value);
+                    }
+                }
+                Some("message_delta") => {
+                    if let Some(value) = parsed
+                        .get("usage")
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(Value::as_u64)
+                    {
+                        output_tokens = Some(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let input_tokens = input_tokens?;
+    let output_tokens = output_tokens.unwrap_or(0);
+    Some(NormalizedUsage {
+        input_tokens,
+        output_tokens,
+        source: UsageSource::Provider,
+        pricing_snapshot: json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }),
+    })
+}
+
+fn stream_chunk_is_terminal(chunk: &str, ingress: IngressFormat) -> bool {
+    match ingress {
+        IngressFormat::OpenAi => chunk.trim().eq_ignore_ascii_case("data: [done]"),
+        IngressFormat::Anthropic => chunk
+            .lines()
+            .any(|line| line.trim() == "event: message_stop"),
+    }
 }
 
 fn estimated_usage_from_request(request: &NormalizedRequest) -> NormalizedUsage {
@@ -1298,7 +1533,7 @@ async fn stream_passthrough_response(
             while let Some(line) = upstream.recv().await {
                 let (line, line_metrics) = cleanup_sse_line(&line, state.cleanup);
                 cleanup_metrics.merge(line_metrics);
-                if line.trim().eq_ignore_ascii_case("data: [done]") {
+                if stream_chunk_is_terminal(&line, normalized.ingress_format) {
                     saw_done = true;
                 }
                 lines.push(line.clone());
@@ -1310,7 +1545,7 @@ async fn stream_passthrough_response(
                 }
             }
 
-            let mut usage = provider_usage_from_sse_lines(&lines)
+            let mut usage = provider_usage_from_sse_lines(&lines, normalized.ingress_format)
                 .unwrap_or_else(|| estimated_usage_from_request(&normalized));
             attach_cleanup_metrics(&mut usage, state.cleanup, cleanup_metrics);
             if !saw_done {
@@ -2058,6 +2293,8 @@ mod tests {
             estimated_input_tokens: 100,
             estimated_output_tokens: 50,
             timestamp: Utc::now(),
+            ingress_format: IngressFormat::OpenAi,
+            passthrough: None,
         }
     }
 
@@ -3340,5 +3577,217 @@ action_on_soft = "warn"
             .expect("request row");
         assert_eq!(row.get::<String, _>("project_id"), "custom-project-name");
         assert_eq!(row.get::<String, _>("session_id"), "session_override_01");
+    }
+
+    // ---- #207: native Anthropic /v1/messages ingress ----
+
+    fn anthropic_messages_body(stream: bool) -> Value {
+        json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 256,
+            "system": "You are a helpful assistant.",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            "stream": stream
+        })
+    }
+
+    #[tokio::test]
+    async fn messages_ingress_non_stream_returns_anthropic_shape_and_records_ledger() {
+        let (app, store) = app_with_store().await;
+        seed_pricebooks(&store).await;
+        seed_global_day_budget(&store, Money::from_usd(10.0).expect("money")).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .body(Body::from(anthropic_messages_body(false).to_string()))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        // Native Anthropic Messages response shape, not the OpenAI chat.completion shape.
+        assert_eq!(json_body["type"], "message");
+        assert_eq!(json_body["role"], "assistant");
+        assert_eq!(json_body["content"][0]["type"], "text");
+        assert_eq!(
+            json_body["content"][0]["text"],
+            "Mock provider deterministic response."
+        );
+        assert_eq!(json_body["usage"]["input_tokens"], 120);
+        assert_eq!(json_body["usage"]["output_tokens"], 48);
+        assert!(json_body.get("choices").is_none());
+
+        let entry_types: Vec<String> = sqlx::query_scalar(
+            "SELECT entry_type FROM cost_ledger WHERE request_id = ?1 ORDER BY id",
+        )
+        .bind(&request_id)
+        .fetch_all(store.pool())
+        .await
+        .expect("ledger entries");
+        assert_eq!(entry_types, vec!["reserve", "reconcile"]);
+
+        let row = sqlx::query(
+            "SELECT input_tokens, output_tokens, source FROM request_usage WHERE request_id = ?1",
+        )
+        .bind(&request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("usage row");
+        assert_eq!(row.get::<i64, _>("input_tokens"), 120);
+        assert_eq!(row.get::<i64, _>("output_tokens"), 48);
+        assert_eq!(row.get::<String, _>("source"), "provider");
+    }
+
+    #[tokio::test]
+    async fn messages_ingress_streaming_forwards_native_sse_and_reconciles() {
+        let (app, store) = app_with_store().await;
+        seed_pricebooks(&store).await;
+        seed_global_day_budget(&store, Money::from_usd(10.0).expect("money")).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(anthropic_messages_body(true).to_string()))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream; charset=utf-8")
+        );
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        // Native Anthropic SSE event sequence forwarded unmodified.
+        assert!(text.contains("event: message_start"));
+        assert!(text.contains("event: content_block_delta"));
+        assert!(text.contains("event: message_stop"));
+        // The Anthropic contract has no OpenAI-style [DONE] sentinel.
+        assert!(!text.contains("[DONE]"));
+
+        sleep(Duration::from_millis(50)).await;
+        let entry_types: Vec<String> = sqlx::query_scalar(
+            "SELECT entry_type FROM cost_ledger WHERE request_id = ?1 ORDER BY id",
+        )
+        .bind(&request_id)
+        .fetch_all(store.pool())
+        .await
+        .expect("ledger entries");
+        assert_eq!(entry_types, vec!["reserve", "reconcile"]);
+
+        let row = sqlx::query(
+            "SELECT input_tokens, output_tokens, source FROM request_usage WHERE request_id = ?1",
+        )
+        .bind(&request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("usage row");
+        assert_eq!(row.get::<i64, _>("input_tokens"), 120);
+        assert_eq!(row.get::<i64, _>("output_tokens"), 48);
+        assert_eq!(row.get::<String, _>("source"), "provider");
+    }
+
+    #[tokio::test]
+    async fn messages_ingress_over_budget_returns_structured_402() {
+        let (app, store) = app_with_store().await;
+        seed_pricebooks(&store).await;
+        seed_global_day_budget(&store, Money::from_usd(0.0).expect("money")).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(anthropic_messages_body(false).to_string()))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json_body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json_body["error"]["type"], "budget_exceeded");
+        assert_eq!(json_body["error"]["retryable"], false);
+        assert_eq!(json_body["error"]["budget"]["scope"], "global:*");
+        assert_eq!(json_body["error"]["budget"]["window"], "day");
+    }
+
+    #[test]
+    fn normalize_messages_preserves_tool_blocks_and_carries_passthrough() {
+        let state = ProxyState::mock_default();
+        let ctx = RequestContext {
+            request_id: "req_msg_01".to_string(),
+        };
+        let payload = AnthropicMessagesRequest {
+            model: "  claude-sonnet-4-6 ".to_string(),
+            messages: json!([
+                {"role": "user", "content": [{"type": "text", "text": "call a tool"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "search", "input": {"q": "x"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+                ]}
+            ]),
+            stream: true,
+            rest: serde_json::from_value(json!({
+                "max_tokens": 512,
+                "system": "sys",
+                "tools": [{"name": "search"}],
+                "tool_choice": {"type": "auto"}
+            }))
+            .expect("rest map"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+
+        let normalized = normalize_messages_request(&ctx, &state, &payload, &headers);
+        assert_eq!(normalized.ingress_format, IngressFormat::Anthropic);
+        assert_eq!(normalized.model_resolved, "claude-sonnet-4-6");
+        assert!(normalized.stream);
+        // tool_use / tool_result content blocks preserved losslessly.
+        assert_eq!(normalized.messages[1]["content"][0]["type"], "tool_use");
+        assert_eq!(normalized.messages[2]["content"][0]["type"], "tool_result");
+        let passthrough = normalized.passthrough.expect("passthrough carried");
+        assert_eq!(passthrough["body"]["system"], "sys");
+        assert_eq!(passthrough["body"]["tools"][0]["name"], "search");
+        assert_eq!(passthrough["body"]["max_tokens"], 512);
+        assert_eq!(passthrough["headers"]["anthropic-version"], "2023-06-01");
+        assert_eq!(
+            passthrough["headers"]["anthropic-beta"],
+            "prompt-caching-2024-07-31"
+        );
     }
 }
