@@ -2,7 +2,9 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use penny_types::{NormalizedRequest, ProviderResponse, ResponseBody, StreamDescriptor};
+use penny_types::{
+    IngressFormat, NormalizedRequest, ProviderResponse, ResponseBody, StreamDescriptor,
+};
 use reqwest::{header::CONTENT_TYPE, Client, StatusCode};
 use serde_json::{json, Value};
 use std::{
@@ -272,14 +274,63 @@ impl AnthropicProvider {
         format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'))
     }
 
-    fn anthropic_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        request
-            .header("x-api-key", &self.config.api_key)
-            .header("anthropic-version", &self.config.api_version)
+    fn anthropic_headers(
+        &self,
+        req: &NormalizedRequest,
+        request: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        let mut builder = request.header("x-api-key", &self.config.api_key);
+        let mut version = self.config.api_version.clone();
+        // Preserve the client's `anthropic-version` / `anthropic-beta` request
+        // headers on the outbound call for native Anthropic ingress.
+        if let Some(headers) = passthrough_headers(req) {
+            for (name, value) in headers {
+                let Some(value) = value.as_str() else {
+                    continue;
+                };
+                match name.as_str() {
+                    "anthropic-version" => version = value.to_string(),
+                    "anthropic-beta" => builder = builder.header("anthropic-beta", value),
+                    _ => {}
+                }
+            }
+        }
+        builder
+            .header("anthropic-version", version)
             .header(CONTENT_TYPE, "application/json")
     }
 
     fn build_payload(&self, req: &NormalizedRequest) -> Value {
+        match req.ingress_format {
+            IngressFormat::Anthropic => self.build_native_payload(req),
+            IngressFormat::OpenAi => self.build_translated_payload(req),
+        }
+    }
+
+    /// Forward a native Anthropic ingress payload upstream with minimal change:
+    /// the client already speaks the Messages contract, so preserve `messages`
+    /// (including `tool_use`/`tool_result` content blocks) verbatim and merge the
+    /// carried body extras (`system`, `tools`, `tool_choice`, `max_tokens`, and any
+    /// other top-level parameters) back in.
+    fn build_native_payload(&self, req: &NormalizedRequest) -> Value {
+        let mut payload = serde_json::Map::new();
+        payload.insert("model".to_string(), json!(req.model_resolved));
+        payload.insert("messages".to_string(), req.messages.clone());
+        payload.insert("stream".to_string(), json!(req.stream));
+        if let Some(extras) = passthrough_body(req) {
+            for (key, value) in extras {
+                payload.insert(key.clone(), value.clone());
+            }
+        }
+        payload
+            .entry("max_tokens".to_string())
+            .or_insert_with(|| json!(req.estimated_output_tokens.max(1)));
+        Value::Object(payload)
+    }
+
+    /// Translate an OpenAI-shaped ingress request into the Anthropic Messages
+    /// contract (used when a non-Anthropic client targets the Anthropic upstream).
+    fn build_translated_payload(&self, req: &NormalizedRequest) -> Value {
         let mut system_segments: Vec<String> = Vec::new();
         let mut anthropic_messages: Vec<Value> = Vec::new();
         if let Some(messages) = req.messages.as_array() {
@@ -587,6 +638,13 @@ impl MockProvider {
     }
 
     pub fn completion_payload(&self, req: &NormalizedRequest) -> Value {
+        match req.ingress_format {
+            IngressFormat::Anthropic => self.anthropic_completion_payload(req),
+            IngressFormat::OpenAi => self.openai_completion_payload(req),
+        }
+    }
+
+    fn openai_completion_payload(&self, req: &NormalizedRequest) -> Value {
         json!({
             "id": format!("chatcmpl_mock_{}", req.id),
             "object": "chat.completion",
@@ -608,8 +666,78 @@ impl MockProvider {
         })
     }
 
+    /// Native Anthropic Messages response shape, returned for Anthropic ingress.
+    fn anthropic_completion_payload(&self, req: &NormalizedRequest) -> Value {
+        json!({
+            "id": format!("msg_mock_{}", req.id),
+            "type": "message",
+            "role": "assistant",
+            "model": req.model_resolved,
+            "content": [{"type": "text", "text": self.config.completion_text}],
+            "stop_reason": "end_turn",
+            "stop_sequence": Value::Null,
+            "usage": {
+                "input_tokens": self.config.usage.input_tokens,
+                "output_tokens": self.config.usage.output_tokens
+            }
+        })
+    }
+
     /// Deterministic SSE lines used by integration tests to simulate streaming.
     pub fn stream_sse_lines(&self, req: &NormalizedRequest) -> Vec<String> {
+        match req.ingress_format {
+            IngressFormat::Anthropic => self.anthropic_stream_sse_lines(req),
+            IngressFormat::OpenAi => self.openai_stream_sse_lines(req),
+        }
+    }
+
+    /// Native Anthropic SSE event sequence, emitted for Anthropic ingress.
+    fn anthropic_stream_sse_lines(&self, req: &NormalizedRequest) -> Vec<String> {
+        let message_start = json!({
+            "type": "message_start",
+            "message": {
+                "id": format!("msg_mock_{}", req.id),
+                "type": "message",
+                "role": "assistant",
+                "model": req.model_resolved,
+                "content": [],
+                "stop_reason": Value::Null,
+                "stop_sequence": Value::Null,
+                "usage": {
+                    "input_tokens": self.config.usage.input_tokens,
+                    "output_tokens": 0
+                }
+            }
+        });
+        let content_block_start = json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        });
+        let content_block_delta = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": self.config.completion_text}
+        });
+        let content_block_stop = json!({"type": "content_block_stop", "index": 0});
+        let message_delta = json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": Value::Null},
+            "usage": {"output_tokens": self.config.usage.output_tokens}
+        });
+        let message_stop = json!({"type": "message_stop"});
+
+        vec![
+            format!("event: message_start\ndata: {message_start}\n\n"),
+            format!("event: content_block_start\ndata: {content_block_start}\n\n"),
+            format!("event: content_block_delta\ndata: {content_block_delta}\n\n"),
+            format!("event: content_block_stop\ndata: {content_block_stop}\n\n"),
+            format!("event: message_delta\ndata: {message_delta}\n\n"),
+            format!("event: message_stop\ndata: {message_stop}\n\n"),
+        ]
+    }
+
+    fn openai_stream_sse_lines(&self, req: &NormalizedRequest) -> Vec<String> {
         let first_chunk = json!({
             "id": format!("chatcmpl_mock_{}", req.id),
             "object": "chat.completion.chunk",
@@ -718,7 +846,7 @@ impl ProviderAdapter for AnthropicProvider {
 
         let payload = self.build_payload(&req);
         let request = self.client.post(self.endpoint_url()).json(&payload);
-        let request = self.anthropic_headers(request);
+        let request = self.anthropic_headers(&req, request);
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
@@ -742,6 +870,7 @@ impl ProviderAdapter for AnthropicProvider {
                 let mut upstream = response.bytes_stream();
                 let mut buffer = Vec::new();
                 let mut state = AnthropicStreamState::default();
+                let native = matches!(stream_req.ingress_format, IngressFormat::Anthropic);
                 while let Some(chunk_result) = upstream.next().await {
                     let chunk = match chunk_result {
                         Ok(bytes) => bytes,
@@ -750,6 +879,18 @@ impl ProviderAdapter for AnthropicProvider {
                     buffer.extend_from_slice(&chunk);
                     for raw_event in drain_sse_events(&mut buffer) {
                         let event = parse_sse_event(&raw_event);
+                        if native {
+                            // Native Anthropic ingress: forward the upstream SSE
+                            // event verbatim and stop after `message_stop`.
+                            let terminal = event.name.as_deref() == Some("message_stop");
+                            if tx.send(format!("{raw_event}\n\n")).await.is_err() {
+                                return;
+                            }
+                            if terminal {
+                                return;
+                            }
+                            continue;
+                        }
                         let mapped =
                             AnthropicProvider::map_stream_event(&stream_req, &mut state, &event);
                         for line in mapped {
@@ -779,9 +920,15 @@ impl ProviderAdapter for AnthropicProvider {
             Ok(parsed) => parsed,
             Err(error) => return Ok(parse_failure_response(error)),
         };
+        // Native Anthropic ingress returns the upstream Messages JSON unmodified;
+        // OpenAI ingress is translated to the Chat Completions shape.
+        let body = match req.ingress_format {
+            IngressFormat::Anthropic => parsed,
+            IngressFormat::OpenAi => self.map_non_stream_response(&req, &parsed),
+        };
         Ok(ProviderResponse {
             status: status.as_u16(),
-            body: ResponseBody::Complete(self.map_non_stream_response(&req, &parsed)),
+            body: ResponseBody::Complete(body),
             upstream_ms: 0,
         })
     }
@@ -957,6 +1104,24 @@ fn parse_sse_event(raw_event: &str) -> SseEvent {
     event
 }
 
+/// Body extras (`system`, `tools`, `tool_choice`, `max_tokens`, and any other
+/// top-level Anthropic parameters) carried on a native-ingress request.
+fn passthrough_body(req: &NormalizedRequest) -> Option<&serde_json::Map<String, Value>> {
+    req.passthrough
+        .as_ref()
+        .and_then(|value| value.get("body"))
+        .and_then(Value::as_object)
+}
+
+/// Client headers (`anthropic-version`, `anthropic-beta`) to forward upstream on a
+/// native-ingress request.
+fn passthrough_headers(req: &NormalizedRequest) -> Option<&serde_json::Map<String, Value>> {
+    req.passthrough
+        .as_ref()
+        .and_then(|value| value.get("headers"))
+        .and_then(Value::as_object)
+}
+
 fn build_openai_role_chunk(req: &NormalizedRequest, state: &AnthropicStreamState) -> String {
     let message_id = state.message_id.as_deref().unwrap_or(&req.id).to_string();
     let model = state
@@ -1086,6 +1251,8 @@ mod tests {
                 .with_ymd_and_hms(2026, 4, 11, 1, 2, 3)
                 .single()
                 .expect("valid static timestamp"),
+            ingress_format: IngressFormat::OpenAi,
+            passthrough: None,
         }
     }
 
@@ -1257,6 +1424,16 @@ mod tests {
         lines
     }
 
+    /// Drain a native Anthropic passthrough stream, which terminates by closing
+    /// the channel after `message_stop` (no `[DONE]` sentinel).
+    async fn drain_stream_lines(mut receiver: mpsc::Receiver<String>) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Some(line) = receiver.recv().await {
+            lines.push(line);
+        }
+        lines
+    }
+
     #[tokio::test]
     async fn anthropic_non_stream_is_mapped_to_openai_shape() {
         let (base_url, request_rx) = spawn_single_response_server(
@@ -1334,6 +1511,82 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("\"Hello\"")));
         assert!(lines.iter().any(|line| line.contains("\"usage\"")));
         assert_eq!(lines.last(), Some(&"data: [DONE]\n\n".to_string()));
+    }
+
+    #[tokio::test]
+    async fn anthropic_native_ingress_returns_upstream_body_unmodified() {
+        let upstream = json!({
+            "id": "msg_native",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "native passthrough"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 42, "output_tokens": 11}
+        });
+        let (base_url, request_rx) =
+            spawn_single_response_server(200, "application/json", upstream.to_string()).await;
+
+        let provider = anthropic_provider(base_url);
+        let mut req = request(false);
+        req.provider_id = "anthropic".to_string();
+        req.ingress_format = IngressFormat::Anthropic;
+        req.passthrough = Some(json!({
+            "body": {"max_tokens": 256, "system": "sys"},
+            "headers": {"anthropic-version": "2030-01-01", "anthropic-beta": "beta-flag"}
+        }));
+
+        let response = provider.send(req).await.expect("response");
+        assert_eq!(response.status, 200);
+        let request_raw = request_rx.await.expect("captured request");
+        let request_lower = request_raw.to_lowercase();
+        assert!(request_lower.starts_with("post /v1/messages"));
+        // Client protocol headers forwarded verbatim.
+        assert!(request_lower.contains("anthropic-version: 2030-01-01"));
+        assert!(request_lower.contains("anthropic-beta: beta-flag"));
+        // Body extras forwarded upstream.
+        assert!(request_raw.contains("\"system\":\"sys\""));
+        assert!(request_raw.contains("\"max_tokens\":256"));
+        match response.body {
+            // Native ingress returns the upstream Anthropic body unmodified.
+            ResponseBody::Complete(payload) => assert_eq!(payload, upstream),
+            other => panic!("expected complete response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_native_ingress_streaming_forwards_events_unmodified() {
+        let sse = [
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"usage\":{\"input_tokens\":33,\"output_tokens\":0}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"Hi\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ]
+        .concat();
+        let (base_url, _) = spawn_single_response_server(200, "text/event-stream", sse).await;
+
+        let provider = anthropic_provider(base_url);
+        let mut req = request(true);
+        req.id = "req_native_stream".to_string();
+        req.provider_id = "anthropic".to_string();
+        req.ingress_format = IngressFormat::Anthropic;
+
+        let response = provider.send(req.clone()).await.expect("stream response");
+        assert!(matches!(response.body, ResponseBody::Stream(_)));
+        let receiver = provider
+            .take_stream_receiver(&req)
+            .expect("stream receiver should exist");
+        let joined = drain_stream_lines(receiver).await.join("");
+        // Native Anthropic SSE events preserved verbatim, in order, no [DONE].
+        assert!(joined.contains("event: message_start"));
+        assert!(joined.contains("event: content_block_delta"));
+        assert!(joined.contains("event: message_delta"));
+        assert!(joined.contains("event: message_stop"));
+        assert!(!joined.contains("[DONE]"));
     }
 
     #[tokio::test]

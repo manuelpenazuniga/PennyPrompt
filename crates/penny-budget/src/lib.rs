@@ -497,6 +497,8 @@ mod tests {
             estimated_input_tokens: 100,
             estimated_output_tokens: 50,
             timestamp: Utc::now(),
+            ingress_format: penny_types::IngressFormat::OpenAi,
+            passthrough: None,
         }
     }
 
