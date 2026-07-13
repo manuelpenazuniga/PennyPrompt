@@ -266,8 +266,17 @@ pub struct StreamDescriptor {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AccountedUsage {
+    /// Fresh (non-cached) input tokens billed at the standard input rate.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cached input tokens read back from the provider prompt cache, billed at
+    /// the discounted cache-read rate.
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    /// Input tokens written to the provider prompt cache, billed at the
+    /// cache-write rate.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
     pub cost_usd: Money,
     pub source: UsageSource,
     pub pricing_snapshot: Value,

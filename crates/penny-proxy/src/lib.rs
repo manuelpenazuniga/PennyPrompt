@@ -227,8 +227,13 @@ struct BudgetApiErrorDetail {
 
 #[derive(Debug, Clone)]
 struct NormalizedUsage {
+    /// Fresh (non-cached) input tokens billed at the standard input rate.
     input_tokens: u64,
     output_tokens: u64,
+    /// Cached input tokens read from the provider prompt cache.
+    cache_read_tokens: u64,
+    /// Input tokens written to the provider prompt cache.
+    cache_creation_tokens: u64,
     source: UsageSource,
     pricing_snapshot: Value,
 }
@@ -840,18 +845,30 @@ fn provider_usage_from_response(
 
 fn provider_usage_from_completion(payload: &Value) -> Option<NormalizedUsage> {
     let usage = payload.get("usage")?;
-    let input_tokens = usage.get("prompt_tokens")?.as_u64()?;
+    let prompt_tokens = usage.get("prompt_tokens")?.as_u64()?;
     let output_tokens = usage.get("completion_tokens")?.as_u64()?;
+    // OpenAI reports cached tokens as a subset of `prompt_tokens`; split them out
+    // so cache reads bill at the discounted rate and the remainder at input rate.
+    let cache_read_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(prompt_tokens);
     Some(NormalizedUsage {
-        input_tokens,
+        input_tokens: prompt_tokens - cache_read_tokens,
         output_tokens,
+        cache_read_tokens,
+        // OpenAI does not bill a separate cache-write rate.
+        cache_creation_tokens: 0,
         source: UsageSource::Provider,
         pricing_snapshot: usage.clone(),
     })
 }
 
-/// Extract provider usage from a native Anthropic Messages response body
-/// (`usage.input_tokens` / `usage.output_tokens`).
+/// Extract provider usage from a native Anthropic Messages response body.
+/// `input_tokens` is already the fresh (non-cached) count; cache reads and writes
+/// are reported separately.
 fn provider_usage_from_anthropic_message(payload: &Value) -> Option<NormalizedUsage> {
     let usage = payload.get("usage")?;
     let input_tokens = usage.get("input_tokens")?.as_u64()?;
@@ -859,6 +876,14 @@ fn provider_usage_from_anthropic_message(payload: &Value) -> Option<NormalizedUs
     Some(NormalizedUsage {
         input_tokens,
         output_tokens,
+        cache_read_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_creation_tokens: usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         source: UsageSource::Provider,
         pricing_snapshot: usage.clone(),
     })
@@ -1071,6 +1096,8 @@ fn provider_usage_from_openai_sse_lines(lines: &[String]) -> Option<NormalizedUs
 fn provider_usage_from_anthropic_sse_lines(lines: &[String]) -> Option<NormalizedUsage> {
     let mut input_tokens: Option<u64> = None;
     let mut output_tokens: Option<u64> = None;
+    let mut cache_read_tokens: u64 = 0;
+    let mut cache_creation_tokens: u64 = 0;
 
     for chunk in lines {
         for physical in chunk.lines() {
@@ -1101,6 +1128,18 @@ fn provider_usage_from_anthropic_sse_lines(lines: &[String]) -> Option<Normalize
                     {
                         output_tokens = Some(value);
                     }
+                    if let Some(value) = usage
+                        .and_then(|u| u.get("cache_read_input_tokens"))
+                        .and_then(Value::as_u64)
+                    {
+                        cache_read_tokens = value;
+                    }
+                    if let Some(value) = usage
+                        .and_then(|u| u.get("cache_creation_input_tokens"))
+                        .and_then(Value::as_u64)
+                    {
+                        cache_creation_tokens = value;
+                    }
                 }
                 Some("message_delta") => {
                     if let Some(value) = parsed
@@ -1121,10 +1160,14 @@ fn provider_usage_from_anthropic_sse_lines(lines: &[String]) -> Option<Normalize
     Some(NormalizedUsage {
         input_tokens,
         output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
         source: UsageSource::Provider,
         pricing_snapshot: json!({
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cache_read_input_tokens": cache_read_tokens,
+            "cache_creation_input_tokens": cache_creation_tokens,
         }),
     })
 }
@@ -1142,6 +1185,8 @@ fn estimated_usage_from_request(request: &NormalizedRequest) -> NormalizedUsage 
     NormalizedUsage {
         input_tokens: request.estimated_input_tokens,
         output_tokens: request.estimated_output_tokens,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
         source: UsageSource::Estimated,
         pricing_snapshot: json!({
             "source": "token_estimation_hook",
@@ -1400,9 +1445,11 @@ async fn actual_usage_cost_usd(
         return Ok(Money::ZERO);
     };
     PricingEngine::new(store)
-        .calculate(
+        .calculate_with_cache(
             &request.model_resolved,
             usage.input_tokens,
+            usage.cache_read_tokens,
+            usage.cache_creation_tokens,
             usage.output_tokens,
         )
         .await
@@ -1504,6 +1551,8 @@ async fn persist_request_and_usage(
         request_id: normalized.id.clone(),
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_creation_tokens: usage.cache_creation_tokens,
         cost_usd,
         source: usage.source.clone(),
         pricing_snapshot: usage.pricing_snapshot.clone(),
@@ -3738,6 +3787,172 @@ action_on_soft = "warn"
         assert_eq!(json_body["error"]["retryable"], false);
         assert_eq!(json_body["error"]["budget"]["scope"], "global:*");
         assert_eq!(json_body["error"]["budget"]["window"], "day");
+    }
+
+    // ---- #208: prompt-cache cost accounting ----
+
+    async fn cache_mock_app(
+        usage: penny_providers::MockUsage,
+        model: &str,
+    ) -> (Router, SqliteStore) {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create in-memory store");
+        let provider = MockProvider::new(MockProviderConfig {
+            usage,
+            ..MockProviderConfig::default()
+        });
+        let state = ProxyState::with_provider(Arc::new(provider), vec![model.to_string()])
+            .with_store(store.clone());
+        (build_router(state), store)
+    }
+
+    async fn usage_row(store: &SqliteStore, request_id: &str) -> (i64, i64, i64, i64, i64) {
+        let row = sqlx::query(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_micros FROM request_usage WHERE request_id = ?1",
+        )
+        .bind(request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("usage row");
+        (
+            row.get::<i64, _>("input_tokens"),
+            row.get::<i64, _>("output_tokens"),
+            row.get::<i64, _>("cache_read_tokens"),
+            row.get::<i64, _>("cache_creation_tokens"),
+            row.get::<i64, _>("cost_micros"),
+        )
+    }
+
+    #[tokio::test]
+    async fn messages_ingress_accounts_prompt_cache_tokens() {
+        let (app, store) = cache_mock_app(
+            penny_providers::MockUsage {
+                input_tokens: 100,
+                output_tokens: 40,
+                cache_read_input_tokens: 1000,
+                cache_creation_input_tokens: 200,
+            },
+            "claude-sonnet-4-6",
+        )
+        .await;
+        seed_pricebooks(&store).await;
+        seed_global_day_budget(&store, Money::from_usd(10.0).expect("money")).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(anthropic_messages_body(false).to_string()))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+
+        // claude-sonnet-4-6: input 3.0, cache_read 0.3, cache_write 3.75, output 15.0.
+        // 100*3 + 1000*0.3 + 200*3.75 + 40*15 (per Mtok) = 300 + 300 + 750 + 600 micros.
+        let (input, output, cache_read, cache_creation, cost_micros) =
+            usage_row(&store, &request_id).await;
+        assert_eq!(input, 100);
+        assert_eq!(output, 40);
+        assert_eq!(cache_read, 1000);
+        assert_eq!(cache_creation, 200);
+        assert_eq!(cost_micros, 1950);
+    }
+
+    #[tokio::test]
+    async fn messages_ingress_streaming_accounts_cache_from_sse() {
+        let (app, store) = cache_mock_app(
+            penny_providers::MockUsage {
+                input_tokens: 100,
+                output_tokens: 40,
+                cache_read_input_tokens: 1000,
+                cache_creation_input_tokens: 200,
+            },
+            "claude-sonnet-4-6",
+        )
+        .await;
+        seed_pricebooks(&store).await;
+        seed_global_day_budget(&store, Money::from_usd(10.0).expect("money")).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(anthropic_messages_body(true).to_string()))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+        let _ = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+
+        sleep(Duration::from_millis(50)).await;
+        let (input, output, cache_read, cache_creation, cost_micros) =
+            usage_row(&store, &request_id).await;
+        assert_eq!(input, 100);
+        assert_eq!(output, 40);
+        assert_eq!(cache_read, 1000);
+        assert_eq!(cache_creation, 200);
+        assert_eq!(cost_micros, 1950);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_accounts_openai_cached_tokens() {
+        let (app, store) = cache_mock_app(
+            penny_providers::MockUsage {
+                input_tokens: 100,
+                output_tokens: 40,
+                cache_read_input_tokens: 1000,
+                cache_creation_input_tokens: 0,
+            },
+            "gpt-4.1",
+        )
+        .await;
+        seed_pricebooks(&store).await;
+        seed_global_day_budget(&store, Money::from_usd(10.0).expect("money")).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "gpt-4.1",
+                    "messages": [{"role": "user", "content": "cached prompt"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("request id header");
+
+        // gpt-4.1: input 2.0, cache_read 0.5, output 8.0.
+        // fresh 100*2 + cache_read 1000*0.5 + output 40*8 (per Mtok) = 200 + 500 + 320 micros.
+        let (input, output, cache_read, cache_creation, cost_micros) =
+            usage_row(&store, &request_id).await;
+        assert_eq!(input, 100);
+        assert_eq!(output, 40);
+        assert_eq!(cache_read, 1000);
+        assert_eq!(cache_creation, 0);
+        assert_eq!(cost_micros, 1020);
     }
 
     #[test]

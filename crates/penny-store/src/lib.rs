@@ -66,6 +66,16 @@ fn embedded_migrator() -> &'static Migrator {
                 "pricebook_micros",
                 include_str!("../../../migrations/0009_pricebook_micros.sql"),
             ),
+            embedded_migration(
+                10,
+                "pricebook_cache_rates",
+                include_str!("../../../migrations/0010_pricebook_cache_rates.sql"),
+            ),
+            embedded_migration(
+                11,
+                "request_usage_cache_tokens",
+                include_str!("../../../migrations/0011_request_usage_cache_tokens.sql"),
+            ),
         ]),
         ..Migrator::DEFAULT
     })
@@ -176,8 +186,13 @@ pub struct NewRequest {
 #[derive(Debug, Clone)]
 pub struct UsageRecord {
     pub request_id: RequestId,
+    /// Fresh (non-cached) input tokens.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cached input tokens read from the provider prompt cache.
+    pub cache_read_tokens: u64,
+    /// Input tokens written to the provider prompt cache.
+    pub cache_creation_tokens: u64,
     pub cost_usd: Money,
     pub source: UsageSource,
     pub pricing_snapshot: Value,
@@ -190,6 +205,8 @@ impl From<(RequestId, AccountedUsage)> for UsageRecord {
             request_id,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_input_tokens,
+            cache_creation_tokens: usage.cache_creation_input_tokens,
             cost_usd: usage.cost_usd,
             source: usage.source,
             pricing_snapshot: usage.pricing_snapshot,
@@ -231,6 +248,12 @@ pub struct PricebookEntryRecord {
     pub model_id: String,
     pub input_per_mtok: Money,
     pub output_per_mtok: Money,
+    /// Prompt-cache read rate. `None` when the model has no dedicated cache
+    /// pricing (cache reads then bill at the standard input rate).
+    pub cache_read_per_mtok: Option<Money>,
+    /// Prompt-cache write rate. `None` when the model has no dedicated cache
+    /// pricing (cache writes then bill at the standard input rate).
+    pub cache_write_per_mtok: Option<Money>,
     pub effective_from: DateTime<Utc>,
     pub effective_until: Option<DateTime<Utc>>,
     pub source: String,
@@ -241,6 +264,8 @@ pub struct NewPricebookEntry {
     pub model_id: String,
     pub input_per_mtok: Money,
     pub output_per_mtok: Money,
+    pub cache_read_per_mtok: Option<Money>,
+    pub cache_write_per_mtok: Option<Money>,
     pub effective_from: DateTime<Utc>,
     pub effective_until: Option<DateTime<Utc>>,
     pub source: String,
@@ -484,14 +509,16 @@ impl RequestRepo for SqliteStore {
         sqlx::query(
             r#"
             INSERT INTO request_usage (
-                request_id, input_tokens, output_tokens, cost_usd, cost_micros, pricing_snapshot, source
+                request_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, cost_micros, pricing_snapshot, source
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
         )
         .bind(&usage.request_id)
         .bind(i64_from_u64(usage.input_tokens))
         .bind(i64_from_u64(usage.output_tokens))
+        .bind(i64_from_u64(usage.cache_read_tokens))
+        .bind(i64_from_u64(usage.cache_creation_tokens))
         .bind(usage.cost_usd.to_usd())
         .bind(usage.cost_usd.micros())
         .bind(usage.pricing_snapshot.to_string())
@@ -747,7 +774,7 @@ impl PricebookRepo for SqliteStore {
         let at_iso = at.to_rfc3339();
         let row = sqlx::query(
             r#"
-            SELECT id, model_id, input_per_mtok_micros, output_per_mtok_micros, effective_from, effective_until, source
+            SELECT id, model_id, input_per_mtok_micros, output_per_mtok_micros, cache_read_per_mtok_micros, cache_write_per_mtok_micros, effective_from, effective_until, source
             FROM pricebook_entries
             WHERE model_id = ?1
               AND datetime(effective_from) <= datetime(?2)
@@ -770,9 +797,9 @@ impl PricebookRepo for SqliteStore {
             sqlx::query(
                 r#"
                 INSERT INTO pricebook_entries (
-                    model_id, input_per_mtok, output_per_mtok, input_per_mtok_micros, output_per_mtok_micros, effective_from, effective_until, source
+                    model_id, input_per_mtok, output_per_mtok, input_per_mtok_micros, output_per_mtok_micros, cache_read_per_mtok_micros, cache_write_per_mtok_micros, effective_from, effective_until, source
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 "#,
             )
             .bind(&entry.model_id)
@@ -780,6 +807,8 @@ impl PricebookRepo for SqliteStore {
             .bind(entry.output_per_mtok.to_usd())
             .bind(entry.input_per_mtok.micros())
             .bind(entry.output_per_mtok.micros())
+            .bind(entry.cache_read_per_mtok.map(|money| money.micros()))
+            .bind(entry.cache_write_per_mtok.map(|money| money.micros()))
             .bind(entry.effective_from.to_rfc3339())
             .bind(entry.effective_until.map(|ts| ts.to_rfc3339()))
             .bind(&entry.source)
@@ -1000,6 +1029,12 @@ fn pricebook_from_row(row: sqlx::sqlite::SqliteRow) -> Result<PricebookEntryReco
         model_id: row.get("model_id"),
         input_per_mtok: Money::from_micros(row.get("input_per_mtok_micros")),
         output_per_mtok: Money::from_micros(row.get("output_per_mtok_micros")),
+        cache_read_per_mtok: row
+            .get::<Option<i64>, _>("cache_read_per_mtok_micros")
+            .map(Money::from_micros),
+        cache_write_per_mtok: row
+            .get::<Option<i64>, _>("cache_write_per_mtok_micros")
+            .map(Money::from_micros),
         effective_from: parse_db_datetime(
             row.get("effective_from"),
             "pricebook_entries.effective_from",
@@ -1151,6 +1186,8 @@ mod tests {
                 request_id,
                 input_tokens: 1234,
                 output_tokens: 321,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: Money::from_usd(0.42).expect("money"),
                 source: UsageSource::Provider,
                 pricing_snapshot: json!({ "model": "claude-sonnet-4-6" }),
@@ -1329,6 +1366,8 @@ mod tests {
                     model_id: "claude-sonnet-4-6".into(),
                     input_per_mtok: Money::from_usd(3.0).expect("money"),
                     output_per_mtok: Money::from_usd(15.0).expect("money"),
+                    cache_read_per_mtok: None,
+                    cache_write_per_mtok: None,
                     effective_from: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap(),
                     effective_until: Some(
                         Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
@@ -1339,6 +1378,8 @@ mod tests {
                     model_id: "claude-sonnet-4-6".into(),
                     input_per_mtok: Money::from_usd(3.5).expect("money"),
                     output_per_mtok: Money::from_usd(16.0).expect("money"),
+                    cache_read_per_mtok: Some(Money::from_usd(0.35).expect("money")),
+                    cache_write_per_mtok: Some(Money::from_usd(4.375).expect("money")),
                     effective_from: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
                     effective_until: None,
                     source: "local".into(),
@@ -1360,6 +1401,14 @@ mod tests {
 
         assert_eq!(price.input_per_mtok, Money::from_usd(3.5).expect("money"));
         assert_eq!(price.output_per_mtok, Money::from_usd(16.0).expect("money"));
+        assert_eq!(
+            price.cache_read_per_mtok,
+            Some(Money::from_usd(0.35).expect("money"))
+        );
+        assert_eq!(
+            price.cache_write_per_mtok,
+            Some(Money::from_usd(4.375).expect("money"))
+        );
     }
 
     #[tokio::test]
