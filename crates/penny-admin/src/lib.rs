@@ -131,6 +131,8 @@ struct SummaryRow {
     request_count: i64,
     input_tokens: i64,
     output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
     cost_usd: Money,
 }
 
@@ -139,6 +141,8 @@ struct SummaryTotals {
     request_count: i64,
     input_tokens: i64,
     output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
     cost_usd: Money,
 }
 
@@ -523,6 +527,8 @@ async fn get_report_summary(
             COUNT(requests.id) AS request_count,
             CAST(COALESCE(SUM(request_usage.input_tokens), 0) AS INTEGER) AS input_tokens,
             CAST(COALESCE(SUM(request_usage.output_tokens), 0) AS INTEGER) AS output_tokens,
+            CAST(COALESCE(SUM(request_usage.cache_read_tokens), 0) AS INTEGER) AS cache_read_tokens,
+            CAST(COALESCE(SUM(request_usage.cache_creation_tokens), 0) AS INTEGER) AS cache_creation_tokens,
             CAST(COALESCE(SUM(request_usage.cost_micros), 0) AS INTEGER) AS total_cost_micros
         FROM requests
         JOIN request_usage ON request_usage.request_id = requests.id
@@ -551,6 +557,8 @@ async fn get_report_summary(
             CAST(COALESCE(SUM(request_count), 0) AS INTEGER) AS request_count,
             CAST(COALESCE(SUM(input_tokens), 0) AS INTEGER) AS input_tokens,
             CAST(COALESCE(SUM(output_tokens), 0) AS INTEGER) AS output_tokens,
+            CAST(COALESCE(SUM(cache_read_tokens), 0) AS INTEGER) AS cache_read_tokens,
+            CAST(COALESCE(SUM(cache_creation_tokens), 0) AS INTEGER) AS cache_creation_tokens,
             CAST(COALESCE(SUM(total_cost_micros), 0) AS INTEGER) AS total_cost_micros,
             CAST(COUNT(*) AS INTEGER) AS total_groups
         FROM grouped
@@ -584,6 +592,8 @@ async fn get_report_summary(
             request_count: row.get("request_count"),
             input_tokens: row.get("input_tokens"),
             output_tokens: row.get("output_tokens"),
+            cache_read_tokens: row.get("cache_read_tokens"),
+            cache_creation_tokens: row.get("cache_creation_tokens"),
             cost_usd: Money::from_micros(row.get("total_cost_micros")),
         })
         .collect::<Vec<_>>();
@@ -592,6 +602,11 @@ async fn get_report_summary(
         request_count: summary_rows.iter().map(|row| row.request_count).sum(),
         input_tokens: summary_rows.iter().map(|row| row.input_tokens).sum(),
         output_tokens: summary_rows.iter().map(|row| row.output_tokens).sum(),
+        cache_read_tokens: summary_rows.iter().map(|row| row.cache_read_tokens).sum(),
+        cache_creation_tokens: summary_rows
+            .iter()
+            .map(|row| row.cache_creation_tokens)
+            .sum(),
         cost_usd: Money::from_micros(
             summary_rows
                 .iter()
@@ -621,6 +636,8 @@ async fn get_report_summary(
         request_count: totals_row.get::<i64, _>("request_count"),
         input_tokens: totals_row.get::<i64, _>("input_tokens"),
         output_tokens: totals_row.get::<i64, _>("output_tokens"),
+        cache_read_tokens: totals_row.get::<i64, _>("cache_read_tokens"),
+        cache_creation_tokens: totals_row.get::<i64, _>("cache_creation_tokens"),
         cost_usd: Money::from_micros(totals_row.get::<i64, _>("total_cost_micros")),
     };
     let total_groups = totals_row.get::<i64, _>("total_groups");
@@ -1387,6 +1404,8 @@ mod tests {
                 request_id: request.id.clone(),
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: Money::from_usd(2.5).expect("money"),
                 source: penny_types::UsageSource::Provider,
                 pricing_snapshot: json!({"test": true}),
@@ -1588,6 +1607,8 @@ mod tests {
                 request_id: request.id.clone(),
                 input_tokens: 200,
                 output_tokens: 100,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: Money::from_usd(5.0).expect("money"),
                 source: penny_types::UsageSource::Provider,
                 pricing_snapshot: json!({"test": true}),

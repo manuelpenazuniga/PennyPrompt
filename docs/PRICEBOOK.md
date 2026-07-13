@@ -48,8 +48,15 @@ Per entry (`[[entries]]`):
 - `class`
 - `input_per_mtok`
 - `output_per_mtok`
+- `cache_read_per_mtok` (optional) — prompt-cache read rate; when omitted, cache reads bill at `input_per_mtok`.
+- `cache_write_per_mtok` (optional) — prompt-cache write rate; when omitted, cache writes bill at `input_per_mtok`.
 - `effective_from`
 - `effective_until` (optional)
+
+Prompt-cache tokens reported by the provider are priced separately: fresh input at
+`input_per_mtok`, cached reads at `cache_read_per_mtok`, and cache writes at
+`cache_write_per_mtok`. If a model has no cache rate, cache tokens fall back to the
+standard input rate (logged at debug) so they are never dropped or zeroed.
 
 Example:
 
@@ -66,6 +73,8 @@ display_name = "Claude Sonnet 4.6"
 class = "balanced"
 input_per_mtok = 3.0
 output_per_mtok = 15.0
+cache_read_per_mtok = 0.3
+cache_write_per_mtok = 3.75
 effective_from = "2026-04-10T00:00:00Z"
 ```
 

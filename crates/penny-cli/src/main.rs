@@ -381,6 +381,8 @@ struct SummaryRow {
     request_count: i64,
     input_tokens: i64,
     output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
     total_cost_usd: f64,
 }
 
@@ -3797,6 +3799,8 @@ async fn fetch_summary_rows(
                 COUNT(requests.id) AS request_count,
                 CAST(COALESCE(SUM(request_usage.input_tokens), 0) AS INTEGER) AS input_tokens,
                 CAST(COALESCE(SUM(request_usage.output_tokens), 0) AS INTEGER) AS output_tokens,
+                CAST(COALESCE(SUM(request_usage.cache_read_tokens), 0) AS INTEGER) AS cache_read_tokens,
+                CAST(COALESCE(SUM(request_usage.cache_creation_tokens), 0) AS INTEGER) AS cache_creation_tokens,
                 COALESCE(SUM(request_usage.cost_usd), 0.0) AS total_cost_usd
             FROM requests
             JOIN request_usage ON request_usage.request_id = requests.id
@@ -3820,6 +3824,8 @@ async fn fetch_summary_rows(
             request_count: row.get("request_count"),
             input_tokens: row.get("input_tokens"),
             output_tokens: row.get("output_tokens"),
+            cache_read_tokens: row.get("cache_read_tokens"),
+            cache_creation_tokens: row.get("cache_creation_tokens"),
             total_cost_usd: row.get("total_cost_usd"),
         })
         .collect())
@@ -3983,6 +3989,8 @@ fn print_summary_table(by: SummaryBy, since: Option<&str>, rows: &[SummaryRow]) 
         Cell::new(by.as_str()).add_attribute(Attribute::Bold),
         Cell::new("requests").add_attribute(Attribute::Bold),
         Cell::new("input_tokens").add_attribute(Attribute::Bold),
+        Cell::new("cache_read").add_attribute(Attribute::Bold),
+        Cell::new("cache_write").add_attribute(Attribute::Bold),
         Cell::new("output_tokens").add_attribute(Attribute::Bold),
         Cell::new("cost_usd").add_attribute(Attribute::Bold),
     ]);
@@ -3992,6 +4000,8 @@ fn print_summary_table(by: SummaryBy, since: Option<&str>, rows: &[SummaryRow]) 
             Cell::new(&row.group_key),
             Cell::new(row.request_count),
             Cell::new(row.input_tokens),
+            Cell::new(row.cache_read_tokens),
+            Cell::new(row.cache_creation_tokens),
             Cell::new(row.output_tokens),
             Cell::new(format!("{:.6}", row.total_cost_usd)),
         ]);
@@ -3999,12 +4009,16 @@ fn print_summary_table(by: SummaryBy, since: Option<&str>, rows: &[SummaryRow]) 
 
     let total_requests: i64 = rows.iter().map(|row| row.request_count).sum();
     let total_input: i64 = rows.iter().map(|row| row.input_tokens).sum();
+    let total_cache_read: i64 = rows.iter().map(|row| row.cache_read_tokens).sum();
+    let total_cache_write: i64 = rows.iter().map(|row| row.cache_creation_tokens).sum();
     let total_output: i64 = rows.iter().map(|row| row.output_tokens).sum();
     let total_cost: f64 = rows.iter().map(|row| row.total_cost_usd).sum();
     table.add_row([
         Cell::new("TOTAL").add_attribute(Attribute::Bold),
         Cell::new(total_requests).add_attribute(Attribute::Bold),
         Cell::new(total_input).add_attribute(Attribute::Bold),
+        Cell::new(total_cache_read).add_attribute(Attribute::Bold),
+        Cell::new(total_cache_write).add_attribute(Attribute::Bold),
         Cell::new(total_output).add_attribute(Attribute::Bold),
         Cell::new(format!("{:.6}", total_cost)).add_attribute(Attribute::Bold),
     ]);
@@ -4034,6 +4048,8 @@ fn render_summary_json(rows: &[SummaryRow]) -> Result<String, CliError> {
                 "group_key": row.group_key,
                 "request_count": row.request_count,
                 "input_tokens": row.input_tokens,
+                "cache_read_tokens": row.cache_read_tokens,
+                "cache_creation_tokens": row.cache_creation_tokens,
                 "output_tokens": row.output_tokens,
                 "total_cost_usd": row.total_cost_usd,
             })
@@ -4045,13 +4061,18 @@ fn render_summary_json(rows: &[SummaryRow]) -> Result<String, CliError> {
 
 fn render_summary_csv(rows: &[SummaryRow]) -> String {
     let mut lines = Vec::with_capacity(rows.len() + 1);
-    lines.push("group_key,request_count,input_tokens,output_tokens,total_cost_usd".to_string());
+    lines.push(
+        "group_key,request_count,input_tokens,cache_read_tokens,cache_creation_tokens,output_tokens,total_cost_usd"
+            .to_string(),
+    );
     for row in rows {
         lines.push(format!(
-            "{},{},{},{},{:.6}",
+            "{},{},{},{},{},{},{:.6}",
             csv_escape(&row.group_key),
             row.request_count,
             row.input_tokens,
+            row.cache_read_tokens,
+            row.cache_creation_tokens,
             row.output_tokens,
             row.total_cost_usd
         ));
@@ -4155,6 +4176,8 @@ mod tests {
         started_at: DateTime<Utc>,
         input_tokens: u64,
         output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
         cost_usd: f64,
     }
 
@@ -4183,6 +4206,8 @@ mod tests {
                 request_id: fixture.request_id.to_string(),
                 input_tokens: fixture.input_tokens,
                 output_tokens: fixture.output_tokens,
+                cache_read_tokens: fixture.cache_read_tokens,
+                cache_creation_tokens: fixture.cache_creation_tokens,
                 cost_usd: Money::from_usd(fixture.cost_usd).expect("money fixture"),
                 source: UsageSource::Provider,
                 pricing_snapshot: serde_json::json!({ "source": "test" }),
@@ -4235,6 +4260,8 @@ mod tests {
                 model_id: model_id.to_string(),
                 input_per_mtok: Money::from_usd(1.0).expect("money"),
                 output_per_mtok: Money::from_usd(2.0).expect("money"),
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
                 effective_from,
                 effective_until,
                 source: "test".to_string(),
@@ -4507,6 +4534,8 @@ mod tests {
                 started_at: now,
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 40,
+                cache_creation_tokens: 10,
                 cost_usd: 1.5,
             },
         )
@@ -4520,6 +4549,8 @@ mod tests {
                 started_at: now,
                 input_tokens: 200,
                 output_tokens: 100,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 2.0,
             },
         )
@@ -4533,6 +4564,8 @@ mod tests {
                 started_at: now,
                 input_tokens: 300,
                 output_tokens: 120,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 3.0,
             },
         )
@@ -4546,6 +4579,13 @@ mod tests {
         assert!((total_cost - 6.5).abs() < 1e-9);
         let total_requests: i64 = rows.iter().map(|row| row.request_count).sum();
         assert_eq!(total_requests, 3);
+        // Cache tokens aggregate into the per-group breakdown.
+        let proj_a = rows
+            .iter()
+            .find(|row| row.group_key == "proj-a")
+            .expect("proj-a row");
+        assert_eq!(proj_a.cache_read_tokens, 40);
+        assert_eq!(proj_a.cache_creation_tokens, 10);
     }
 
     #[tokio::test]
@@ -4561,6 +4601,8 @@ mod tests {
                 started_at: now - ChronoDuration::days(3),
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 1.0,
             },
         )
@@ -4574,6 +4616,8 @@ mod tests {
                 started_at: now - ChronoDuration::hours(2),
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 2.0,
             },
         )
@@ -4855,6 +4899,8 @@ mod tests {
                 request_count: 2,
                 input_tokens: 300,
                 output_tokens: 150,
+                cache_read_tokens: 40,
+                cache_creation_tokens: 10,
                 total_cost_usd: 3.5,
             },
             SummaryRow {
@@ -4862,6 +4908,8 @@ mod tests {
                 request_count: 1,
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 total_cost_usd: 1.0,
             },
         ];
@@ -4871,6 +4919,8 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["group_key"], "proj-a");
         assert_eq!(items[0]["request_count"], 2);
+        assert_eq!(items[0]["cache_read_tokens"], 40);
+        assert_eq!(items[0]["cache_creation_tokens"], 10);
         assert_eq!(items[1]["total_cost_usd"], 1.0);
     }
 
@@ -4881,15 +4931,20 @@ mod tests {
             request_count: 2,
             input_tokens: 300,
             output_tokens: 150,
+            cache_read_tokens: 40,
+            cache_creation_tokens: 10,
             total_cost_usd: 3.5,
         }];
         let rendered = render_summary_csv(&rows);
         let mut lines = rendered.lines();
         assert_eq!(
             lines.next(),
-            Some("group_key,request_count,input_tokens,output_tokens,total_cost_usd")
+            Some("group_key,request_count,input_tokens,cache_read_tokens,cache_creation_tokens,output_tokens,total_cost_usd")
         );
-        assert_eq!(lines.next(), Some("\"proj,\"\"a\"\"\",2,300,150,3.500000"));
+        assert_eq!(
+            lines.next(),
+            Some("\"proj,\"\"a\"\"\",2,300,40,10,150,3.500000")
+        );
         assert_eq!(lines.next(), None);
     }
 
@@ -4923,6 +4978,8 @@ mod tests {
                 request_count: 4,
                 input_tokens: 400,
                 output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 total_cost_usd: 5.0,
             },
             SummaryRow {
@@ -4930,6 +4987,8 @@ mod tests {
                 request_count: 2,
                 input_tokens: 200,
                 output_tokens: 100,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 total_cost_usd: 2.0,
             },
         ];
@@ -4939,6 +4998,8 @@ mod tests {
                 request_count: 5,
                 input_tokens: 500,
                 output_tokens: 250,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 total_cost_usd: 6.0,
             },
             SummaryRow {
@@ -4946,6 +5007,8 @@ mod tests {
                 request_count: 1,
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 total_cost_usd: 1.0,
             },
         ];

@@ -591,6 +591,11 @@ impl AnthropicProvider {
 pub struct MockUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cached input tokens. For OpenAI shape these are reported as a subset of
+    /// `prompt_tokens`; for Anthropic shape they are reported separately.
+    pub cache_read_input_tokens: u64,
+    /// Cache-creation input tokens (Anthropic shape only).
+    pub cache_creation_input_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -616,6 +621,8 @@ impl Default for MockProviderConfig {
             usage: MockUsage {
                 input_tokens: 120,
                 output_tokens: 48,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
             upstream_ms: 42,
             stream_format: "sse".to_string(),
@@ -645,6 +652,18 @@ impl MockProvider {
     }
 
     fn openai_completion_payload(&self, req: &NormalizedRequest) -> Value {
+        // OpenAI reports cached tokens inside `prompt_tokens`, with a
+        // `prompt_tokens_details.cached_tokens` breakdown.
+        let cached = self.config.usage.cache_read_input_tokens;
+        let prompt_tokens = self.config.usage.input_tokens + cached;
+        let mut usage = json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": self.config.usage.output_tokens,
+            "total_tokens": prompt_tokens + self.config.usage.output_tokens
+        });
+        if cached > 0 {
+            usage["prompt_tokens_details"] = json!({ "cached_tokens": cached });
+        }
         json!({
             "id": format!("chatcmpl_mock_{}", req.id),
             "object": "chat.completion",
@@ -658,11 +677,7 @@ impl MockProvider {
                 },
                 "finish_reason": "stop"
             }],
-            "usage": {
-                "prompt_tokens": self.config.usage.input_tokens,
-                "completion_tokens": self.config.usage.output_tokens,
-                "total_tokens": self.config.usage.input_tokens + self.config.usage.output_tokens
-            }
+            "usage": usage
         })
     }
 
@@ -678,7 +693,9 @@ impl MockProvider {
             "stop_sequence": Value::Null,
             "usage": {
                 "input_tokens": self.config.usage.input_tokens,
-                "output_tokens": self.config.usage.output_tokens
+                "output_tokens": self.config.usage.output_tokens,
+                "cache_read_input_tokens": self.config.usage.cache_read_input_tokens,
+                "cache_creation_input_tokens": self.config.usage.cache_creation_input_tokens
             }
         })
     }
@@ -705,7 +722,9 @@ impl MockProvider {
                 "stop_sequence": Value::Null,
                 "usage": {
                     "input_tokens": self.config.usage.input_tokens,
-                    "output_tokens": 0
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": self.config.usage.cache_read_input_tokens,
+                    "cache_creation_input_tokens": self.config.usage.cache_creation_input_tokens
                 }
             }
         });
@@ -1325,6 +1344,8 @@ mod tests {
             usage: MockUsage {
                 input_tokens: 111,
                 output_tokens: 222,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
             completion_text: "configured".to_string(),
             ..MockProviderConfig::default()

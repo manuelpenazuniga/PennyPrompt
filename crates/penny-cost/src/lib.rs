@@ -61,7 +61,30 @@ impl<'a, R: PricebookRepo> PricingEngine<'a, R> {
         input_tokens: u64,
         output_tokens: u64,
     ) -> Result<Money, CostError> {
-        if input_tokens == 0 && output_tokens == 0 {
+        self.calculate_with_cache(model_id, input_tokens, 0, 0, output_tokens)
+            .await
+    }
+
+    /// Cost with prompt-cache accounting.
+    ///
+    /// `fresh_input_tokens` are billed at the standard input rate, `cache_read_tokens`
+    /// at the cache-read rate, `cache_write_tokens` at the cache-write rate, and
+    /// `output_tokens` at the output rate. When the model has no dedicated cache
+    /// rate, cache tokens fall back to the standard input rate (logged at debug so
+    /// they are never silently dropped or zeroed).
+    pub async fn calculate_with_cache(
+        &self,
+        model_id: &str,
+        fresh_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<Money, CostError> {
+        if fresh_input_tokens == 0
+            && cache_read_tokens == 0
+            && cache_write_tokens == 0
+            && output_tokens == 0
+        {
             return Ok(Money::ZERO);
         }
 
@@ -71,11 +94,37 @@ impl<'a, R: PricebookRepo> PricingEngine<'a, R> {
             .await?
             .ok_or_else(|| CostError::PriceNotFound(model_id.to_string()))?;
 
-        let input_cost = prorate_mtok(input_tokens, price.input_per_mtok)?;
-        let output_cost = prorate_mtok(output_tokens, price.output_per_mtok)?;
-        input_cost
-            .checked_add(output_cost)
-            .ok_or(CostError::MoneyOverflow)
+        let cache_read_rate = price.cache_read_per_mtok.unwrap_or_else(|| {
+            if cache_read_tokens > 0 {
+                tracing::debug!(
+                    target: "cost.cache",
+                    model_id,
+                    "no cache_read rate in pricebook; billing cache reads at input rate"
+                );
+            }
+            price.input_per_mtok
+        });
+        let cache_write_rate = price.cache_write_per_mtok.unwrap_or_else(|| {
+            if cache_write_tokens > 0 {
+                tracing::debug!(
+                    target: "cost.cache",
+                    model_id,
+                    "no cache_write rate in pricebook; billing cache writes at input rate"
+                );
+            }
+            price.input_per_mtok
+        });
+
+        let mut total = prorate_mtok(fresh_input_tokens, price.input_per_mtok)?;
+        for (tokens, rate) in [
+            (cache_read_tokens, cache_read_rate),
+            (cache_write_tokens, cache_write_rate),
+            (output_tokens, price.output_per_mtok),
+        ] {
+            let cost = prorate_mtok(tokens, rate)?;
+            total = total.checked_add(cost).ok_or(CostError::MoneyOverflow)?;
+        }
+        Ok(total)
     }
 
     /// Estimate input/output tokens from OpenAI-compatible `messages`.
@@ -106,6 +155,8 @@ impl<'a, R: PricebookRepo> PricingEngine<'a, R> {
             "model_id": entry.model_id,
             "input_per_mtok": entry.input_per_mtok,
             "output_per_mtok": entry.output_per_mtok,
+            "cache_read_per_mtok": entry.cache_read_per_mtok,
+            "cache_write_per_mtok": entry.cache_write_per_mtok,
             "effective_from": entry.effective_from,
             "effective_until": entry.effective_until,
             "source": entry.source
@@ -310,6 +361,8 @@ struct PricebookModelEntry {
     class: Option<String>,
     input_per_mtok: f64,
     output_per_mtok: f64,
+    cache_read_per_mtok: Option<f64>,
+    cache_write_per_mtok: Option<f64>,
     effective_from: String,
     effective_until: Option<String>,
     source: Option<String>,
@@ -374,6 +427,11 @@ pub async fn import_pricebook_files<P: AsRef<Path>>(
                 model_id: entry.model_id,
                 input_per_mtok: Money::from_usd(entry.input_per_mtok)?,
                 output_per_mtok: Money::from_usd(entry.output_per_mtok)?,
+                cache_read_per_mtok: entry.cache_read_per_mtok.map(Money::from_usd).transpose()?,
+                cache_write_per_mtok: entry
+                    .cache_write_per_mtok
+                    .map(Money::from_usd)
+                    .transpose()?,
                 effective_from: parse_datetime(&entry.effective_from, "effective_from")?,
                 effective_until: entry
                     .effective_until
@@ -445,6 +503,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn calculate_with_cache_prices_cache_tokens_distinctly() {
+        let store = setup_store_with_pricebook().await;
+        let engine = PricingEngine::new(&store);
+
+        // claude-sonnet-4-6: input 3.0, cache_read 0.3, cache_write 3.75, output 15.0.
+        let cost = engine
+            .calculate_with_cache(
+                "claude-sonnet-4-6",
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                1_000_000,
+            )
+            .await
+            .expect("calculate with cache");
+        assert_eq!(
+            cost,
+            Money::from_usd(3.0 + 0.3 + 3.75 + 15.0).expect("money")
+        );
+
+        // Cache accounting must diverge from the naive all-fresh-input calculation.
+        let naive = engine
+            .calculate("claude-sonnet-4-6", 3_000_000, 1_000_000)
+            .await
+            .expect("naive calculate");
+        assert_ne!(cost, naive);
+    }
+
+    #[tokio::test]
+    async fn calculate_with_cache_falls_back_to_input_rate_without_cache_rates() {
+        let store = SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("create store");
+        sqlx::query(
+            "INSERT INTO providers (id, name, base_url, api_format, enabled) VALUES ('p', 'P', 'https://example.invalid', 'openai', 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("insert provider");
+        sqlx::query(
+            "INSERT INTO models (id, provider_id, external_name, display_name, class) VALUES ('no-cache-model', 'p', 'no-cache-model', 'No Cache Model', 'balanced')",
+        )
+        .execute(store.pool())
+        .await
+        .expect("insert model");
+        PricebookRepo::import(
+            &store,
+            &[NewPricebookEntry {
+                model_id: "no-cache-model".to_string(),
+                input_per_mtok: Money::from_usd(2.0).expect("money"),
+                output_per_mtok: Money::from_usd(8.0).expect("money"),
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
+                effective_from: parse_datetime("2026-01-01T00:00:00Z", "effective_from")
+                    .expect("datetime"),
+                effective_until: None,
+                source: "local".to_string(),
+            }],
+        )
+        .await
+        .expect("import entry");
+
+        let engine = PricingEngine::new(&store);
+        // Cache tokens bill at the input rate when no cache rate exists: never
+        // dropped, never zeroed.
+        let cost = engine
+            .calculate_with_cache("no-cache-model", 1_000_000, 1_000_000, 1_000_000, 0)
+            .await
+            .expect("calculate with cache fallback");
+        assert_eq!(cost, Money::from_usd(6.0).expect("money"));
+    }
+
+    #[tokio::test]
     async fn snapshot_returns_price_entry() {
         let store = setup_store_with_pricebook().await;
         let engine = PricingEngine::new(&store);
@@ -482,6 +613,8 @@ mod tests {
                     model_id: "test-model".to_string(),
                     input_per_mtok: Money::from_usd(1.0).expect("money"),
                     output_per_mtok: Money::from_usd(2.0).expect("money"),
+                    cache_read_per_mtok: None,
+                    cache_write_per_mtok: None,
                     effective_from: parse_datetime("2026-04-10T00:00:00Z", "effective_from")
                         .expect("datetime"),
                     effective_until: Some(
@@ -494,6 +627,8 @@ mod tests {
                     model_id: "test-model".to_string(),
                     input_per_mtok: Money::from_usd(3.0).expect("money"),
                     output_per_mtok: Money::from_usd(4.0).expect("money"),
+                    cache_read_per_mtok: None,
+                    cache_write_per_mtok: None,
                     effective_from: parse_datetime("2026-04-25T00:00:00Z", "effective_from")
                         .expect("datetime"),
                     effective_until: None,

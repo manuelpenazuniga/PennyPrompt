@@ -1424,6 +1424,7 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "toml",
+ "tracing",
 ]
 
 [[package]]
