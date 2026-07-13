@@ -62,8 +62,9 @@ pennyprompt doctor
 # 4. Start the proxy
 pennyprompt serve
 
-# 5. Point your agent at it (OpenAI-compatible clients)
-export OPENAI_BASE_URL=http://localhost:8585/v1
+# 5. Point your agent at it
+export OPENAI_BASE_URL=http://localhost:8585/v1   # OpenAI-compatible clients
+export ANTHROPIC_BASE_URL=http://localhost:8585   # native Anthropic clients (OpenClaw, claw-code)
 ```
 
 Your agent works exactly the same. You control the spend. First report in minutes:
@@ -222,18 +223,18 @@ Pricing lives in **local, versioned TOML pricebooks** (`prices/*.toml`) with eff
 
 ## 🔌 Compatibility
 
-PennyPrompt works with any tool that speaks the OpenAI chat completions API:
+PennyPrompt speaks both the OpenAI chat completions API and the native Anthropic Messages API:
 
 | Agent | How to connect |
 |-------|---------------|
 | Codex | `OPENAI_BASE_URL=http://localhost:8585/v1` |
 | Cursor | Settings → Models → Base URL → `http://localhost:8585/v1` |
 | Continue | `config.json` → `apiBase` → `http://localhost:8585/v1` |
-| OpenClaw / claw-code | Via OpenAI-compatible base URL today — native Anthropic ingress lands in alpha.5 ([#207](https://github.com/manuelpenazuniga/PennyPrompt/issues/207)) |
+| OpenClaw / claw-code | `ANTHROPIC_BASE_URL=http://localhost:8585` — native `/v1/messages` ingress, zero translation |
 | NadirClaw | Chain: Agent → NadirClaw → PennyPrompt → Provider |
-| curl / SDKs | `http://localhost:8585/v1/chat/completions` |
+| curl / SDKs | OpenAI `http://localhost:8585/v1/chat/completions` or Anthropic `http://localhost:8585/v1/messages` |
 
-> **Current inbound contract (alpha):** the proxy accepts the **OpenAI-compatible** `POST /v1/chat/completions` surface. Native Anthropic ingress (`POST /v1/messages`) — letting Anthropic-native agents connect with zero translation — is the headline of the **alpha.5** train ([#207](https://github.com/manuelpenazuniga/PennyPrompt/issues/207)). All current constraints: [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
+> **Inbound contracts:** the proxy accepts both the **OpenAI-compatible** `POST /v1/chat/completions` surface and the **native Anthropic** `POST /v1/messages` surface (streaming and tool use), so Anthropic-native agents connect with zero translation. Prompt-cache tokens are accounted with dedicated cache-read/cache-write rates, so reported cost matches the provider invoice on cache-heavy workloads. All current constraints: [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
 
 ## 🛠️ Configuration
 
@@ -318,7 +319,7 @@ Roadmap source of truth: [docs/GITHUB_BACKLOG.md](docs/GITHUB_BACKLOG.md), drive
 |-------|-------|-----------|
 | ✅ `alpha.1`–`alpha.3` | Foundation → hardening | Proxy, atomic budgets, loop detection, streaming, real providers, release automation |
 | 🔄 `alpha.4` | Operator usability | Serve daemon, `run` orchestration, installer smoke check ([#199](https://github.com/manuelpenazuniga/PennyPrompt/issues/199)) |
-| ⏭️ `alpha.5` | **Compatibility & cost accuracy** | Native Anthropic `/v1/messages` ingress, prompt-cache cost accounting ([#225](https://github.com/manuelpenazuniga/PennyPrompt/issues/225)) |
+| 🔄 `alpha.5` | **Compatibility & cost accuracy** | Native Anthropic `/v1/messages` ingress and prompt-cache cost accounting landed on `main`; concurrency/timeout guardrails and binary rename to `pennyprompt` ([#225](https://github.com/manuelpenazuniga/PennyPrompt/issues/225)) |
 | ⏭️ `alpha.6` | **Agent-aware moat** | Per-task budgets, human-approval circuit breaker, cost-feedback headers, invoice-parity benchmark, webhooks ([#226](https://github.com/manuelpenazuniga/PennyPrompt/issues/226)) |
 | ⏭️ `beta.1` | **Scope expansion** | Gemini + local models (Ollama/vLLM) + OpenRouter, live TUI dashboard, MCP budget introspection, statusline, Homebrew ([#227](https://github.com/manuelpenazuniga/PennyPrompt/issues/227)) |
 | ⏭️ `v1.0.0` | **Team, without betraying local-first** | Admin auth, optional PostgreSQL, durable detector state ([#228](https://github.com/manuelpenazuniga/PennyPrompt/issues/228)) |

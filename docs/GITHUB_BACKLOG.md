@@ -246,11 +246,11 @@ code lands.
 
 | Gap | Impact | Tracked by |
 |-----|--------|-----------|
-| No native Anthropic `/v1/messages` ingress (OpenAI-compatible inbound only) | Native Anthropic agents (the primary target) cannot use the proxy without an OpenAI-compatible base URL | `#207`, docs `#210` |
-| Prompt-cache tokens not accounted | Reported cost is systematically off on cache-heavy agent workloads | `#208`, docs `#210` |
+| ~~No native Anthropic `/v1/messages` ingress~~ **Resolved (`#207`, alpha.5)** | Native Anthropic agents connect with `ANTHROPIC_BASE_URL` and zero translation | `#207` merged; docs `#210` |
+| ~~Prompt-cache tokens not accounted~~ **Resolved (`#208`, alpha.5)** | Cache read/write tokens priced with dedicated rates; cost matches cache-heavy invoices | `#208` merged; docs `#210` |
 | Admin plane has no authentication | Any local process reaching the admin port can read reports and mutate budgets (mitigated: documented local-only) | `#221` |
 | Detector state is in-memory | Paused/awaiting-approval sessions do not survive a `serve` restart | `#224` |
-| `max_connections(1)` serialises reads | Reporting/health reads block behind the writer under load | `#223`, `#209` |
+| `max_connections(1)` serialises reads | Reporting/health reads block behind the writer under load (partially mitigated by the alpha.5 inbound concurrency limit `#209`) | `#223`, `#209` |
 | Provider coverage = Anthropic + OpenAI only | Gemini/local/OpenRouter users excluded | `#215`, `#216`, `#217` |
 
 ---

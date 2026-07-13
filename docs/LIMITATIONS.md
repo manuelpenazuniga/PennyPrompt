@@ -1,23 +1,24 @@
 # Known Limitations (Alpha)
 
-This list documents current constraints as of July 5, 2026.
+This list documents current constraints as of July 12, 2026.
 
 ## Inbound API Surface
 
 - The proxy accepts the **OpenAI-compatible** `POST /v1/chat/completions` surface plus
-  `GET /v1/models`. This is the only inbound request contract today.
-- **Native Anthropic ingress (`POST /v1/messages`) is not implemented yet.** Anthropic-native
-  agents (OpenClaw, claw-code, Claude-family SDKs) must be pointed at an OpenAI-compatible base
-  URL until native ingress lands. Tracked by `#207` (alpha.5); the compatibility table in the
-  README is annotated accordingly (`#210`).
+  `GET /v1/models`.
+- **Resolved (July 12, 2026, `#207`):** native Anthropic ingress (`POST /v1/messages`) is now
+  implemented — Anthropic-native agents (OpenClaw, claw-code, Claude-family SDKs) connect with
+  `ANTHROPIC_BASE_URL=http://localhost:8585` and zero translation, including streaming and tool
+  use. The response shape returned matches the ingress contract (Anthropic in → Anthropic out).
 
 ## Cost Accuracy
 
-- **Prompt-cache tokens are not yet included in cost accounting.** Provider `cache_read` /
-  `cache_creation` (Anthropic) and `prompt_tokens_details.cached_tokens` (OpenAI) are not read,
-  so reported cost can diverge from the provider invoice on cache-heavy agent workloads.
-  Provider-reported non-cache usage remains authoritative during reconciliation. Tracked by
-  `#208` (alpha.5).
+- **Resolved (July 12, 2026, `#208`):** prompt-cache tokens are now included in cost accounting.
+  Provider `cache_read_input_tokens` / `cache_creation_input_tokens` (Anthropic) and
+  `prompt_tokens_details.cached_tokens` (OpenAI) are read from both non-streaming and streaming
+  responses and priced with dedicated cache-read / cache-write rates, so reported cost matches
+  the provider invoice on cache-heavy agent workloads. Models without cache rates fall back to
+  the standard input rate (logged at debug), never dropping tokens.
 - Streaming reconciliation falls back to token estimation when the provider omits a final usage
   payload; provider-reported usage is preferred when present.
 
