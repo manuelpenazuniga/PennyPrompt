@@ -15,7 +15,7 @@ case "$OPENAI_BASE_URL" in http://127.0.0.1:*/v1) ;; *) exit 3 ;; esac &&
 test "$OPENAI_API_BASE" = "$OPENAI_BASE_URL" &&
 test "$OPENAI_API_KEY" = pennyprompt-local-proxy"#;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_penny-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_pennyprompt"))
         .current_dir(repo_root)
         .env("HOME", home.path())
         .env_remove("PENNY_CONFIG")

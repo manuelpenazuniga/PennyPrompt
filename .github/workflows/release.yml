@@ -57,10 +57,11 @@ jobs:
         run: |
           set -euo pipefail
           TARGET="${{ matrix.target }}"
-          ASSET="penny-cli-${VERSION}-${TARGET}"
+          BIN="pennyprompt"
+          ASSET="${BIN}-${VERSION}-${TARGET}"
           mkdir -p dist
-          cp "target/${TARGET}/release/penny-cli" "dist/penny-cli"
-          tar -C dist -czf "dist/${ASSET}.tar.gz" penny-cli
+          cp "target/${TARGET}/release/${BIN}" "dist/${BIN}"
+          tar -C dist -czf "dist/${ASSET}.tar.gz" "${BIN}"
           (
             cd dist
             if command -v shasum >/dev/null 2>&1; then
@@ -69,7 +70,7 @@ jobs:
               sha256sum "${ASSET}.tar.gz" > "${ASSET}.sha256"
             fi
           )
-          rm -f dist/penny-cli
+          rm -f "dist/${BIN}"
 
       - name: Upload artifact bundle
         uses: actions/upload-artifact@v4
