@@ -18,7 +18,7 @@ Current baseline:
 Source of truth for this backlog:
 - The strategic audit: `docs/STRATEGY-AUDIT-2026-07-05.md` (rev. 1.1).
 - GitHub epics `#225` (alpha.5), `#226` (alpha.6), `#227` (beta.1), `#228` (v1.0.0),
-  plus child issues `#207`-`#224` and `#230`-`#234`.
+  plus child issues `#207`-`#224`, `#230`-`#234`, and `#236`.
 - In-flight alpha.4 epic `#199` and child `#203`.
 - Closed alpha.3 epic `#186` and blockers `#183`, `#184`, `#185`, `#189`, `#190`, `#196`.
 - Implementation reality in `crates/`.
@@ -113,10 +113,13 @@ literally true, and make reported cost correct for the flagship coding-agent wor
 - [ ] `#208` — feat(cost): prompt caching cost accounting (cache read/write tokens)
 - [ ] `#209` — feat(proxy): inbound concurrency limit and upstream timeout
 - [ ] `#210` — docs: align compatibility and limitation claims with implemented ingress
+- [ ] `#236` — feat(cli): rename binary from `penny-cli` to `pennyprompt` (brand
+  alignment; one-train compat symlink; must land before alpha.5 artifacts are cut)
 
 Exit: a native Anthropic (OpenClaw-style) client completes a real streamed, tool-using
 task with cache-accurate cost matching the provider invoice; README compatibility table
-verified end-to-end; standard gate green; version/CHANGELOG/notes/gate updated.
+verified end-to-end; the shipped binary is named `pennyprompt` with legacy-tag installs
+still working; standard gate green; version/CHANGELOG/notes/gate updated.
 
 ### Phase B — `v0.1.0-alpha.6` — Agent-aware moat · Epic `#226`
 
